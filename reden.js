@@ -5,354 +5,372 @@ const sqlite3 = require('sqlite3').verbose();
 const crypto = require('crypto');
 
 const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
 
 if (!process.env.WEBHOOK_SECRET) {
   console.error("Missing WEBHOOK_SECRET");
   process.exit(1);
 }
-const SECRET = process.env.WEBHOOK_SECRET;
 
-const ENGINE_VERSION = 'v1.0.1-production';
+const SECRET = process.env.WEBHOOK_SECRET;
+const ENGINE_VERSION = 'v2.2.0';
 
 // ============================================
 // DATABASE
 // ============================================
 
 const db = new sqlite3.Database('./reden.db');
-db.run('PRAGMA foreign_keys = ON');
 
 db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      event_type TEXT NOT NULL,
-      cart_id TEXT,
-      email TEXT,
-      data TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  db.run('PRAGMA foreign_keys = ON');
+  db.run('PRAGMA journal_mode = WAL');
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      cart_id TEXT,
-      experiment_group TEXT CHECK(experiment_group IN ('CONTROL', 'TREATMENT')) NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    experiment_group TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS decision_policies (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      version TEXT NOT NULL UNIQUE,
-      rules TEXT NOT NULL,
-      active BOOLEAN DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS decision_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT UNIQUE,
+    rules TEXT,
+    active BOOLEAN DEFAULT 0
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS decisions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      idempotency_key TEXT UNIQUE NOT NULL,
-      session_id TEXT NOT NULL,
-      cart_id TEXT NOT NULL,
-      engine_version TEXT NOT NULL,
-      policy_version_id INTEGER NOT NULL,
-      state TEXT CHECK(state IN ('EVALUATED', 'ACTIONED', 'DELIVERED')) DEFAULT 'EVALUATED',
-      cart_value REAL NOT NULL,
-      item_count INTEGER NOT NULL,
-      velocity_score REAL,
-      tab_score REAL,
-      cart_comp_score REAL,
-      friction_score REAL,
-      composite_score REAL,
-      action TEXT CHECK(action IN ('SUPPRESS', 'REMIND', 'INCENTIVISE', 'NONE')) NOT NULL,
-      reason_code TEXT NOT NULL,
-      experiment_group TEXT CHECK(experiment_group IN ('CONTROL', 'TREATMENT')) NOT NULL,
-      discount_type TEXT,
-      discount_value REAL,
-      discount_cap REAL,
-      est_prob_conversion_no_action REAL,
-      est_prob_conversion_with_action REAL,
-      est_expected_lift_value REAL,
-      est_expected_discount_cost REAL,
-      est_net_expected_value REAL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (session_id) REFERENCES sessions(id),
-      FOREIGN KEY (policy_version_id) REFERENCES decision_policies(id)
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT UNIQUE,
+    session_id TEXT,
+    cart_id TEXT,
+    action TEXT,
+    composite_score REAL,
+    est_net_expected_value REAL,
+    experiment_group TEXT,
+    state TEXT DEFAULT 'EVALUATED',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS outcomes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      decision_id INTEGER,
-      cart_id TEXT,
-      session_id TEXT,
-      converted BOOLEAN DEFAULT 0,
-      final_revenue REAL DEFAULT 0,
-      discount_applied REAL DEFAULT 0,
-      final_margin REAL DEFAULT 0,
-      observed_at DATETIME,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(decision_id),
-      UNIQUE(cart_id),
-      FOREIGN KEY (decision_id) REFERENCES decisions(id)
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER,
+    converted BOOLEAN,
+    final_revenue REAL,
+    discount_applied REAL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
 
   db.run(
-    `INSERT OR IGNORE INTO decision_policies (version, rules, active) VALUES (?, ?, 1)`,
-    ['policy:v1.0', JSON.stringify({
-      velocity_weight: 0.35,
-      tab_weight: 0.25,
-      cart_comp_weight: 0.25,
-      friction_weight: 0.15,
-      suppress_threshold: 0.75,
-      remind_threshold: 0.40,
-      incentivise_discount_pct: 10,
-      incentivise_discount_cap: 50
+    `INSERT OR IGNORE INTO decision_policies (version, rules, active)
+     VALUES (?, ?, 1)`,
+    ['policy:v2.2', JSON.stringify({
+      weights: {
+        velocity: 0.35,
+        tab: 0.25,
+        cart: 0.25,
+        friction: 0.15
+      },
+      discount: {
+        cap: 50
+      }
     })]
   );
-
-  db.run(`CREATE INDEX IF NOT EXISTS idx_log_cart_id ON log(cart_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_log_timestamp ON log(timestamp)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_decisions_session_id ON decisions(session_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_decisions_cart_id ON decisions(cart_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_outcomes_decision_id ON outcomes(decision_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_outcomes_cart_id ON outcomes(cart_id)`);
 });
 
 // ============================================
-// HELPERS
+// SECURITY
 // ============================================
 
-function generateIdempotencyKey() {
-  return crypto.randomBytes(16).toString('hex');
-}
+function verifySignature(req) {
+  const sig = req.headers['x-signature'];
+  if (!sig) return false;
 
-function safeJSONParse(input) {
+  const expected = crypto
+    .createHmac('sha256', SECRET)
+    .update(JSON.stringify(req.body))
+    .digest('hex');
+i
   try {
-    return JSON.parse(input || '{}');
+    return crypto.timingSafeEqual(
+      Buffer.from(sig),
+      Buffer.from(expected)
+    );
   } catch {
-    return {};
+    return false;
   }
-}
-
-function safeCompare(a, b) {
-  const bufA = Buffer.from(a || '');
-  const bufB = Buffer.from(b || '');
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
-function log(type, cartId, email, data) {
-  db.run(
-    `INSERT INTO log (event_type, cart_id, email, data) VALUES (?, ?, ?, ?)`,
-    [type, cartId, email, JSON.stringify(data)],
-    (err) => {
-      if (err) console.error('LOG ERROR:', err);
-    }
-  );
 }
 
 // ============================================
 // EXPERIMENT
 // ============================================
 
-function assignExperimentGroup(sessionId) {
-  return new Promise((resolve, reject) => {
-    const group = Math.random() < 0.05 ? 'CONTROL' : 'TREATMENT';
-
-    db.run(
-      `INSERT INTO sessions (id, experiment_group)
-       VALUES (?, ?)
-       ON CONFLICT(id) DO NOTHING`,
-      [sessionId, group],
-      (err) => {
-        if (err) return reject(err);
-        resolve(group);
-      }
-    );
-  });
+function assignGroup(sessionId) {
+  const hash = crypto.createHash('md5').update(sessionId).digest('hex');
+  const bucket = parseInt(hash.slice(0, 8), 16) % 100;
+  return bucket < 20 ? 'CONTROL' : 'TREATMENT';
 }
 
-function getExperimentGroup(sessionId) {
-  return new Promise((resolve, reject) => {
-    db.get(
-      `SELECT experiment_group FROM sessions WHERE id = ?`,
-      [sessionId],
-      (err, row) => {
-        if (err) return reject(err);
-        if (row?.experiment_group) return resolve(row.experiment_group);
-        assignExperimentGroup(sessionId).then(resolve).catch(reject);
-      }
-    );
-  });
+// ============================================
+// CORE MODEL
+// ============================================
+
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+function computeScore(signals, weights) {
+  return (
+    signals.velocity * weights.velocity +
+    signals.tab * weights.tab +
+    signals.cart * weights.cart +
+    signals.friction * weights.friction
+  );
+}
+
+function estimateConversion(score) {
+  return sigmoid(3 * (score - 0.5));
+}
+
+function computeLift(score) {
+  return 0.05 + (1 - score) * 0.25;
+}
+
+function getDiscountPct(cart_value) {
+  if (cart_value < 50) return 0.05;
+  if (cart_value < 200) return 0.10;
+  return 0.15;
 }
 
 // ============================================
 // POLICY
 // ============================================
 
-function getActivePolicy() {
+function getPolicy() {
   return new Promise((resolve, reject) => {
     db.get(
-      `SELECT id, version, rules FROM decision_policies WHERE active = 1 LIMIT 1`,
+      `SELECT * FROM decision_policies WHERE active=1 LIMIT 1`,
       (err, row) => {
         if (err) return reject(err);
-        if (!row) return reject(new Error('No active policy'));
-        resolve(row);
+        resolve({
+          id: row.id,
+          rules: JSON.parse(row.rules)
+        });
       }
     );
   });
 }
 
 // ============================================
-// SIGNALS
+// SCORE
 // ============================================
 
-function extractSignals(cartId, decisionTimestamp) {
-  return new Promise((resolve, reject) => {
-    db.all(
-      `SELECT event_type, data, timestamp FROM log 
-       WHERE cart_id = ? AND timestamp <= ?
-       ORDER BY timestamp ASC`,
-      [cartId, decisionTimestamp],
-      (err, rows) => {
-        if (err) return reject(err);
+app.post('/score', async (req, res) => {
+  try {
+    if (!verifySignature(req)) {
+      return res.status(401).send('Invalid signature');
+    }
 
-        const signals = {
-          velocity: 0.5,
-          tab: 0.5,
-          cart_comp: 0.5,
-          friction: 0.5
-        };
+    const {
+      session_id,
+      cart_id,
+      cart_value = 0,
+      signals = {},
+      time_since_last_activity = 0
+    } = req.body;
 
-        if (!rows?.length) return resolve(signals);
+    // ✅ Input validation
+    if (!session_id || !cart_id) {
+      return res.status(400).json({
+        error: 'Missing session_id or cart_id'
+      });
+    }
 
-        const events = rows.map(r => ({
-          type: r.event_type,
-          data: safeJSONParse(r.data),
-          ts: new Date(r.timestamp)
-        }));
+    const idempotency_key =
+      req.body.idempotency_key ||
+      crypto.randomBytes(12).toString('hex');
 
-        const first = events[0];
-        const webhook = [...events].reverse().find(e => e.type === 'webhook');
+    const existing = await new Promise((resolve) => {
+      db.get(
+        `SELECT * FROM decisions WHERE idempotency_key=?`,
+        [idempotency_key],
+        (_, row) => resolve(row)
+      );
+    });
 
-        if (first && webhook) {
-          const delta = (webhook.ts - first.ts) / 1000;
-          signals.velocity = delta < 180 ? 1.0 : delta < 600 ? 0.7 : 0.3;
-        }
-
-        const tracks = events.filter(e => e.type === 'track');
-        if (tracks.length) {
-          const last = tracks[tracks.length - 1];
-          const tabSwitches = last.data.tab_switch_count || 0;
-
-          signals.tab =
-            tabSwitches === 0 ? 1.0 :
-            tabSwitches <= 2 ? 0.6 : 0.2;
-
-          if (last.data.friction_clicks?.shipping || last.data.friction_clicks?.returns) {
-            signals.friction = 0.7;
-          }
-        }
-
-        if (webhook) {
-          const value = webhook.data.total_price || 0;
-          const items = webhook.data.items || 0;
-
-          signals.cart_comp =
-            value > 200 && items === 1 ? 0.8 :
-            items >= 3 ? 0.4 : 0.6;
-        }
-
-        resolve(signals);
+    // ✅ Idempotency safety
+    if (existing) {
+      if (existing.cart_id !== cart_id) {
+        return res.status(409).json({
+          error: 'Idempotency key reused with different cart'
+        });
       }
+      return res.json(existing);
+    }
+
+    const policy = await getPolicy();
+
+    const group = assignGroup(session_id);
+
+    // ✅ Persist session
+    db.run(
+      `INSERT OR IGNORE INTO sessions (id, experiment_group)
+       VALUES (?, ?)`,
+      [session_id, group]
     );
-  });
-}
 
-// ============================================
-// SCORING
-// ============================================
+    const fullSignals = {
+      velocity: signals.velocity || 0.5,
+      tab: signals.tab || 0.5,
+      cart: signals.cart || 0.5,
+      friction: signals.friction || 0.5
+    };
 
-function scoreSignals(signals, policy) {
-  const rules = safeJSONParse(policy.rules);
+    let score = computeScore(fullSignals, policy.rules.weights);
 
-  return Math.round((
-    signals.velocity * rules.velocity_weight +
-    signals.tab * rules.tab_weight +
-    signals.cart_comp * rules.cart_comp_weight +
-    signals.friction * rules.friction_weight
-  ) * 100) / 100;
-}
+    const timeScore = Math.min(1, time_since_last_activity / 1800);
+    score = score * (1 - 0.5 * timeScore);
 
-function decideAction(score, policy) {
-  const rules = safeJSONParse(policy.rules);
+    const pNo = estimateConversion(score);
+    const lift = computeLift(score);
+    const pYes = Math.min(1, pNo + lift);
 
-  if (score >= rules.suppress_threshold) return 'SUPPRESS';
-  if (score >= rules.remind_threshold) return 'REMIND';
-  return 'INCENTIVISE';
-}
+    const discountPct = getDiscountPct(cart_value);
 
-function reasonCodeForAction(action) {
-  if (action === 'SUPPRESS') return 'PREMIUM_PROTECTION';
-  if (action === 'REMIND') return 'GENTLE_NUDGE';
-  return 'MARGIN_RECOVERY';
-}
+    const discount = Math.min(
+      cart_value * discountPct,
+      policy.rules.discount.cap
+    );
 
-// ============================================
-// COUNTERFACTUALS
-// ============================================
+    const evNo = pNo * cart_value * 0.35;
+    const evYes = pYes * (cart_value - discount) * 0.35;
 
-function calculateCounterfactuals(score, cartValue, action, policy) {
-  const rules = safeJSONParse(policy.rules);
-  const margin = 0.35;
+    let action = 'NONE';
 
-  const p0 = Math.min(0.95, score);
-  const p1 = Math.min(0.95, p0 + 0.15);
+    // ✅ Negative EV guard
+    if (evYes > evNo && evYes > 0) {
+      if (discountPct <= 0.05) action = 'INCENTIVE_LOW';
+      else if (discountPct <= 0.10) action = 'INCENTIVE_MED';
+      else action = 'INCENTIVE_HIGH';
+    }
 
-  const lift = (p1 - p0) * cartValue * margin;
+    if (group === 'CONTROL') {
+      action = 'NONE';
+    }
 
-  let discountCost = 0;
-  let discountType = null;
-  let discountValue = 0;
-  let discountCap = 0;
+    const netEV = Math.max(evYes, evNo);
 
-  if (action === 'INCENTIVISE') {
-    discountType = 'percentage';
-    discountValue = rules.incentivise_discount_pct;
-    discountCap = rules.incentivise_discount_cap;
+    // ✅ Observability
+    console.log({
+      session_id,
+      score,
+      action,
+      evNo,
+      evYes,
+      group
+    });
 
-    const discount = Math.min(cartValue * discountValue / 100, discountCap);
-    discountCost = discount * p1;
+    const decisionId = await new Promise((resolve, reject) => {
+      db.run(
+        `INSERT INTO decisions
+        (idempotency_key, session_id, cart_id, action,
+         composite_score, est_net_expected_value, experiment_group)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          idempotency_key,
+          session_id,
+          cart_id,
+          action,
+          score,
+          netEV,
+          group
+        ],
+        function (err) {
+          if (err) reject(err);
+          else resolve(this.lastID);
+        }
+      );
+    });
+
+    res.json({
+      decision_id: decisionId,
+      action,
+      score,
+      ev_no: evNo,
+      ev_yes: evYes,
+      lift,
+      discount,
+      group
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  return {
-    probWithoutAction: Math.round(p0 * 100) / 100,
-    probWithAction: Math.round(p1 * 100) / 100,
-    expectedLiftValue: Math.round(lift * 100) / 100,
-    expectedDiscountCost: Math.round(discountCost * 100) / 100,
-    netExpectedValue: Math.round((lift - discountCost) * 100) / 100,
-    discountType,
-    discountValue,
-    discountCap
-  };
-}
+});
 
 // ============================================
-// ENDPOINTS
+// ACTION
 // ============================================
 
-app.use(express.json({ verify: (req, res, buf) => (req.rawBody = buf) }));
+app.post('/action', (req, res) => {
+  const { decision_id } = req.body;
 
-// (rest unchanged: webhook, track, score, action, outcome, health)
+  db.run(
+    `UPDATE decisions
+     SET state='ACTIONED'
+     WHERE id=? AND state='EVALUATED'`,
+    [decision_id],
+    function () {
+      if (this.changes === 0) {
+        return res.status(409).send('Invalid state');
+      }
+      res.json({ ok: true });
+    }
+  );
+});
+
+// ============================================
+// OUTCOME
+// ============================================
+
+app.post('/outcome', (req, res) => {
+  const {
+    decision_id,
+    converted,
+    final_revenue = 0,
+    discount_applied = 0
+  } = req.body;
+
+  // ✅ Validate decision exists
+  db.get(
+    `SELECT id FROM decisions WHERE id=?`,
+    [decision_id],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.status(400).send('Invalid decision_id');
+
+      db.run(
+        `INSERT INTO outcomes
+        (decision_id, converted, final_revenue, discount_applied)
+        VALUES (?, ?, ?, ?)`,
+        [decision_id, converted ? 1 : 0, final_revenue, discount_applied]
+      );
+
+      db.run(
+        `UPDATE decisions
+         SET state='DELIVERED'
+         WHERE id=?`,
+        [decision_id]
+      );
+
+      res.json({ ok: true });
+    }
+  );
+});
+
+// ============================================
 
 app.listen(PORT, () => {
   console.log(`[REDEN] ${ENGINE_VERSION} running`);
-});
+});   
