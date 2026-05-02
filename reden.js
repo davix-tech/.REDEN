@@ -9,12 +9,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-if (!process.env.WEBHOOK_SECRET) {
-  console.error("Missing WEBHOOK_SECRET");
-  process.exit(1);
-}
-
-const SECRET = process.env.WEBHOOK_SECRET;
 const ENGINE_VERSION = 'v2.2.0';
 
 // ============================================
@@ -80,29 +74,6 @@ db.serialize(() => {
 });
 
 // ============================================
-// SECURITY
-// ============================================
-
-function verifySignature(req) {
-  const sig = req.headers['x-signature'];
-  if (!sig) return false;
-
-  const expected = crypto
-    .createHmac('sha256', SECRET)
-    .update(JSON.stringify(req.body))
-    .digest('hex');
-i
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(sig),
-      Buffer.from(expected)
-    );
-  } catch {
-    return false;
-  }
-}
-
-// ============================================
 // EXPERIMENT
 // ============================================
 
@@ -163,15 +134,11 @@ function getPolicy() {
 }
 
 // ============================================
-// SCORE
+// SCORE (NO SIGNATURE)
 // ============================================
 
 app.post('/score', async (req, res) => {
   try {
-    if (!verifySignature(req)) {
-      return res.status(401).send('Invalid signature');
-    }
-
     const {
       session_id,
       cart_id,
@@ -180,7 +147,6 @@ app.post('/score', async (req, res) => {
       time_since_last_activity = 0
     } = req.body;
 
-    // ✅ Input validation
     if (!session_id || !cart_id) {
       return res.status(400).json({
         error: 'Missing session_id or cart_id'
@@ -199,7 +165,6 @@ app.post('/score', async (req, res) => {
       );
     });
 
-    // ✅ Idempotency safety
     if (existing) {
       if (existing.cart_id !== cart_id) {
         return res.status(409).json({
@@ -210,10 +175,8 @@ app.post('/score', async (req, res) => {
     }
 
     const policy = await getPolicy();
-
     const group = assignGroup(session_id);
 
-    // ✅ Persist session
     db.run(
       `INSERT OR IGNORE INTO sessions (id, experiment_group)
        VALUES (?, ?)`,
@@ -248,7 +211,6 @@ app.post('/score', async (req, res) => {
 
     let action = 'NONE';
 
-    // ✅ Negative EV guard
     if (evYes > evNo && evYes > 0) {
       if (discountPct <= 0.05) action = 'INCENTIVE_LOW';
       else if (discountPct <= 0.10) action = 'INCENTIVE_MED';
@@ -261,7 +223,6 @@ app.post('/score', async (req, res) => {
 
     const netEV = Math.max(evYes, evNo);
 
-    // ✅ Observability
     console.log({
       session_id,
       score,
@@ -310,67 +271,7 @@ app.post('/score', async (req, res) => {
 });
 
 // ============================================
-// ACTION
-// ============================================
-
-app.post('/action', (req, res) => {
-  const { decision_id } = req.body;
-
-  db.run(
-    `UPDATE decisions
-     SET state='ACTIONED'
-     WHERE id=? AND state='EVALUATED'`,
-    [decision_id],
-    function () {
-      if (this.changes === 0) {
-        return res.status(409).send('Invalid state');
-      }
-      res.json({ ok: true });
-    }
-  );
-});
-
-// ============================================
-// OUTCOME
-// ============================================
-
-app.post('/outcome', (req, res) => {
-  const {
-    decision_id,
-    converted,
-    final_revenue = 0,
-    discount_applied = 0
-  } = req.body;
-
-  // ✅ Validate decision exists
-  db.get(
-    `SELECT id FROM decisions WHERE id=?`,
-    [decision_id],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(400).send('Invalid decision_id');
-
-      db.run(
-        `INSERT INTO outcomes
-        (decision_id, converted, final_revenue, discount_applied)
-        VALUES (?, ?, ?, ?)`,
-        [decision_id, converted ? 1 : 0, final_revenue, discount_applied]
-      );
-
-      db.run(
-        `UPDATE decisions
-         SET state='DELIVERED'
-         WHERE id=?`,
-        [decision_id]
-      );
-
-      res.json({ ok: true });
-    }
-  );
-});
-
-// ============================================
 
 app.listen(PORT, () => {
   console.log(`[REDEN] ${ENGINE_VERSION} running`);
-});   
+}); 
