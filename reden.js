@@ -37,7 +37,43 @@ db.serialize(() => {
 });
 
 // ============================================
-// SCORE
+// LEARNED PROBABILITIES
+// ============================================
+
+function getConversionRates(callback) {
+  db.all(
+    `
+    SELECT d.action,
+           COUNT(*) as total,
+           SUM(o.converted) as conversions
+    FROM outcomes o
+    JOIN decisions d ON o.decision_id = d.id
+    GROUP BY d.action
+    `,
+    (err, rows) => {
+      if (err) return callback(err);
+
+      // fallback defaults (used when data is low)
+      const rates = {
+        NONE: 0.2,
+        INCENTIVE_LOW: 0.25,
+        INCENTIVE_MED: 0.3,
+        INCENTIVE_HIGH: 0.35
+      };
+
+      rows.forEach(r => {
+        if (r.total > 0) {
+          rates[r.action] = r.conversions / r.total;
+        }
+      });
+
+      callback(null, rates);
+    }
+  );
+}
+
+// ============================================
+// SCORE (DATA-DRIVEN EV)
 // ============================================
 
 app.post('/score', (req, res) => {
@@ -47,38 +83,67 @@ app.post('/score', (req, res) => {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
-  let action = 'NONE';
-
-  if (cart_value > 200) action = 'INCENTIVE_HIGH';
-  else if (cart_value > 100) action = 'INCENTIVE_MED';
-  else if (cart_value > 50) action = 'INCENTIVE_LOW';
-
-  // Exploration (10% chance override)
-  if (Math.random() < 0.1) {
-    action = 'NONE';
-  }
-
-  let discount = 0;
-  if (action === 'INCENTIVE_LOW') discount = 5;
-  if (action === 'INCENTIVE_MED') discount = 10;
-  if (action === 'INCENTIVE_HIGH') discount = 15;
-
-  db.run(
-    `INSERT INTO decisions (session_id, cart_id, action, discount)
-     VALUES (?, ?, ?, ?)`,
-    [session_id, cart_id, action, discount],
-    function (err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-
-      res.json({
-        decision_id: this.lastID,
-        action,
-        discount
-      });
+  getConversionRates((err, rates) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
     }
-  );
+
+    const dLow = 5;
+    const dMed = 10;
+    const dHigh = 15;
+
+    const evNone = rates.NONE * cart_value;
+    const evLow = rates.INCENTIVE_LOW * (cart_value - dLow);
+    const evMed = rates.INCENTIVE_MED * (cart_value - dMed);
+    const evHigh = rates.INCENTIVE_HIGH * (cart_value - dHigh);
+
+    let action = 'NONE';
+    let discount = 0;
+    let bestEV = evNone;
+
+    if (evLow > bestEV) {
+      action = 'INCENTIVE_LOW';
+      discount = dLow;
+      bestEV = evLow;
+    }
+
+    if (evMed > bestEV) {
+      action = 'INCENTIVE_MED';
+      discount = dMed;
+      bestEV = evMed;
+    }
+
+    if (evHigh > bestEV) {
+      action = 'INCENTIVE_HIGH';
+      discount = dHigh;
+      bestEV = evHigh;
+    }
+
+    // exploration (keep learning)
+    if (Math.random() < 0.1) {
+      action = 'NONE';
+      discount = 0;
+    }
+
+    db.run(
+      `INSERT INTO decisions (session_id, cart_id, action, discount)
+       VALUES (?, ?, ?, ?)`,
+      [session_id, cart_id, action, discount],
+      function (err) {
+        if (err) {
+          return res.status(500).json({ error: err.message });
+        }
+
+        res.json({
+          decision_id: this.lastID,
+          action,
+          discount,
+          expected_value: bestEV,
+          rates_used: rates
+        });
+      }
+    );
+  });
 });
 
 // ============================================
@@ -107,7 +172,7 @@ app.post('/action', (req, res) => {
 });
 
 // ============================================
-// OUTCOME (VALIDATED)
+// OUTCOME (STRICT)
 // ============================================
 
 app.post('/outcome', (req, res) => {
@@ -145,7 +210,7 @@ app.post('/outcome', (req, res) => {
 });
 
 // ============================================
-// OUTCOMES (READ)
+// OUTCOMES
 // ============================================
 
 app.get('/outcomes', (req, res) => {
@@ -186,5 +251,5 @@ app.get('/metrics', (req, res) => {
 // ============================================
 
 app.listen(PORT, () => {
-  console.log(`REDEN v1.1 running on ${PORT}`);
+  console.log(`REDEN v1.6 (Learning) running on ${PORT}`);
 });
