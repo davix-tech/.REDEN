@@ -135,6 +135,38 @@ app.get('/outcomes', (req, res) => {
 });
 
 // ============================================
+// METRICS
+// ============================================
+
+app.get('/metrics', (req, res) => {
+  db.get(
+    `SELECT
+        COUNT(*) as total,
+        SUM(converted) as conversions,
+        AVG(final_revenue) as avg_revenue
+     FROM outcomes`,
+    (err, row) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+
+      const total = row.total || 0;
+      const conversions = row.conversions || 0;
+
+      const conversion_rate =
+        total > 0 ? conversions / total : 0;
+
+      res.json({
+        total,
+        conversions,
+        conversion_rate,
+        avg_revenue: row.avg_revenue || 0
+      });
+    }
+  );
+});
+
+// ============================================
 
 app.listen(PORT, () => {
   console.log(`REDEN v1 running on ${PORT}`);
