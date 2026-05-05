@@ -53,7 +53,6 @@ function getConversionRates(callback) {
     (err, rows) => {
       if (err) return callback(err);
 
-      // fallback defaults (used when data is low)
       const rates = {
         NONE: 0.2,
         INCENTIVE_LOW: 0.25,
@@ -73,7 +72,7 @@ function getConversionRates(callback) {
 }
 
 // ============================================
-// SCORE (DATA-DRIVEN EV)
+// SCORE
 // ============================================
 
 app.post('/score', (req, res) => {
@@ -119,7 +118,7 @@ app.post('/score', (req, res) => {
       bestEV = evHigh;
     }
 
-    // exploration (keep learning)
+    // exploration
     if (Math.random() < 0.1) {
       action = 'NONE';
       discount = 0;
@@ -249,7 +248,66 @@ app.get('/metrics', (req, res) => {
 });
 
 // ============================================
+// TEST ROUTES (BROWSER)
+// ============================================
+
+// full pipeline test
+app.get('/test-flow', (req, res) => {
+  const session_id = 'test_' + Date.now();
+  const cart_id = 'cart_' + Date.now();
+  const cart_value = 120;
+
+  getConversionRates((err, rates) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const action = 'INCENTIVE_MED';
+    const discount = 10;
+
+    db.run(
+      `INSERT INTO decisions (session_id, cart_id, action, discount)
+       VALUES (?, ?, ?, ?)`,
+      [session_id, cart_id, action, discount],
+      function (err) {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const decision_id = this.lastID;
+
+        // mark as actioned
+        db.run(
+          `UPDATE decisions SET state='ACTIONED' WHERE id=?`,
+          [decision_id]
+        );
+
+        const converted = Math.random() > 0.5;
+        const revenue = converted ? 100 + Math.random() * 50 : 0;
+
+        db.run(
+          `INSERT INTO outcomes (decision_id, converted, final_revenue)
+           VALUES (?, ?, ?)`,
+          [decision_id, converted ? 1 : 0, revenue],
+          () => {
+            res.json({
+              decision_id,
+              action,
+              converted,
+              revenue
+            });
+          }
+        );
+      }
+    );
+  });
+});
+
+// reset DB
+app.get('/reset', (req, res) => {
+  db.run(`DELETE FROM decisions`);
+  db.run(`DELETE FROM outcomes`);
+  res.json({ ok: true });
+});
+
+// ============================================
 
 app.listen(PORT, () => {
-  console.log(`REDEN v1.6 (Learning) running on ${PORT}`);
+  console.log(`REDEN v1.7 (Learning + Test Mode) running on ${PORT}`);
 });
