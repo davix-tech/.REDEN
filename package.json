@@ -1,18 +1,14 @@
 {
   "name": "reden",
-  "version": "0.1.0",
-  "description": "REDEN - Single file decision engine",
+  "version": "1.0.0",
+  "description": "REDEN - Adaptive cart recovery decision engine",
   "main": "reden.js",
-  "bin": {
-    "reden": "reden.js"
-  },
   "scripts": {
-    "start": "node reden.js",
-    "dev": "node reden.js"
+    "start": "node reden.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "sqlite3": "^5.1.6"
+    "pg": "^8.11.0"
   },
   "engines": {
     "node": ">=18"
