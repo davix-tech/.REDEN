@@ -1,10 +1,13 @@
-// server.js
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
+import dotenv from "dotenv";
 import Redis from "ioredis";
 import { Queue, Worker } from "bullmq";
-import crypto from "crypto";
+import { db } from "./db.js";
+import { pickAction, updateBandit } from "./bandit.js";
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,188 +15,148 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json());
 
-// ─────────────────────────────
-// CONFIG
-// ─────────────────────────────
-const PORT = process.env.PORT || 3000;
-const REDIS_URL = process.env.REDIS_URL || null;
+const redis = new Redis(process.env.REDIS_URL);
+const queue = new Queue("outcomes", { connection: redis });
 
-// ─────────────────────────────
-// REDIS (safe fallback)
-// ─────────────────────────────
-let redis = null;
-let queue = null;
+// Worker (async learning)
+new Worker(
+  "outcomes",
+  async job => {
+    const { decision_id, converted, revenue, action } = job.data;
 
-if (REDIS_URL) {
-  redis = new Redis(REDIS_URL);
-  queue = new Queue("outcomes", { connection: redis });
+    await db.query(
+      "INSERT INTO outcomes(decision_id, converted, revenue) VALUES($1,$2,$3)",
+      [decision_id, converted, revenue]
+    );
 
-  new Worker(
-    "outcomes",
-    async job => {
-      const { decision_id, converted, revenue } = job.data;
+    await updateBandit(action, converted);
+  },
+  { connection: redis }
+);
 
-      const d = decisions.get(decision_id);
-      if (!d) return;
-
-      d.state = "ACTIONED";
-      d.converted = converted;
-      d.revenue = revenue;
-
-      metrics.total++;
-      if (converted) {
-        metrics.conversions++;
-        metrics.revenue += revenue;
-      }
-    },
-    { connection: redis }
-  );
-
-  console.log("✔ Redis + Queue active");
-} else {
-  console.log("⚠ Running WITHOUT Redis (dev mode)");
-}
-
-// ─────────────────────────────
-// IN-MEMORY STORE (replace with DB later)
-// ─────────────────────────────
-const decisions = new Map();
-
-const metrics = {
-  total: 0,
-  conversions: 0,
-  revenue: 0
+// Discount map
+const discounts = {
+  NONE: 0,
+  INCENTIVE_LOW: 5,
+  INCENTIVE_MED: 10,
+  INCENTIVE_HIGH: 20
 };
 
-// ─────────────────────────────
-// HELPERS
-// ─────────────────────────────
-function pickAction(cart) {
-  if (cart < 50) return "INCENTIVE_LOW";
-  if (cart < 150) return "INCENTIVE_MED";
-  return "INCENTIVE_HIGH";
-}
+// ───────── SCORE
+app.post("/score", async (req, res) => {
+  try {
+    const { session_id, cart_value } = req.body;
 
-function discountFor(action) {
-  switch (action) {
-    case "INCENTIVE_LOW": return 5;
-    case "INCENTIVE_MED": return 10;
-    case "INCENTIVE_HIGH": return 20;
-    default: return 0;
+    if (!session_id || typeof cart_value !== "number") {
+      return res.status(400).json({ error: "Invalid payload" });
+    }
+
+    const action = await pickAction();
+    const discount = discounts[action];
+    const explored = Math.random() < 0.2;
+
+    const ev = cart_value - discount;
+
+    const result = await db.query(
+      `INSERT INTO decisions(session_id, cart_value, action, discount, explored, state)
+       VALUES($1,$2,$3,$4,$5,'EVALUATED')
+       RETURNING id`,
+      [session_id, cart_value, action, discount, explored]
+    );
+
+    res.json({
+      decision_id: result.rows[0].id,
+      action,
+      discount,
+      expected_value: ev,
+      explored
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-}
-
-// ─────────────────────────────
-// ROUTES
-// ─────────────────────────────
-
-// SCORE
-app.post("/score", (req, res) => {
-  const { session_id, cart_value } = req.body;
-
-  if (!session_id || typeof cart_value !== "number") {
-    return res.status(400).json({ error: "Invalid payload" });
-  }
-
-  const action = pickAction(cart_value);
-  const discount = discountFor(action);
-  const explored = Math.random() < 0.2;
-
-  const decision_id = Math.floor(Math.random() * 1e6);
-
-  const expected_value = cart_value - discount;
-
-  decisions.set(decision_id, {
-    session_id,
-    cart_value,
-    action,
-    discount,
-    explored,
-    state: "EVALUATED"
-  });
-
-  res.json({
-    decision_id,
-    action,
-    discount,
-    expected_value,
-    explored
-  });
 });
 
-// ACTION
-app.post("/action", (req, res) => {
+// ───────── ACTION
+app.post("/action", async (req, res) => {
   const { decision_id } = req.body;
 
-  const d = decisions.get(decision_id);
-  if (!d || d.state !== "EVALUATED") {
+  const r = await db.query(
+    `UPDATE decisions SET state='ACTIONED'
+     WHERE id=$1 AND state='EVALUATED'`,
+    [decision_id]
+  );
+
+  if (r.rowCount === 0) {
     return res.status(409).json({ error: "Invalid state" });
   }
 
-  d.state = "ACTIONED";
-
   res.json({ ok: true });
 });
 
-// OUTCOME
+// ───────── OUTCOME
 app.post("/outcome", async (req, res) => {
   const { decision_id, converted, revenue } = req.body;
 
-  if (queue) {
-    await queue.add("record", { decision_id, converted, revenue });
-  } else {
-    // fallback
-    const d = decisions.get(decision_id);
-    if (d) {
-      metrics.total++;
-      if (converted) {
-        metrics.conversions++;
-        metrics.revenue += revenue;
-      }
-    }
+  const d = await db.query(
+    "SELECT action FROM decisions WHERE id=$1",
+    [decision_id]
+  );
+
+  if (!d.rows.length) {
+    return res.status(404).json({ error: "Decision not found" });
   }
+
+  await queue.add("record", {
+    decision_id,
+    converted,
+    revenue,
+    action: d.rows[0].action
+  });
 
   res.json({ ok: true });
 });
 
-// METRICS
-app.get("/metrics", (req, res) => {
-  const rate = metrics.total
-    ? metrics.conversions / metrics.total
-    : 0;
+// ───────── METRICS
+app.get("/metrics", async (req, res) => {
+  const r = await db.query(`
+    SELECT 
+      COUNT(*) as total,
+      SUM(CASE WHEN converted THEN 1 ELSE 0 END) as conversions,
+      AVG(revenue) as avg_revenue
+    FROM outcomes
+  `);
+
+  const total = Number(r.rows[0].total || 0);
+  const conversions = Number(r.rows[0].conversions || 0);
 
   res.json({
-    total: metrics.total,
-    conversions: metrics.conversions,
-    conversion_rate: rate,
-    avg_revenue: metrics.total
-      ? metrics.revenue / metrics.total
-      : 0
+    total,
+    conversions,
+    conversion_rate: total ? conversions / total : 0,
+    avg_revenue: Number(r.rows[0].avg_revenue || 0)
   });
 });
 
-// ACTION METRICS (simple mock)
-app.get("/metrics/actions", (req, res) => {
-  res.json([
-    { action: "NONE", total: 10, conversion_rate: 0.1 },
-    { action: "INCENTIVE_LOW", total: 20, conversion_rate: 0.25 },
-    { action: "INCENTIVE_MED", total: 30, conversion_rate: 0.4 },
-    { action: "INCENTIVE_HIGH", total: 25, conversion_rate: 0.55 }
-  ]);
+// ───────── ACTION METRICS
+app.get("/metrics/actions", async (req, res) => {
+  const r = await db.query(`
+    SELECT d.action,
+           COUNT(o.*) as total,
+           AVG(CASE WHEN o.converted THEN 1 ELSE 0 END) as conversion_rate
+    FROM decisions d
+    LEFT JOIN outcomes o ON d.id = o.decision_id
+    GROUP BY d.action
+  `);
+
+  res.json(r.rows);
 });
 
-// ─────────────────────────────
-// STATIC FRONTEND
-// ─────────────────────────────
+// ───────── STATIC
 app.use(express.static(path.join(__dirname, "public")));
+app.get("*", (req, res) =>
+  res.sendFile(path.join(__dirname, "public/index.html"))
+);
 
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "public/index.html"));
-});
-
-// ─────────────────────────────
-// START
-// ─────────────────────────────
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(process.env.PORT, () =>
+  console.log("REDEN production server running")
+);
