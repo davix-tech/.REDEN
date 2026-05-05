@@ -37,7 +37,19 @@ db.serialize(() => {
 });
 
 // ============================================
-// LEARNING (STABILIZED)
+// HEALTH (VERY IMPORTANT FOR DEBUGGING)
+// ============================================
+
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'REDEN v1.7',
+    endpoints: ['/score', '/action', '/outcome', '/metrics', '/outcomes', '/testflow']
+  });
+});
+
+// ============================================
+// LEARNING (PROBABILITIES)
 // ============================================
 
 function getConversionRates(callback) {
@@ -53,24 +65,17 @@ function getConversionRates(callback) {
     (err, rows) => {
       if (err) return callback(err);
 
-      const baseRates = {
+      const rates = {
         NONE: 0.2,
         INCENTIVE_LOW: 0.25,
         INCENTIVE_MED: 0.3,
         INCENTIVE_HIGH: 0.35
       };
 
-      const PRIOR_WEIGHT = 5;
-      const rates = { ...baseRates };
-
       rows.forEach(r => {
-        const prior = baseRates[r.action] || 0.2;
-
-        const adjusted =
-          (r.conversions + PRIOR_WEIGHT * prior) /
-          (r.total + PRIOR_WEIGHT);
-
-        rates[r.action] = adjusted;
+        if (r.total > 0) {
+          rates[r.action] = r.conversions / r.total;
+        }
       });
 
       callback(null, rates);
@@ -90,7 +95,9 @@ app.post('/score', (req, res) => {
   }
 
   getConversionRates((err, rates) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
 
     const dLow = 5;
     const dMed = 10;
@@ -134,7 +141,9 @@ app.post('/score', (req, res) => {
        VALUES (?, ?, ?, ?)`,
       [session_id, cart_id, action, discount],
       function (err) {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) {
+          return res.status(500).json({ error: err.message });
+        }
 
         res.json({
           decision_id: this.lastID,
@@ -188,7 +197,9 @@ app.post('/outcome', (req, res) => {
     `SELECT state FROM decisions WHERE id=?`,
     [decision_id],
     (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
 
       if (!row || row.state !== 'ACTIONED') {
         return res.status(409).json({ error: 'Decision not actioned' });
@@ -210,92 +221,30 @@ app.post('/outcome', (req, res) => {
 });
 
 // ============================================
-// TEST FLOW (SIMULATION)
+// OUTCOMES (THIS WAS MISSING IN YOUR DEPLOY)
 // ============================================
 
-app.get('/test-flow', (req, res) => {
-  const session_id = 'test_' + Math.random().toString(36).substring(7);
-  const cart_id = 'cart_' + Math.random().toString(36).substring(7);
-  const cart_value = Math.floor(Math.random() * 200) + 50;
-
-  getConversionRates((err, rates) => {
-    if (err) return res.status(500).json({ error: err.message });
-
-    const dLow = 5;
-    const dMed = 10;
-    const dHigh = 15;
-
-    const evNone = rates.NONE * cart_value;
-    const evLow = rates.INCENTIVE_LOW * (cart_value - dLow);
-    const evMed = rates.INCENTIVE_MED * (cart_value - dMed);
-    const evHigh = rates.INCENTIVE_HIGH * (cart_value - dHigh);
-
-    let action = 'NONE';
-    let discount = 0;
-    let bestEV = evNone;
-
-    if (evLow > bestEV) {
-      action = 'INCENTIVE_LOW';
-      discount = dLow;
-      bestEV = evLow;
-    }
-
-    if (evMed > bestEV) {
-      action = 'INCENTIVE_MED';
-      discount = dMed;
-      bestEV = evMed;
-    }
-
-    if (evHigh > bestEV) {
-      action = 'INCENTIVE_HIGH';
-      discount = dHigh;
-      bestEV = evHigh;
-    }
-
-    const prob = rates[action] || 0.2;
-    const converted = Math.random() < prob;
-    const revenue = converted ? (cart_value - discount) : 0;
-
-    db.run(
-      `INSERT INTO decisions (session_id, cart_id, action, discount)
-       VALUES (?, ?, ?, ?)`,
-      [session_id, cart_id, action, discount],
-      function (err) {
-        if (err) return res.status(500).json({ error: err.message });
-
-        const decision_id = this.lastID;
-
-        db.run(
-          `UPDATE decisions SET state='ACTIONED' WHERE id=?`,
-          [decision_id],
-          () => {
-            db.run(
-              `INSERT INTO outcomes (decision_id, converted, final_revenue)
-               VALUES (?, ?, ?)`,
-              [decision_id, converted ? 1 : 0, revenue],
-              () => {
-                res.json({
-                  decision_id,
-                  action,
-                  converted,
-                  revenue
-                });
-              }
-            );
-          }
-        );
+app.get('/outcomes', (req, res) => {
+  db.all(
+    `SELECT * FROM outcomes ORDER BY created_at DESC LIMIT 50`,
+    (err, rows) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
       }
-    );
-  });
+      res.json(rows);
+    }
+  );
 });
 
 // ============================================
-// METRICS (GLOBAL)
+// METRICS
 // ============================================
 
 app.get('/metrics', (req, res) => {
   db.all(`SELECT * FROM outcomes`, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
 
     const total = rows.length;
     const conversions = rows.filter(r => r.converted).length;
@@ -311,37 +260,54 @@ app.get('/metrics', (req, res) => {
 });
 
 // ============================================
-// METRICS (PER ACTION)
+// TEST FLOW (AUTO END-TO-END)
 // ============================================
 
-app.get('/metrics/actions', (req, res) => {
-  db.all(
-    `
-    SELECT 
-      d.action,
-      COUNT(*) as total,
-      SUM(o.converted) as conversions,
-      AVG(o.final_revenue) as avg_revenue
-    FROM decisions d
-    JOIN outcomes o ON d.id = o.decision_id
-    GROUP BY d.action
-    `,
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
+app.get('/testflow', (req, res) => {
+  const session_id = 'test_' + Date.now();
+  const cart_id = 'cart_' + Math.floor(Math.random() * 1000);
+  const cart_value = Math.floor(Math.random() * 200) + 50;
 
-      res.json(rows.map(r => ({
-        action: r.action,
-        total: r.total,
-        conversions: r.conversions || 0,
-        conversion_rate: r.total ? (r.conversions || 0) / r.total : 0,
-        avg_revenue: r.avg_revenue || 0
-      })));
-    }
-  );
+  getConversionRates((err, rates) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const actions = ['NONE', 'INCENTIVE_LOW', 'INCENTIVE_MED', 'INCENTIVE_HIGH'];
+    const discounts = { NONE: 0, INCENTIVE_LOW: 5, INCENTIVE_MED: 10, INCENTIVE_HIGH: 15 };
+
+    const action = actions[Math.floor(Math.random() * actions.length)];
+    const discount = discounts[action];
+
+    db.run(
+      `INSERT INTO decisions (session_id, cart_id, action, discount, state)
+       VALUES (?, ?, ?, ?, 'ACTIONED')`,
+      [session_id, cart_id, action, discount],
+      function () {
+        const decision_id = this.lastID;
+
+        const prob = rates[action] || 0.2;
+        const converted = Math.random() < prob;
+        const revenue = converted ? cart_value - discount : 0;
+
+        db.run(
+          `INSERT INTO outcomes (decision_id, converted, final_revenue)
+           VALUES (?, ?, ?)`,
+          [decision_id, converted ? 1 : 0, revenue],
+          () => {
+            res.json({
+              decision_id,
+              action,
+              converted,
+              revenue
+            });
+          }
+        );
+      }
+    );
+  });
 });
 
 // ============================================
 
 app.listen(PORT, () => {
-  console.log(`REDEN v1 FINAL running on ${PORT}`);
+  console.log(`REDEN v1.7 running on ${PORT}`);
 });
