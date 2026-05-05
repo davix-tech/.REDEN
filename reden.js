@@ -9,18 +9,6 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ============================================
-// BASIC HEALTH
-// ============================================
-
-app.get('/', (req, res) => {
-  res.send('REDEN v1 LIVE');
-});
-
-app.get('/testflow', (req, res) => {
-  res.json({ ok: true, message: 'API working' });
-});
-
-// ============================================
 // DATABASE
 // ============================================
 
@@ -46,6 +34,14 @@ db.serialize(() => {
     final_revenue REAL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+});
+
+// ============================================
+// ROOT (IMPORTANT - avoids "Cannot GET /")
+// ============================================
+
+app.get('/', (req, res) => {
+  res.json({ status: 'REDEN v1 LIVE' });
 });
 
 // ============================================
@@ -249,7 +245,7 @@ app.get('/metrics', (req, res) => {
 });
 
 // ============================================
-// METRICS BY ACTION
+// METRICS BY ACTION (FIXED)
 // ============================================
 
 app.get('/metrics/actions', (req, res) => {
@@ -267,13 +263,14 @@ app.get('/metrics/actions', (req, res) => {
     (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
 
-      res.json(rows.map(r => ({
+      const result = rows.map(r => ({
         action: r.action,
         total: r.total,
-        conversions: r.conversions || 0,
         conversion_rate: r.total ? r.conversions / r.total : 0,
         avg_revenue: r.avg_revenue || 0
-      })));
+      }));
+
+      res.json(result);
     }
   );
 });
@@ -281,5 +278,5 @@ app.get('/metrics/actions', (req, res) => {
 // ============================================
 
 app.listen(PORT, () => {
-  console.log(`REDEN v1 FINAL running on ${PORT}`);
-});
+  console.log(`REDEN FINAL running on ${PORT}`);
+});      
