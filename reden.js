@@ -123,6 +123,7 @@ app.post('/score', (req, res) => {
       bestEV = evHigh;
     }
 
+    // exploration
     if (Math.random() < 0.1) {
       action = 'NONE';
       discount = 0;
@@ -209,7 +210,7 @@ app.post('/outcome', (req, res) => {
 });
 
 // ============================================
-// TEST FLOW (AUTO SIMULATION)
+// TEST FLOW (SIMULATION)
 // ============================================
 
 app.get('/test-flow', (req, res) => {
@@ -289,7 +290,7 @@ app.get('/test-flow', (req, res) => {
 });
 
 // ============================================
-// METRICS
+// METRICS (GLOBAL)
 // ============================================
 
 app.get('/metrics', (req, res) => {
@@ -310,8 +311,37 @@ app.get('/metrics', (req, res) => {
 });
 
 // ============================================
+// METRICS (PER ACTION)
+// ============================================
+
+app.get('/metrics/actions', (req, res) => {
+  db.all(
+    `
+    SELECT 
+      d.action,
+      COUNT(*) as total,
+      SUM(o.converted) as conversions,
+      AVG(o.final_revenue) as avg_revenue
+    FROM decisions d
+    JOIN outcomes o ON d.id = o.decision_id
+    GROUP BY d.action
+    `,
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+
+      res.json(rows.map(r => ({
+        action: r.action,
+        total: r.total,
+        conversions: r.conversions || 0,
+        conversion_rate: r.total ? (r.conversions || 0) / r.total : 0,
+        avg_revenue: r.avg_revenue || 0
+      })));
+    }
+  );
+});
+
+// ============================================
 
 app.listen(PORT, () => {
-  console.log(`REDEN v1.9 (Simulation Ready) running on ${PORT}`);
+  console.log(`REDEN v1 FINAL running on ${PORT}`);
 });
-            
