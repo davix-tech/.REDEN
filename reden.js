@@ -2,23 +2,20 @@
 
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const cors = require('cors');
 
 const app = express();
 app.use(express.json());
-app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
 // ============================================
-// BASIC HEALTH (IMPORTANT FOR BROWSER)
+// BASIC HEALTH
 // ============================================
 
 app.get('/', (req, res) => {
   res.send('REDEN v1 LIVE');
 });
 
-// quick sanity test (end-to-end check)
 app.get('/testflow', (req, res) => {
   res.json({ ok: true, message: 'API working' });
 });
@@ -52,7 +49,7 @@ db.serialize(() => {
 });
 
 // ============================================
-// LEARNED PROBABILITIES
+// LEARNING
 // ============================================
 
 function getConversionRates(callback) {
@@ -131,7 +128,6 @@ app.post('/score', (req, res) => {
       bestEV = evHigh;
     }
 
-    // exploration
     if (Math.random() < 0.1) {
       action = 'NONE';
       discount = 0;
@@ -143,8 +139,6 @@ app.post('/score', (req, res) => {
       [session_id, cart_id, action, discount],
       function (err) {
         if (err) return res.status(500).json({ error: err.message });
-
-        console.log('DECISION:', action, discount);
 
         res.json({
           decision_id: this.lastID,
@@ -212,9 +206,6 @@ app.post('/outcome', (req, res) => {
           if (err) {
             return res.status(409).json({ error: 'Outcome already recorded' });
           }
-
-          console.log('OUTCOME:', decision_id, converted, revenue);
-
           res.json({ ok: true });
         }
       );
@@ -276,15 +267,13 @@ app.get('/metrics/actions', (req, res) => {
     (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
 
-      const result = rows.map(r => ({
+      res.json(rows.map(r => ({
         action: r.action,
         total: r.total,
         conversions: r.conversions || 0,
         conversion_rate: r.total ? r.conversions / r.total : 0,
         avg_revenue: r.avg_revenue || 0
-      }));
-
-      res.json(result);
+      })));
     }
   );
 });
