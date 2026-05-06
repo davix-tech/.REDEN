@@ -1,162 +1,185 @@
-import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
-import dotenv from "dotenv";
-import Redis from "ioredis";
-import { Queue, Worker } from "bullmq";
-import { db } from "./db.js";
-import { pickAction, updateBandit } from "./bandit.js";
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>REDEN</title>
 
-dotenv.config();
+<style>
+:root{
+  --bg:#0a0f18;
+  --panel:#0f1624;
+  --border:#1f2a3a;
+  --accent:#6c8dff;
+  --text:#dbe6ff;
+  --dim:#6b7c99;
+}
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+*{box-sizing:border-box;margin:0;padding:0;}
 
-const app = express();
-app.use(express.json());
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:monospace;
+  padding:20px;
+}
 
-const redis = new Redis(process.env.REDIS_URL);
-const queue = new Queue("outcomes", { connection: redis });
+/* layout */
+.container{
+  max-width:900px;
+  margin:auto;
+}
 
-// Worker (async learning)
-new Worker(
-  "outcomes",
-  async job => {
-    const { decision_id, converted, revenue, action } = job.data;
+/* header */
+.header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:20px;
+}
 
-    await db.query(
-      "INSERT INTO outcomes(decision_id, converted, revenue) VALUES($1,$2,$3)",
-      [decision_id, converted, revenue]
-    );
+.title{
+  font-size:22px;
+  letter-spacing:4px;
+}
 
-    await updateBandit(action, converted);
-  },
-  { connection: redis }
-);
+.status{
+  color:#34d399;
+  font-size:12px;
+}
 
-// Discount map
-const discounts = {
-  NONE: 0,
-  INCENTIVE_LOW: 5,
-  INCENTIVE_MED: 10,
-  INCENTIVE_HIGH: 20
-};
+/* panel */
+.panel{
+  background:var(--panel);
+  border:1px solid var(--border);
+  padding:20px;
+  margin-bottom:16px;
+}
 
-// ───────── SCORE
-app.post("/score", async (req, res) => {
+/* input */
+input{
+  width:100%;
+  padding:10px;
+  margin-top:10px;
+  background:#0c1422;
+  border:1px solid var(--border);
+  color:white;
+}
+
+/* button */
+button{
+  margin-top:10px;
+  padding:10px;
+  width:100%;
+  border:none;
+  background:var(--accent);
+  color:white;
+  cursor:pointer;
+}
+
+button:disabled{
+  opacity:0.5;
+}
+
+/* result */
+.result{
+  font-size:18px;
+  margin-top:10px;
+}
+
+/* log */
+.log{
+  font-size:11px;
+  color:var(--dim);
+  max-height:200px;
+  overflow:auto;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="title">REDEN</div>
+    <div class="status">● LIVE</div>
+  </div>
+
+  <!-- INPUT -->
+  <div class="panel">
+    <div>Cart Value</div>
+    <input type="number" id="cart" value="100"/>
+    <button onclick="score()">SCORE</button>
+  </div>
+
+  <!-- RESULT -->
+  <div class="panel">
+    <div>Decision</div>
+    <div class="result" id="result">—</div>
+  </div>
+
+  <!-- LOG -->
+  <div class="panel">
+    <div>System Log</div>
+    <div class="log" id="log"></div>
+  </div>
+
+</div>
+
+<script>
+const BASE = "https://reden-zljf.onrender.com";
+
+let decision = null;
+
+function log(msg){
+  const el = document.getElementById("log");
+  el.innerHTML = msg + "<br>" + el.innerHTML;
+}
+
+/* SAFE FETCH HANDLER */
+async function safeFetch(url, options){
+  const res = await fetch(url, options);
+
+  const text = await res.text();
+
   try {
-    const { session_id, cart_value } = req.body;
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Non-JSON response (likely HTML error page)");
+  }
+}
 
-    if (!session_id || typeof cart_value !== "number") {
-      return res.status(400).json({ error: "Invalid payload" });
-    }
+/* SCORE */
+async function score(){
+  const cart = Number(document.getElementById("cart").value);
 
-    const action = await pickAction();
-    const discount = discounts[action];
-    const explored = Math.random() < 0.2;
+  log("Scoring...");
 
-    const ev = cart_value - discount;
-
-    const result = await db.query(
-      `INSERT INTO decisions(session_id, cart_value, action, discount, explored, state)
-       VALUES($1,$2,$3,$4,$5,'EVALUATED')
-       RETURNING id`,
-      [session_id, cart_value, action, discount, explored]
-    );
-
-    res.json({
-      decision_id: result.rows[0].id,
-      action,
-      discount,
-      expected_value: ev,
-      explored
+  try {
+    const data = await safeFetch(BASE + "/score", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body:JSON.stringify({
+        session_id:"frontend",
+        cart_id:"cart_" + Date.now(),
+        cart_value:cart
+      })
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+
+    decision = data;
+
+    document.getElementById("result").innerText =
+      data.action + " | $" + data.expected_value;
+
+    log("Decision: " + data.action);
+
+  } catch(e){
+    log("ERROR: " + e.message);
   }
-});
+}
+</script>
 
-// ───────── ACTION
-app.post("/action", async (req, res) => {
-  const { decision_id } = req.body;
-
-  const r = await db.query(
-    `UPDATE decisions SET state='ACTIONED'
-     WHERE id=$1 AND state='EVALUATED'`,
-    [decision_id]
-  );
-
-  if (r.rowCount === 0) {
-    return res.status(409).json({ error: "Invalid state" });
-  }
-
-  res.json({ ok: true });
-});
-
-// ───────── OUTCOME
-app.post("/outcome", async (req, res) => {
-  const { decision_id, converted, revenue } = req.body;
-
-  const d = await db.query(
-    "SELECT action FROM decisions WHERE id=$1",
-    [decision_id]
-  );
-
-  if (!d.rows.length) {
-    return res.status(404).json({ error: "Decision not found" });
-  }
-
-  await queue.add("record", {
-    decision_id,
-    converted,
-    revenue,
-    action: d.rows[0].action
-  });
-
-  res.json({ ok: true });
-});
-
-// ───────── METRICS
-app.get("/metrics", async (req, res) => {
-  const r = await db.query(`
-    SELECT 
-      COUNT(*) as total,
-      SUM(CASE WHEN converted THEN 1 ELSE 0 END) as conversions,
-      AVG(revenue) as avg_revenue
-    FROM outcomes
-  `);
-
-  const total = Number(r.rows[0].total || 0);
-  const conversions = Number(r.rows[0].conversions || 0);
-
-  res.json({
-    total,
-    conversions,
-    conversion_rate: total ? conversions / total : 0,
-    avg_revenue: Number(r.rows[0].avg_revenue || 0)
-  });
-});
-
-// ───────── ACTION METRICS
-app.get("/metrics/actions", async (req, res) => {
-  const r = await db.query(`
-    SELECT d.action,
-           COUNT(o.*) as total,
-           AVG(CASE WHEN o.converted THEN 1 ELSE 0 END) as conversion_rate
-    FROM decisions d
-    LEFT JOIN outcomes o ON d.id = o.decision_id
-    GROUP BY d.action
-  `);
-
-  res.json(r.rows);
-});
-
-// ───────── STATIC
-app.use(express.static(path.join(__dirname, "public")));
-app.get("*", (req, res) =>
-  res.sendFile(path.join(__dirname, "public/index.html"))
-);
-
-app.listen(process.env.PORT, () =>
-  console.log("REDEN production server running")
-);
+</body>
+</html>
