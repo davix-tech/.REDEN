@@ -5,10 +5,6 @@ dotenv.config();
 
 const { Pool } = pg;
 
-/* ─────────────────────────────────────────────
-   DATABASE CONNECTION
-───────────────────────────────────────────── */
-
 export const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -16,89 +12,51 @@ export const db = new Pool({
   }
 });
 
-/* ─────────────────────────────────────────────
-   SAFE INIT
-───────────────────────────────────────────── */
-
+/* ─────────────────────────────
+   INIT DATABASE
+───────────────────────────── */
 export async function initDB() {
   try {
 
+    /* DECISIONS TABLE */
     await db.query(`
       CREATE TABLE IF NOT EXISTS decisions (
         id SERIAL PRIMARY KEY,
-
         session_id TEXT NOT NULL,
         cart_id TEXT NOT NULL,
-
         action TEXT NOT NULL,
-
         discount NUMERIC DEFAULT 0,
         expected_value NUMERIC DEFAULT 0,
-
         converted BOOLEAN DEFAULT false,
         revenue NUMERIC DEFAULT 0,
-
-        state TEXT DEFAULT 'SCORED',
-
+        state TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
-      );
+      )
     `);
 
-    /* ─────────────────────────────────────────
-       HARDEN EXISTING TABLES
-    ───────────────────────────────────────── */
-
+    /* BANDIT STATE TABLE */
     await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS session_id TEXT;
+      CREATE TABLE IF NOT EXISTS bandit_state (
+        action TEXT PRIMARY KEY,
+        pulls INTEGER DEFAULT 0,
+        rewards NUMERIC DEFAULT 0
+      )
     `);
 
+    /* SEED ACTIONS */
     await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS cart_id TEXT;
+      INSERT INTO bandit_state (action, pulls, rewards)
+      VALUES
+      ('NONE', 0, 0),
+      ('INCENTIVE_LOW', 0, 0),
+      ('INCENTIVE_MED', 0, 0),
+      ('INCENTIVE_HIGH', 0, 0)
+      ON CONFLICT (action) DO NOTHING
     `);
 
-    await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS action TEXT;
-    `);
-
-    await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS discount NUMERIC DEFAULT 0;
-    `);
-
-    await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS expected_value NUMERIC DEFAULT 0;
-    `);
-
-    await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS converted BOOLEAN DEFAULT false;
-    `);
-
-    await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS revenue NUMERIC DEFAULT 0;
-    `);
-
-    await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS state TEXT DEFAULT 'SCORED';
-    `);
-
-    await db.query(`
-      ALTER TABLE decisions
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
-    `);
-
-    console.log("[DB] connected");
-    console.log("[DB] schema ready");
+    console.log("[DB] initialized");
 
   } catch (e) {
-
-    console.error("[DB ERROR]", e.message);
-
+    console.error("[DB INIT ERROR]", e.message);
   }
 }
