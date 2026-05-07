@@ -1,185 +1,292 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>REDEN</title>
+import express from "express";
+import dotenv from "dotenv";
+import { db } from "./db.js";
+import { pickAction, updateBandit } from "./bandit.js";
+import { initRedis, redis } from "./redis.js";
 
-<style>
-:root{
-  --bg:#0a0f18;
-  --panel:#0f1624;
-  --border:#1f2a3a;
-  --accent:#6c8dff;
-  --text:#dbe6ff;
-  --dim:#6b7c99;
-}
+dotenv.config();
 
-*{box-sizing:border-box;margin:0;padding:0;}
+const app = express();
 
-body{
-  background:var(--bg);
-  color:var(--text);
-  font-family:monospace;
-  padding:20px;
-}
+// ─── MIDDLEWARE ───
+app.use(express.json());
+app.use(express.static("public"));
 
-/* layout */
-.container{
-  max-width:900px;
-  margin:auto;
-}
+// ─── INIT REDIS (SAFE) ───
+initRedis();
 
-/* header */
-.header{
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  margin-bottom:20px;
-}
+// ─── HEALTH CHECK ───
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "REDEN",
+    redis: redis ? "enabled" : "disabled"
+  });
+});
 
-.title{
-  font-size:22px;
-  letter-spacing:4px;
-}
-
-.status{
-  color:#34d399;
-  font-size:12px;
-}
-
-/* panel */
-.panel{
-  background:var(--panel);
-  border:1px solid var(--border);
-  padding:20px;
-  margin-bottom:16px;
-}
-
-/* input */
-input{
-  width:100%;
-  padding:10px;
-  margin-top:10px;
-  background:#0c1422;
-  border:1px solid var(--border);
-  color:white;
-}
-
-/* button */
-button{
-  margin-top:10px;
-  padding:10px;
-  width:100%;
-  border:none;
-  background:var(--accent);
-  color:white;
-  cursor:pointer;
-}
-
-button:disabled{
-  opacity:0.5;
-}
-
-/* result */
-.result{
-  font-size:18px;
-  margin-top:10px;
-}
-
-/* log */
-.log{
-  font-size:11px;
-  color:var(--dim);
-  max-height:200px;
-  overflow:auto;
-}
-</style>
-</head>
-
-<body>
-
-<div class="container">
-
-  <!-- HEADER -->
-  <div class="header">
-    <div class="title">REDEN</div>
-    <div class="status">● LIVE</div>
-  </div>
-
-  <!-- INPUT -->
-  <div class="panel">
-    <div>Cart Value</div>
-    <input type="number" id="cart" value="100"/>
-    <button onclick="score()">SCORE</button>
-  </div>
-
-  <!-- RESULT -->
-  <div class="panel">
-    <div>Decision</div>
-    <div class="result" id="result">—</div>
-  </div>
-
-  <!-- LOG -->
-  <div class="panel">
-    <div>System Log</div>
-    <div class="log" id="log"></div>
-  </div>
-
-</div>
-
-<script>
-const BASE = "https://reden-zljf.onrender.com";
-
-let decision = null;
-
-function log(msg){
-  const el = document.getElementById("log");
-  el.innerHTML = msg + "<br>" + el.innerHTML;
-}
-
-/* SAFE FETCH HANDLER */
-async function safeFetch(url, options){
-  const res = await fetch(url, options);
-
-  const text = await res.text();
-
+// ─── SCORE ───
+app.post("/score", async (req, res) => {
   try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error("Non-JSON response (likely HTML error page)");
-  }
-}
+    const { session_id, cart_id, cart_value } = req.body;
 
-/* SCORE */
-async function score(){
-  const cart = Number(document.getElementById("cart").value);
+    if (!session_id || !cart_id || cart_value == null) {
+      return res.status(400).json({
+        error: "missing_fields"
+      });
+    }
 
-  log("Scoring...");
+    const action = await pickAction();
 
-  try {
-    const data = await safeFetch(BASE + "/score", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body:JSON.stringify({
-        session_id:"frontend",
-        cart_id:"cart_" + Date.now(),
-        cart_value:cart
-      })
+    let discount = 0;
+
+    if (action === "INCENTIVE_LOW") discount = 5;
+    if (action === "INCENTIVE_MED") discount = 10;
+    if (action === "INCENTIVE_HIGH") discount = 20;
+
+    const expected_value = Number(cart_value) - discount;
+
+    const result = await db.query(
+      `
+      INSERT INTO decisions
+      (
+        session_id,
+        cart_id,
+        action,
+        discount,
+        expected_value,
+        state
+      )
+      VALUES ($1,$2,$3,$4,$5,'SCORED')
+      RETURNING id
+      `,
+      [
+        session_id,
+        cart_id,
+        action,
+        discount,
+        expected_value
+      ]
+    );
+
+    const decision_id = result.rows[0].id;
+
+    // Optional Redis cache
+    if (redis) {
+      try {
+        await redis.set(
+          `decision:${decision_id}`,
+          JSON.stringify({
+            action,
+            discount,
+            expected_value
+          }),
+          "EX",
+          300
+        );
+      } catch (e) {
+        console.log("[REDIS] cache skipped");
+      }
+    }
+
+    res.json({
+      decision_id,
+      action,
+      discount,
+      expected_value,
+      explored: Math.random() < 0.1
     });
 
-    decision = data;
+  } catch (e) {
+    console.error("SCORE ERROR:", e.message);
 
-    document.getElementById("result").innerText =
-      data.action + " | $" + data.expected_value;
-
-    log("Decision: " + data.action);
-
-  } catch(e){
-    log("ERROR: " + e.message);
+    res.status(500).json({
+      error: "score_failed"
+    });
   }
-}
-</script>
+});
 
-</body>
-</html>
+// ─── ACTION ───
+app.post("/action", async (req, res) => {
+  try {
+    const { decision_id } = req.body;
+
+    if (!decision_id) {
+      return res.status(400).json({
+        error: "missing_decision_id"
+      });
+    }
+
+    const result = await db.query(
+      `
+      UPDATE decisions
+      SET state='ACTIONED'
+      WHERE id=$1
+      AND state='SCORED'
+      `,
+      [decision_id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(409).json({
+        error: "invalid_state"
+      });
+    }
+
+    res.json({
+      ok: true
+    });
+
+  } catch (e) {
+    console.error("ACTION ERROR:", e.message);
+
+    res.status(500).json({
+      error: "action_failed"
+    });
+  }
+});
+
+// ─── OUTCOME ───
+app.post("/outcome", async (req, res) => {
+  try {
+    const {
+      decision_id,
+      converted,
+      revenue
+    } = req.body;
+
+    if (!decision_id) {
+      return res.status(400).json({
+        error: "missing_decision_id"
+      });
+    }
+
+    const d = await db.query(
+      `
+      SELECT action
+      FROM decisions
+      WHERE id=$1
+      `,
+      [decision_id]
+    );
+
+    if (d.rowCount === 0) {
+      return res.status(404).json({
+        error: "decision_not_found"
+      });
+    }
+
+    const action = d.rows[0].action;
+
+    await db.query(
+      `
+      UPDATE decisions
+      SET
+        state='COMPLETED',
+        converted=$1,
+        revenue=$2
+      WHERE id=$3
+      `,
+      [
+        converted,
+        revenue,
+        decision_id
+      ]
+    );
+
+    await updateBandit(action, converted);
+
+    res.json({
+      ok: true
+    });
+
+  } catch (e) {
+    console.error("OUTCOME ERROR:", e.message);
+
+    res.status(500).json({
+      error: "outcome_failed"
+    });
+  }
+});
+
+// ─── METRICS ───
+app.get("/metrics", async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        COUNT(*) as total,
+        SUM(
+          CASE
+            WHEN converted THEN 1
+            ELSE 0
+          END
+        ) as conversions,
+        AVG(revenue) as avg_revenue
+      FROM decisions
+      WHERE state='COMPLETED'
+    `);
+
+    const total = Number(rows[0].total || 0);
+    const conversions = Number(rows[0].conversions || 0);
+
+    res.json({
+      total,
+      conversions,
+      conversion_rate:
+        total > 0
+          ? conversions / total
+          : 0,
+      avg_revenue:
+        Number(rows[0].avg_revenue || 0)
+    });
+
+  } catch (e) {
+    console.error("METRICS ERROR:", e.message);
+
+    res.status(500).json({
+      error: "metrics_failed"
+    });
+  }
+});
+
+// ─── ACTION METRICS ───
+app.get("/metrics/actions", async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        action,
+        COUNT(*) as total,
+        AVG(
+          CASE
+            WHEN converted THEN 1
+            ELSE 0
+          END
+        ) as conversion_rate
+      FROM decisions
+      WHERE state='COMPLETED'
+      GROUP BY action
+    `);
+
+    res.json(rows);
+
+  } catch (e) {
+    console.error("ACTION METRICS ERROR:", e.message);
+
+    res.status(500).json({
+      error: "metrics_actions_failed"
+    });
+  }
+});
+
+// ─── FALLBACK 404 ───
+app.use((req, res) => {
+  res.status(404).json({
+    error: "route_not_found"
+  });
+});
+
+// ─── START SERVER ───
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`REDEN running on port ${PORT}`);
+});
