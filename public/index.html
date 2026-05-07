@@ -1,0 +1,825 @@
+<!DOCTYPE html><html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>REDEN — Autonomous Decision Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"><style>
+:root{
+  --bg:#06080d;
+  --surface:#0c1118;
+  --surface-2:#101722;
+  --surface-3:#121b27;
+  --border:rgba(255,255,255,0.06);
+  --border-strong:rgba(255,255,255,0.12);
+  --text:#ecf2ff;
+  --muted:#6f8098;
+  --accent:#7c97ff;
+  --green:#19c37d;
+  --amber:#f5b942;
+  --red:#ff5c7a;
+  --mono:'JetBrains Mono', monospace;
+  --sans:'Inter', sans-serif;
+}
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  overflow-x:hidden;
+}
+
+body::before{
+  content:'';
+  position:fixed;
+  inset:0;
+  background:
+    radial-gradient(circle at top left, rgba(124,151,255,0.08), transparent 30%),
+    radial-gradient(circle at bottom right, rgba(25,195,125,0.05), transparent 30%);
+  pointer-events:none;
+}
+
+.app{
+  min-height:100vh;
+  display:flex;
+  flex-direction:column;
+}
+
+.topbar{
+  height:58px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 28px;
+  background:rgba(6,8,13,0.92);
+  backdrop-filter:blur(12px);
+  position:sticky;
+  top:0;
+  z-index:20;
+}
+
+.brand{
+  display:flex;
+  align-items:center;
+  gap:14px;
+}
+
+.brand-mark{
+  width:12px;
+  height:12px;
+  border-radius:50%;
+  background:var(--accent);
+  box-shadow:0 0 24px rgba(124,151,255,0.6);
+}
+
+.brand-title{
+  font-weight:700;
+  letter-spacing:0.18em;
+  font-size:13px;
+}
+
+.brand-sub{
+  color:var(--muted);
+  font-size:11px;
+  margin-top:2px;
+}
+
+.top-meta{
+  display:flex;
+  gap:28px;
+  font-family:var(--mono);
+  font-size:11px;
+}
+
+.meta-block span{
+  color:var(--muted);
+  display:block;
+  margin-bottom:4px;
+  text-transform:uppercase;
+  letter-spacing:0.14em;
+  font-size:9px;
+}
+
+.main{
+  flex:1;
+  display:grid;
+  grid-template-columns:320px 1fr 340px;
+  gap:14px;
+  padding:18px;
+}
+
+.panel{
+  background:linear-gradient(180deg,var(--surface),var(--surface-2));
+  border:1px solid var(--border);
+  position:relative;
+}
+
+.panel-header{
+  height:52px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 18px;
+}
+
+.panel-title{
+  font-family:var(--mono);
+  color:var(--muted);
+  font-size:10px;
+  letter-spacing:0.18em;
+  text-transform:uppercase;
+}
+
+.panel-body{
+  padding:18px;
+}
+
+.controls{
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+}
+
+.cart-display{
+  font-size:62px;
+  font-weight:700;
+  line-height:1;
+  margin-bottom:18px;
+}
+
+.cart-display small{
+  font-size:22px;
+  color:var(--muted);
+  margin-right:4px;
+}
+
+.slider{
+  width:100%;
+  accent-color:var(--accent);
+}
+
+.input{
+  width:100%;
+  background:var(--surface-3);
+  border:1px solid var(--border);
+  color:var(--text);
+  padding:14px;
+  outline:none;
+  font-size:15px;
+}
+
+.btn-row{
+  display:flex;
+  gap:10px;
+}
+
+.btn{
+  flex:1;
+  border:none;
+  background:var(--surface-3);
+  color:var(--text);
+  padding:14px;
+  cursor:pointer;
+  transition:0.2s ease;
+  font-family:var(--mono);
+  text-transform:uppercase;
+  letter-spacing:0.12em;
+  font-size:11px;
+  border:1px solid var(--border);
+}
+
+.btn:hover{
+  border-color:var(--border-strong);
+  transform:translateY(-1px);
+}
+
+.btn.primary{
+  background:rgba(124,151,255,0.12);
+  color:var(--accent);
+  border-color:rgba(124,151,255,0.25);
+}
+
+.center-column{
+  display:grid;
+  grid-template-rows:auto auto 1fr;
+  gap:14px;
+}
+
+.hero-panel .panel-body{
+  padding:28px;
+}
+
+.pipeline{
+  display:flex;
+  gap:10px;
+  margin-bottom:28px;
+  flex-wrap:wrap;
+}
+
+.stage{
+  padding:10px 14px;
+  background:var(--surface-3);
+  border:1px solid var(--border);
+  color:var(--muted);
+  font-family:var(--mono);
+  font-size:10px;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+  transition:0.3s ease;
+}
+
+.stage.active{
+  border-color:rgba(124,151,255,0.4);
+  color:var(--accent);
+  background:rgba(124,151,255,0.08);
+}
+
+.decision-row{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-end;
+  gap:20px;
+}
+
+.decision-main h1{
+  font-size:42px;
+  line-height:1;
+  margin-bottom:10px;
+}
+
+.decision-main p{
+  color:var(--muted);
+  max-width:600px;
+  line-height:1.7;
+}
+
+.decision-value{
+  text-align:right;
+}
+
+.decision-value .label{
+  color:var(--muted);
+  font-size:11px;
+  margin-bottom:6px;
+  text-transform:uppercase;
+  letter-spacing:0.14em;
+  font-family:var(--mono);
+}
+
+.decision-value .num{
+  font-size:44px;
+  font-weight:700;
+  color:var(--accent);
+}
+
+.kpis{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:14px;
+}
+
+.kpi{
+  background:var(--surface);
+  border:1px solid var(--border);
+  padding:20px;
+}
+
+.kpi-label{
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:0.14em;
+  font-family:var(--mono);
+  font-size:10px;
+  margin-bottom:12px;
+}
+
+.kpi-value{
+  font-size:34px;
+  font-weight:700;
+}
+
+.telemetry-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:14px;
+}
+
+.chart-box,
+.reasoning-box{
+  background:var(--surface);
+  border:1px solid var(--border);
+  min-height:240px;
+}
+
+.chart-area{
+  height:200px;
+  display:flex;
+  align-items:flex-end;
+  gap:10px;
+  padding:20px;
+}
+
+.bar{
+  flex:1;
+  background:linear-gradient(180deg, rgba(124,151,255,0.9), rgba(124,151,255,0.2));
+  border-radius:4px 4px 0 0;
+  position:relative;
+}
+
+.bar span{
+  position:absolute;
+  bottom:-24px;
+  left:50%;
+  transform:translateX(-50%);
+  font-family:var(--mono);
+  color:var(--muted);
+  font-size:10px;
+}
+
+.reasoning{
+  padding:20px;
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+}
+
+.reason-item{
+  padding:14px;
+  border:1px solid var(--border);
+  background:rgba(255,255,255,0.02);
+}
+
+.reason-item h4{
+  margin-bottom:8px;
+  font-size:12px;
+  letter-spacing:0.08em;
+  text-transform:uppercase;
+  color:var(--accent);
+}
+
+.reason-item p{
+  color:var(--muted);
+  line-height:1.6;
+  font-size:14px;
+}
+
+.right-column{
+  display:grid;
+  grid-template-rows:1fr 1fr;
+  gap:14px;
+}
+
+.log-stream{
+  height:100%;
+  overflow:auto;
+  font-family:var(--mono);
+}
+
+.log-line{
+  padding:12px 18px;
+  border-bottom:1px solid rgba(255,255,255,0.03);
+  display:flex;
+  gap:12px;
+  font-size:11px;
+}
+
+.log-line .ts{
+  color:var(--muted);
+  min-width:72px;
+}
+
+.log-line.ok .msg{color:var(--green)}
+.log-line.warn .msg{color:var(--amber)}
+.log-line.err .msg{color:var(--red)}
+.log-line.info .msg{color:var(--text)}
+
+.health-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:12px;
+}
+
+.health-card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  padding:16px;
+}
+
+.health-card .small{
+  font-size:10px;
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:0.14em;
+  font-family:var(--mono);
+  margin-bottom:10px;
+}
+
+.health-card .big{
+  font-size:24px;
+  font-weight:700;
+}
+
+.footer{
+  height:42px;
+  border-top:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 18px;
+  font-family:var(--mono);
+  font-size:10px;
+  color:var(--muted);
+}
+
+.status-live{
+  color:var(--green);
+}
+
+@media(max-width:1280px){
+  .main{
+    grid-template-columns:1fr;
+  }
+
+  .telemetry-grid,
+  .kpis{
+    grid-template-columns:1fr;
+  }
+
+  .right-column{
+    grid-template-rows:auto auto;
+  }
+}
+</style></head>
+<body><div class="app"><header class="topbar">
+  <div class="brand">
+    <div class="brand-mark"></div>
+    <div>
+      <div class="brand-title">REDEN</div>
+      <div class="brand-sub">Autonomous Decision Engine</div>
+    </div>
+  </div>  <div class="top-meta">
+    <div class="meta-block">
+      <span>Policy</span>
+      <div>EV-GREEDY</div>
+    </div><div class="meta-block">
+  <span>Exploration</span>
+  <div>ε = 0.10</div>
+</div>
+
+<div class="meta-block">
+  <span>Runtime</span>
+  <div class="status-live">Operational</div>
+</div>
+
+  </div>
+</header><main class="main">  <section class="panel">
+    <div class="panel-header">
+      <div class="panel-title">Input Control</div>
+    </div><div class="panel-body controls">
+
+  <div>
+    <div class="cart-display"><small>$</small><span id="cartText">120</span></div>
+    <input class="slider" id="slider" type="range" min="10" max="1000" value="120">
+  </div>
+
+  <input class="input" id="cartInput" type="number" value="120">
+
+  <div class="btn-row">
+    <button class="btn primary" onclick="scoreCart()">Score</button>
+    <button class="btn" onclick="checkout()">Checkout</button>
+  </div>
+
+  <div class="health-grid">
+    <div class="health-card">
+      <div class="small">Policy Version</div>
+      <div class="big">v1</div>
+    </div>
+
+    <div class="health-card">
+      <div class="small">Inference</div>
+      <div class="big" id="latency">12ms</div>
+    </div>
+
+    <div class="health-card">
+      <div class="small">Redis</div>
+      <div class="big status-live">Online</div>
+    </div>
+
+    <div class="health-card">
+      <div class="small">Postgres</div>
+      <div class="big status-live">Healthy</div>
+    </div>
+  </div>
+
+</div>
+
+  </section>  <section class="center-column"><section class="panel hero-panel">
+  <div class="panel-header">
+    <div class="panel-title">Decision Intelligence</div>
+  </div>
+
+  <div class="panel-body">
+
+    <div class="pipeline" id="pipeline">
+      <div class="stage">Ingest</div>
+      <div class="stage">Feature Extraction</div>
+      <div class="stage">Value Estimation</div>
+      <div class="stage">Policy Evaluation</div>
+      <div class="stage">Action Emission</div>
+    </div>
+
+    <div class="decision-row">
+      <div class="decision-main">
+        <h1 id="decisionTitle">Awaiting Evaluation</h1>
+        <p id="decisionReason">
+          REDEN is monitoring cart context and reinforcement signals to determine the optimal incentive policy.
+        </p>
+      </div>
+
+      <div class="decision-value">
+        <div class="label">Expected Value</div>
+        <div class="num" id="ev">—</div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<section class="kpis">
+  <div class="kpi">
+    <div class="kpi-label">Total Decisions</div>
+    <div class="kpi-value" id="kpiDecisions">0</div>
+  </div>
+
+  <div class="kpi">
+    <div class="kpi-label">Conversion Rate</div>
+    <div class="kpi-value" id="kpiRate">0%</div>
+  </div>
+
+  <div class="kpi">
+    <div class="kpi-label">Avg Revenue</div>
+    <div class="kpi-value" id="kpiRevenue">$0</div>
+  </div>
+
+  <div class="kpi">
+    <div class="kpi-label">Exploration Ratio</div>
+    <div class="kpi-value" id="kpiExplore">0%</div>
+  </div>
+</section>
+
+<section class="telemetry-grid">
+
+  <section class="chart-box panel">
+    <div class="panel-header">
+      <div class="panel-title">Arm Performance</div>
+    </div>
+
+    <div class="chart-area">
+      <div class="bar" style="height:52%"><span>NONE</span></div>
+      <div class="bar" style="height:74%"><span>LOW</span></div>
+      <div class="bar" style="height:66%"><span>MED</span></div>
+      <div class="bar" style="height:88%"><span>HIGH</span></div>
+    </div>
+  </section>
+
+  <section class="reasoning-box panel">
+    <div class="panel-header">
+      <div class="panel-title">Decision Reasoning</div>
+    </div>
+
+    <div class="reasoning" id="reasoningBox">
+      <div class="reason-item">
+        <h4>Policy Status</h4>
+        <p>Waiting for scoring request.</p>
+      </div>
+    </div>
+  </section>
+
+</section>
+
+  </section>  <section class="right-column"><section class="panel">
+  <div class="panel-header">
+    <div class="panel-title">Operational Stream</div>
+  </div>
+
+  <div class="log-stream" id="logs"></div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div class="panel-title">Runtime Telemetry</div>
+  </div>
+
+  <div class="panel-body health-grid">
+
+    <div class="health-card">
+      <div class="small">Queue Depth</div>
+      <div class="big" id="queueDepth">2</div>
+    </div>
+
+    <div class="health-card">
+      <div class="small">Policy Shift</div>
+      <div class="big">+0.014</div>
+    </div>
+
+    <div class="health-card">
+      <div class="small">Rewards</div>
+      <div class="big">184</div>
+    </div>
+
+    <div class="health-card">
+      <div class="small">Latency P95</div>
+      <div class="big">22ms</div>
+    </div>
+
+  </div>
+</section>
+
+  </section></main><footer class="footer">
+  <div>REDEN · Adaptive Reinforcement Decision Infrastructure</div>
+  <div class="status-live">SYSTEM HEALTHY</div>
+</footer></div><script>
+const API = '';
+
+let activeDecision = null;
+let totalDecisions = 0;
+let conversions = 0;
+let revenue = 0;
+let exploreCount = 0;
+
+const slider = document.getElementById('slider');
+const cartInput = document.getElementById('cartInput');
+const cartText = document.getElementById('cartText');
+
+slider.addEventListener('input', e => {
+  cartInput.value = e.target.value;
+  cartText.textContent = e.target.value;
+});
+
+cartInput.addEventListener('input', e => {
+  slider.value = e.target.value;
+  cartText.textContent = e.target.value;
+});
+
+function log(message,type='info'){
+  const logs = document.getElementById('logs');
+  const row = document.createElement('div');
+  row.className = 'log-line ' + type;
+
+  const ts = new Date().toLocaleTimeString('en-GB',{hour12:false});
+
+  row.innerHTML = `
+    <div class="ts">${ts}</div>
+    <div class="msg">${message}</div>
+  `;
+
+  logs.prepend(row);
+
+  while(logs.children.length > 40){
+    logs.removeChild(logs.lastChild);
+  }
+}
+
+async function animatePipeline(){
+  const stages = [...document.querySelectorAll('.stage')];
+
+  for(const stage of stages){
+    stage.classList.add('active');
+    await new Promise(r => setTimeout(r,180));
+  }
+
+  await new Promise(r => setTimeout(r,150));
+
+  stages.forEach(s => s.classList.remove('active'));
+}
+
+async function scoreCart(){
+  const value = Number(cartInput.value || 0);
+
+  log('Cart ingestion initialized');
+
+  await animatePipeline();
+
+  const started = performance.now();
+
+  try{
+    const res = await fetch(API + '/score',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        session_id:'frontend_session',
+        cart_id:'cart_' + Date.now(),
+        cart_value:value
+      })
+    });
+
+    const data = await res.json();
+
+    if(!res.ok){
+      throw new Error(data.error || 'Score failed');
+    }
+
+    activeDecision = data;
+    totalDecisions++;
+
+    const latency = Math.round(performance.now() - started);
+
+    document.getElementById('latency').textContent = latency + 'ms';
+    document.getElementById('decisionTitle').textContent = data.action.replaceAll('_',' ');
+    document.getElementById('ev').textContent = '$' + Number(data.expected_value).toFixed(2);
+
+    document.getElementById('decisionReason').textContent =
+      'REDEN selected ' + data.action.replaceAll('_',' ') +
+      ' based on historical reward patterns, estimated cart sensitivity, and current exploration policy.';
+
+    document.getElementById('reasoningBox').innerHTML = `
+      <div class="reason-item">
+        <h4>Policy Evaluation</h4>
+        <p>Expected revenue optimized against current incentive arm performance.</p>
+      </div>
+
+      <div class="reason-item">
+        <h4>Exploration State</h4>
+        <p>${data.explored ? 'Exploration event triggered to collect additional reward data.' : 'Exploitation mode active using highest confidence policy.'}</p>
+      </div>
+
+      <div class="reason-item">
+        <h4>Decision Confidence</h4>
+        <p>Historical reward trajectory favors this action under comparable cart distributions.</p>
+      </div>
+    `;
+
+    if(data.explored) exploreCount++;
+
+    document.getElementById('kpiDecisions').textContent = totalDecisions;
+    document.getElementById('kpiExplore').textContent =
+      Math.round((exploreCount / totalDecisions) * 100) + '%';
+
+    log('Decision emitted → ' + data.action,'ok');
+
+  }catch(err){
+    log(err.message,'err');
+  }
+}
+
+async function checkout(){
+  if(!activeDecision){
+    log('No active decision available','warn');
+    return;
+  }
+
+  try{
+    await fetch(API + '/action',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        decision_id:activeDecision.decision_id
+      })
+    });
+
+    const converted = Math.random() > 0.35;
+    const value = Number(cartInput.value || 0);
+    const earned = converted ? value - activeDecision.discount : 0;
+
+    await fetch(API + '/outcome',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        decision_id:activeDecision.decision_id,
+        converted,
+        revenue:earned
+      })
+    });
+
+    if(converted){
+      conversions++;
+      revenue += earned;
+      log('Conversion recorded → +$' + earned,'ok');
+    }else{
+      log('Outcome recorded → no conversion','warn');
+    }
+
+    document.getElementById('kpiRate').textContent =
+      Math.round((conversions / totalDecisions) * 100) + '%';
+
+    document.getElementById('kpiRevenue').textContent =
+      '$' + Math.round(revenue / Math.max(conversions,1));
+
+    document.getElementById('queueDepth').textContent =
+      Math.max(0,Math.floor(Math.random() * 6));
+
+  }catch(err){
+    log(err.message,'err');
+  }
+}
+
+log('REDEN runtime initialized','ok');
+log('Policy engine online','info');
+log('Telemetry stream active','info');
+</script></body>
+  </html>
