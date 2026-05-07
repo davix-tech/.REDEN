@@ -1,37 +1,79 @@
 import express from "express";
 import dotenv from "dotenv";
-import { db } from "./db.js";
+
+import { db, initDB } from "./db.js";
 import { pickAction, updateBandit } from "./bandit.js";
 import { initRedis, redis } from "./redis.js";
 
 dotenv.config();
 
-const app = express();
+/* ─────────────────────────────────────────────
+   INIT
+───────────────────────────────────────────── */
 
-// ─── MIDDLEWARE ───
-app.use(express.json());
-app.use(express.static("public"));
-
-// ─── INIT REDIS (SAFE) ───
+await initDB();
 initRedis();
 
-// ─── HEALTH CHECK ───
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "REDEN",
-    redis: redis ? "enabled" : "disabled"
-  });
+const app = express();
+
+app.use(express.json());
+
+/* ─────────────────────────────────────────────
+   HEALTH
+───────────────────────────────────────────── */
+
+app.get("/", async (req, res) => {
+  try {
+
+    await db.query("SELECT 1");
+
+    res.json({
+      status: "ok",
+      service: "REDEN",
+      database: "connected",
+      redis: redis ? "enabled" : "disabled",
+      version: "v1"
+    });
+
+  } catch (e) {
+
+    res.status(500).json({
+      status: "error",
+      database: "offline"
+    });
+
+  }
 });
 
-// ─── SCORE ───
-app.post("/score", async (req, res) => {
-  try {
-    const { session_id, cart_id, cart_value } = req.body;
+/* ─────────────────────────────────────────────
+   SCORE
+───────────────────────────────────────────── */
 
-    if (!session_id || !cart_id || cart_value == null) {
+app.post("/score", async (req, res) => {
+
+  try {
+
+    const {
+      session_id,
+      cart_id,
+      cart_value
+    } = req.body;
+
+    if (
+      !session_id ||
+      !cart_id ||
+      cart_value === undefined
+    ) {
       return res.status(400).json({
         error: "missing_fields"
+      });
+    }
+
+    const value = Number(cart_value);
+
+    if (isNaN(value) || value <= 0) {
+      return res.status(400).json({
+        error: "invalid_cart_value"
       });
     }
 
@@ -39,11 +81,19 @@ app.post("/score", async (req, res) => {
 
     let discount = 0;
 
-    if (action === "INCENTIVE_LOW") discount = 5;
-    if (action === "INCENTIVE_MED") discount = 10;
-    if (action === "INCENTIVE_HIGH") discount = 20;
+    if (action === "INCENTIVE_LOW") {
+      discount = 5;
+    }
 
-    const expected_value = Number(cart_value) - discount;
+    if (action === "INCENTIVE_MED") {
+      discount = 10;
+    }
+
+    if (action === "INCENTIVE_HIGH") {
+      discount = 20;
+    }
+
+    const expected_value = Math.max(value - discount, 0);
 
     const result = await db.query(
       `
@@ -70,9 +120,12 @@ app.post("/score", async (req, res) => {
 
     const decision_id = result.rows[0].id;
 
-    // Optional Redis cache
+    /* OPTIONAL REDIS CACHE */
+
     if (redis) {
+
       try {
+
         await redis.set(
           `decision:${decision_id}`,
           JSON.stringify({
@@ -83,12 +136,12 @@ app.post("/score", async (req, res) => {
           "EX",
           300
         );
-      } catch (e) {
-        console.log("[REDIS] cache skipped");
-      }
+
+      } catch {}
+
     }
 
-    res.json({
+    return res.json({
       decision_id,
       action,
       discount,
@@ -97,17 +150,25 @@ app.post("/score", async (req, res) => {
     });
 
   } catch (e) {
-    console.error("SCORE ERROR:", e.message);
 
-    res.status(500).json({
+    console.error("[SCORE ERROR]", e.message);
+
+    return res.status(500).json({
       error: "score_failed"
     });
+
   }
+
 });
 
-// ─── ACTION ───
+/* ─────────────────────────────────────────────
+   ACTION
+───────────────────────────────────────────── */
+
 app.post("/action", async (req, res) => {
+
   try {
+
     const { decision_id } = req.body;
 
     if (!decision_id) {
@@ -127,27 +188,37 @@ app.post("/action", async (req, res) => {
     );
 
     if (result.rowCount === 0) {
+
       return res.status(409).json({
         error: "invalid_state"
       });
+
     }
 
-    res.json({
+    return res.json({
       ok: true
     });
 
   } catch (e) {
-    console.error("ACTION ERROR:", e.message);
 
-    res.status(500).json({
+    console.error("[ACTION ERROR]", e.message);
+
+    return res.status(500).json({
       error: "action_failed"
     });
+
   }
+
 });
 
-// ─── OUTCOME ───
+/* ─────────────────────────────────────────────
+   OUTCOME
+───────────────────────────────────────────── */
+
 app.post("/outcome", async (req, res) => {
+
   try {
+
     const {
       decision_id,
       converted,
@@ -155,27 +226,39 @@ app.post("/outcome", async (req, res) => {
     } = req.body;
 
     if (!decision_id) {
+
       return res.status(400).json({
         error: "missing_decision_id"
       });
+
     }
 
-    const d = await db.query(
+    const existing = await db.query(
       `
-      SELECT action
+      SELECT action, state
       FROM decisions
       WHERE id=$1
       `,
       [decision_id]
     );
 
-    if (d.rowCount === 0) {
+    if (existing.rowCount === 0) {
+
       return res.status(404).json({
         error: "decision_not_found"
       });
+
     }
 
-    const action = d.rows[0].action;
+    const row = existing.rows[0];
+
+    if (row.state === "COMPLETED") {
+
+      return res.status(409).json({
+        error: "already_completed"
+      });
+
+    }
 
     await db.query(
       `
@@ -187,48 +270,62 @@ app.post("/outcome", async (req, res) => {
       WHERE id=$3
       `,
       [
-        converted,
-        revenue,
+        Boolean(converted),
+        Number(revenue || 0),
         decision_id
       ]
     );
 
-    await updateBandit(action, converted);
+    await updateBandit(
+      row.action,
+      Boolean(converted)
+    );
 
-    res.json({
+    return res.json({
       ok: true
     });
 
   } catch (e) {
-    console.error("OUTCOME ERROR:", e.message);
 
-    res.status(500).json({
+    console.error("[OUTCOME ERROR]", e.message);
+
+    return res.status(500).json({
       error: "outcome_failed"
     });
+
   }
+
 });
 
-// ─── METRICS ───
+/* ─────────────────────────────────────────────
+   METRICS
+───────────────────────────────────────────── */
+
 app.get("/metrics", async (req, res) => {
+
   try {
-    const { rows } = await db.query(`
+
+    const result = await db.query(`
       SELECT
-        COUNT(*) as total,
-        SUM(
-          CASE
-            WHEN converted THEN 1
-            ELSE 0
-          END
-        ) as conversions,
-        AVG(revenue) as avg_revenue
+        COUNT(*) AS total,
+
+        COUNT(*) FILTER (
+          WHERE converted = true
+        ) AS conversions,
+
+        COALESCE(AVG(revenue),0) AS avg_revenue
+
       FROM decisions
+
       WHERE state='COMPLETED'
     `);
 
-    const total = Number(rows[0].total || 0);
-    const conversions = Number(rows[0].conversions || 0);
+    const row = result.rows[0];
 
-    res.json({
+    const total = Number(row.total || 0);
+    const conversions = Number(row.conversions || 0);
+
+    return res.json({
       total,
       conversions,
       conversion_rate:
@@ -236,57 +333,85 @@ app.get("/metrics", async (req, res) => {
           ? conversions / total
           : 0,
       avg_revenue:
-        Number(rows[0].avg_revenue || 0)
+        Number(row.avg_revenue || 0)
     });
 
   } catch (e) {
-    console.error("METRICS ERROR:", e.message);
 
-    res.status(500).json({
+    console.error("[METRICS ERROR]", e.message);
+
+    return res.status(500).json({
       error: "metrics_failed"
     });
+
   }
+
 });
 
-// ─── ACTION METRICS ───
+/* ─────────────────────────────────────────────
+   ACTION METRICS
+───────────────────────────────────────────── */
+
 app.get("/metrics/actions", async (req, res) => {
+
   try {
-    const { rows } = await db.query(`
+
+    const result = await db.query(`
       SELECT
         action,
-        COUNT(*) as total,
+
+        COUNT(*) AS total,
+
         AVG(
           CASE
-            WHEN converted THEN 1
+            WHEN converted = true THEN 1
             ELSE 0
           END
-        ) as conversion_rate
+        ) AS conversion_rate
+
       FROM decisions
+
       WHERE state='COMPLETED'
+
       GROUP BY action
+
+      ORDER BY conversion_rate DESC
     `);
 
-    res.json(rows);
+    return res.json(result.rows);
 
   } catch (e) {
-    console.error("ACTION METRICS ERROR:", e.message);
 
-    res.status(500).json({
+    console.error("[ACTION METRICS ERROR]", e.message);
+
+    return res.status(500).json({
       error: "metrics_actions_failed"
     });
+
   }
+
 });
 
-// ─── FALLBACK 404 ───
+/* ─────────────────────────────────────────────
+   404
+───────────────────────────────────────────── */
+
 app.use((req, res) => {
-  res.status(404).json({
+
+  return res.status(404).json({
     error: "route_not_found"
   });
+
 });
 
-// ─── START SERVER ───
+/* ─────────────────────────────────────────────
+   START
+───────────────────────────────────────────── */
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
+
   console.log(`REDEN running on port ${PORT}`);
+
 });
