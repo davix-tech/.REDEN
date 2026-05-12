@@ -8,16 +8,23 @@
   "use strict";
 
   /* ─────────────────────────────────────────────
-     CONFIG
+     VERSION
   ───────────────────────────────────────────── */
 
-  const SDK_VERSION = "1.0.0";
+  const SDK_VERSION = "2.0.0";
+
+  /* ─────────────────────────────────────────────
+     DEFAULT CONFIG
+  ───────────────────────────────────────────── */
 
   const DEFAULTS = {
     apiBase: "https://api.dcore.name.ng",
+    apiKey: "",
+    siteId: "",
     debug: false,
     autoTrack: true,
     autoPageview: true,
+    autoOptimize: false,
     sessionKey: "__reden_session",
     decisionTTL: 1000 * 60 * 30,
   };
@@ -37,7 +44,7 @@
   };
 
   /* ─────────────────────────────────────────────
-     UTILITIES
+     LOGGING
   ───────────────────────────────────────────── */
 
   function log(...args) {
@@ -49,6 +56,10 @@
   function warn(...args) {
     console.warn("[REDEN]", ...args);
   }
+
+  /* ─────────────────────────────────────────────
+     UTILITIES
+  ───────────────────────────────────────────── */
 
   function uuid() {
     if (window.crypto?.randomUUID) {
@@ -64,14 +75,6 @@
 
   function now() {
     return Date.now();
-  }
-
-  function safeJsonParse(value) {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return null;
-    }
   }
 
   function persistSession(id) {
@@ -106,28 +109,61 @@
     return sid;
   }
 
+  function getScriptConfig() {
+    const current =
+      document.currentScript;
+
+    if (!current) return {};
+
+    return {
+      apiKey:
+        current.dataset.apiKey || "",
+      siteId:
+        current.dataset.siteId || "",
+      autoOptimize:
+        current.dataset.autoOptimize ===
+        "true",
+      debug:
+        current.dataset.debug ===
+        "true",
+    };
+  }
+
   /* ─────────────────────────────────────────────
      NETWORK
   ───────────────────────────────────────────── */
 
-  async function request(path, options = {}) {
+  async function request(
+    path,
+    options = {}
+  ) {
     const url =
       config.apiBase + path;
 
     try {
+
       const res = await fetch(url, {
         headers: {
           "Content-Type":
             "application/json",
+
+          "x-api-key":
+            config.apiKey || "",
+
+          "x-site-id":
+            config.siteId || "",
         },
+
         ...options,
       });
 
-      const data = await res.json();
+      const data =
+        await res.json();
 
       if (!res.ok) {
         throw new Error(
-          data.error || "request_failed"
+          data.error ||
+            "request_failed"
         );
       }
 
@@ -149,55 +185,96 @@
      TRACKING
   ───────────────────────────────────────────── */
 
-  async function track(event, payload = {}) {
-
+  async function track(
+    event,
+    payload = {}
+  ) {
     const body = {
-      session_id: state.sessionId,
+      session_id:
+        state.sessionId,
+
+      site_id:
+        config.siteId,
+
       event,
+
       payload,
+
       url: location.href,
-      path: location.pathname,
+
+      path:
+        location.pathname,
+
       title: document.title,
+
       ts: now(),
-      sdk_version: SDK_VERSION,
+
+      sdk_version:
+        SDK_VERSION,
     };
 
     log("track", body);
 
     try {
 
-      return await request("/event", {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
+      return await request(
+        "/event",
+        {
+          method: "POST",
+
+          body: JSON.stringify(
+            body
+          ),
+        }
+      );
 
     } catch {
+
       return null;
+
     }
   }
 
   /* ─────────────────────────────────────────────
-     DECISION ENGINE CLIENT
+     DECISION SYSTEM
   ───────────────────────────────────────────── */
 
-  async function score(cartValue = 0, meta = {}) {
-
+  async function score(
+    cartValue = 0,
+    meta = {}
+  ) {
     const body = {
-      session_id: state.sessionId,
-      cart_id: meta.cart_id || uuid(),
-      cart_value: Number(cartValue || 0),
+      site_id:
+        config.siteId,
+
+      session_id:
+        state.sessionId,
+
+      cart_id:
+        meta.cart_id || uuid(),
+
+      cart_value:
+        Number(cartValue || 0),
+
       meta,
     };
 
-    log("score request", body);
-
-    const decision = await request(
-      "/score",
-      {
-        method: "POST",
-        body: JSON.stringify(body),
-      }
+    log(
+      "score request",
+      body
     );
+
+    const decision =
+      await request(
+        "/score",
+        {
+          method: "POST",
+
+          body: JSON.stringify(
+            body
+          ),
+        }
+      );
 
     state.activeDecision = {
       ...decision,
@@ -209,17 +286,23 @@
     return decision;
   }
 
-  async function action(decisionId) {
-
+  async function action(
+    decisionId
+  ) {
     if (!decisionId) {
-      warn("missing decision_id");
+      warn(
+        "missing decision_id"
+      );
+
       return null;
     }
 
     return request("/action", {
       method: "POST",
+
       body: JSON.stringify({
-        decision_id: decisionId,
+        decision_id:
+          decisionId,
       }),
     });
   }
@@ -229,145 +312,211 @@
     converted,
     revenue,
   }) {
-
     if (!decision_id) {
-      warn("missing decision_id");
+
+      warn(
+        "missing decision_id"
+      );
+
       return null;
     }
 
-    return request("/outcome", {
-      method: "POST",
-      body: JSON.stringify({
-        decision_id,
-        converted:
-          Boolean(converted),
-        revenue:
-          Number(revenue || 0),
-      }),
-    });
-  }
+    return request(
+      "/outcome",
+      {
+        method: "POST",
 
-  /* ─────────────────────────────────────────────
-     AUTO TRACKING
-  ───────────────────────────────────────────── */
+        body: JSON.stringify({
+          decision_id,
 
-  function setupPageTracking() {
+          converted:
+            Boolean(
+              converted
+            ),
 
-    if (!config.autoPageview) {
-      return;
-    }
-
-    track("pageview", {
-      referrer:
-        document.referrer || null,
-    });
-  }
-
-  function setupClickTracking() {
-
-    if (!config.autoTrack) {
-      return;
-    }
-
-    document.addEventListener(
-      "click",
-      (e) => {
-
-        const el = e.target;
-
-        if (!el) return;
-
-        track("click", {
-          tag:
-            el.tagName || null,
-          id:
-            el.id || null,
-          class:
-            el.className || null,
-          text:
-            (
-              el.innerText || ""
-            )
-              .trim()
-              .slice(0, 120),
-        });
-
-      },
-      true
-    );
-  }
-
-  function setupUnloadTracking() {
-
-    window.addEventListener(
-      "beforeunload",
-      () => {
-
-        const duration =
-          now() - state.pageStart;
-
-        navigator.sendBeacon(
-          config.apiBase + "/event",
-          JSON.stringify({
-            session_id:
-              state.sessionId,
-            event: "session_end",
-            payload: {
-              duration,
-            },
-            ts: now(),
-          })
-        );
-
+          revenue:
+            Number(
+              revenue || 0
+            ),
+        }),
       }
     );
   }
 
   /* ─────────────────────────────────────────────
-     DOM OPTIMIZATION HELPERS
+     DOM ENGINE
   ───────────────────────────────────────────── */
 
-  function updateText(selector, text) {
-
+  function updateText(
+    selector,
+    text
+  ) {
     const el =
-      document.querySelector(selector);
+      document.querySelector(
+        selector
+      );
 
-    if (!el) {
-      return false;
-    }
+    if (!el) return false;
 
     el.textContent = text;
 
     return true;
   }
 
-  function injectBanner(content) {
+  function updateHTML(
+    selector,
+    html
+  ) {
+    const el =
+      document.querySelector(
+        selector
+      );
 
+    if (!el) return false;
+
+    el.innerHTML = html;
+
+    return true;
+  }
+
+  function addClass(
+    selector,
+    className
+  ) {
+    const el =
+      document.querySelector(
+        selector
+      );
+
+    if (!el) return false;
+
+    el.classList.add(className);
+
+    return true;
+  }
+
+  function injectBanner(
+    content
+  ) {
     const banner =
-      document.createElement("div");
+      document.createElement(
+        "div"
+      );
 
     banner.innerHTML = content;
 
-    banner.style.position = "fixed";
-    banner.style.bottom = "20px";
-    banner.style.right = "20px";
-    banner.style.zIndex = "999999";
-    banner.style.padding = "14px 18px";
-    banner.style.background = "#111827";
-    banner.style.color = "#fff";
-    banner.style.borderRadius = "14px";
+    banner.style.position =
+      "fixed";
+
+    banner.style.bottom =
+      "20px";
+
+    banner.style.right =
+      "20px";
+
+    banner.style.zIndex =
+      "999999";
+
+    banner.style.padding =
+      "14px 18px";
+
+    banner.style.background =
+      "#111827";
+
+    banner.style.color =
+      "#fff";
+
+    banner.style.borderRadius =
+      "14px";
+
     banner.style.fontFamily =
       "Inter,sans-serif";
+
     banner.style.boxShadow =
       "0 10px 40px rgba(0,0,0,0.4)";
 
-    document.body.appendChild(banner);
+    document.body.appendChild(
+      banner
+    );
 
     return banner;
   }
 
-  async function optimize(options = {}) {
+  /* ─────────────────────────────────────────────
+     REMOTE RULE ENGINE
+  ───────────────────────────────────────────── */
 
+  function applyRule(rule) {
+
+    if (!rule) return;
+
+    const {
+      selector,
+      action,
+      value,
+    } = rule;
+
+    switch (action) {
+
+      case "replace_text":
+
+        updateText(
+          selector,
+          value
+        );
+
+        break;
+
+      case "replace_html":
+
+        updateHTML(
+          selector,
+          value
+        );
+
+        break;
+
+      case "add_class":
+
+        addClass(
+          selector,
+          value
+        );
+
+        break;
+
+      case "banner":
+
+        injectBanner(value);
+
+        break;
+
+      default:
+
+        warn(
+          "unknown rule action",
+          action
+        );
+    }
+  }
+
+  function applyRules(rules) {
+
+    if (!Array.isArray(rules))
+      return;
+
+    for (const rule of rules) {
+      applyRule(rule);
+    }
+  }
+
+  /* ─────────────────────────────────────────────
+     OPTIMIZATION ENGINE
+  ───────────────────────────────────────────── */
+
+  async function optimize(
+    options = {}
+  ) {
     const decision =
       await score(
         options.cartValue || 0,
@@ -379,41 +528,52 @@
     }
 
     if (
-      decision.action ===
-      "INCENTIVE_HIGH"
+      Array.isArray(
+        decision.rules
+      )
     ) {
-
-      injectBanner(`
-        <strong>Special Offer</strong><br/>
-        Unlock premium savings today.
-      `);
-
+      applyRules(
+        decision.rules
+      );
     }
 
-    if (
-      decision.action ===
-      "INCENTIVE_MED"
-    ) {
+    else {
 
-      updateText(
-        options.ctaSelector ||
-          "button",
-        "Claim Offer"
-      );
+      switch (
+        decision.action
+      ) {
 
-    }
+        case "INCENTIVE_HIGH":
 
-    if (
-      decision.action ===
-      "INCENTIVE_LOW"
-    ) {
+          injectBanner(`
+            <strong>Special Offer</strong><br/>
+            Unlock premium savings today.
+          `);
 
-      updateText(
-        options.ctaSelector ||
-          "button",
-        "Continue"
-      );
+          break;
 
+        case "INCENTIVE_MED":
+
+          updateText(
+            options.ctaSelector ||
+              "button",
+
+            "Claim Offer"
+          );
+
+          break;
+
+        case "INCENTIVE_LOW":
+
+          updateText(
+            options.ctaSelector ||
+              "button",
+
+            "Continue"
+          );
+
+          break;
+      }
     }
 
     await action(
@@ -424,37 +584,152 @@
   }
 
   /* ─────────────────────────────────────────────
-     METRICS
+     AUTO TRACKING
+  ───────────────────────────────────────────── */
+
+  function setupPageTracking() {
+
+    if (
+      !config.autoPageview
+    ) {
+      return;
+    }
+
+    track("pageview", {
+      referrer:
+        document.referrer ||
+        null,
+    });
+  }
+
+  function setupClickTracking() {
+
+    if (!config.autoTrack) {
+      return;
+    }
+
+    document.addEventListener(
+      "click",
+
+      (e) => {
+
+        const el =
+          e.target;
+
+        if (!el) return;
+
+        track("click", {
+          tag:
+            el.tagName ||
+            null,
+
+          id:
+            el.id || null,
+
+          class:
+            el.className ||
+            null,
+
+          text:
+            (
+              el.innerText ||
+              ""
+            )
+              .trim()
+              .slice(0, 120),
+        });
+
+      },
+
+      true
+    );
+  }
+
+  function setupUnloadTracking() {
+
+    window.addEventListener(
+      "beforeunload",
+
+      () => {
+
+        const duration =
+          now() -
+          state.pageStart;
+
+        navigator.sendBeacon(
+          config.apiBase +
+            "/event",
+
+          JSON.stringify({
+            session_id:
+              state.sessionId,
+
+            site_id:
+              config.siteId,
+
+            event:
+              "session_end",
+
+            payload: {
+              duration,
+            },
+
+            ts: now(),
+          })
+        );
+      }
+    );
+  }
+
+  /* ─────────────────────────────────────────────
+     ANALYTICS
   ───────────────────────────────────────────── */
 
   async function metrics() {
-    return request("/metrics");
+    return request(
+      "/metrics"
+    );
   }
 
   async function actionMetrics() {
-    return request("/metrics/actions");
+    return request(
+      "/metrics/actions"
+    );
   }
 
   /* ─────────────────────────────────────────────
      INIT
   ───────────────────────────────────────────── */
 
-  function init(userConfig = {}) {
+  function init(
+    userConfig = {}
+  ) {
+    if (
+      state.initialized
+    ) {
 
-    if (state.initialized) {
-      warn("already initialized");
-      return;
+      warn(
+        "already initialized"
+      );
+
+      return api;
     }
+
+    const scriptConfig =
+      getScriptConfig();
 
     config = {
       ...DEFAULTS,
+      ...scriptConfig,
       ...userConfig,
     };
 
     ensureSession();
 
     setupPageTracking();
+
     setupClickTracking();
+
     setupUnloadTracking();
 
     state.initialized = true;
@@ -463,6 +738,15 @@
       "SDK initialized",
       SDK_VERSION
     );
+
+    if (
+      config.autoOptimize
+    ) {
+
+      optimize().catch(
+        () => {}
+      );
+    }
 
     return api;
   }
@@ -490,7 +774,15 @@
 
     actionMetrics,
 
+    applyRule,
+
+    applyRules,
+
     updateText,
+
+    updateHTML,
+
+    addClass,
 
     injectBanner,
 
@@ -501,12 +793,32 @@
     getDecision() {
       return state.activeDecision;
     },
+
+    config() {
+      return config;
+    },
   };
 
   /* ─────────────────────────────────────────────
-     GLOBAL
+     GLOBAL EXPORT
   ───────────────────────────────────────────── */
 
   window.Reden = api;
+
+  /* ─────────────────────────────────────────────
+     AUTO INIT
+  ───────────────────────────────────────────── */
+
+  const autoConfig =
+    getScriptConfig();
+
+  if (
+    autoConfig.siteId
+  ) {
+
+    window.Reden.init(
+      autoConfig
+    );
+  }
 
 })(window, document);
