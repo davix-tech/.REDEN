@@ -36,13 +36,103 @@ const __dirname =
 
 app.use(express.json());
 
-/* SERVE SDK + STATIC FILES */
+/* SERVE SDK */
 
 app.use(
   express.static(
     path.join(__dirname, "public")
   )
 );
+
+/* ─────────────────────────────────────────────
+   API KEY AUTH
+───────────────────────────────────────────── */
+
+async function authenticate(
+  req,
+  res,
+  next
+) {
+
+  try {
+
+    const publicKey =
+      req.headers["x-api-key"];
+
+    const siteId =
+      req.headers["x-site-id"];
+
+    /* ALLOW ROOT + SDK */
+
+    if (
+      req.path === "/" ||
+      req.path.includes(".js")
+    ) {
+
+      return next();
+
+    }
+
+    if (
+      !publicKey ||
+      !siteId
+    ) {
+
+      return res.status(401).json({
+        error:
+          "missing_credentials",
+      });
+
+    }
+
+    const result =
+      await db.query(
+        `
+        SELECT *
+        FROM api_keys
+        WHERE public_key=$1
+        AND site_id=$2
+        AND active=true
+        `,
+        [
+          publicKey,
+          siteId,
+        ]
+      );
+
+    if (
+      result.rowCount === 0
+    ) {
+
+      return res.status(403).json({
+        error:
+          "invalid_api_key",
+      });
+
+    }
+
+    req.site =
+      result.rows[0];
+
+    next();
+
+  } catch (e) {
+
+    console.error(
+      "[AUTH ERROR]",
+      e.message
+    );
+
+    return res.status(500).json({
+      error:
+        "authentication_failed",
+    });
+
+  }
+
+}
+
+app.use(authenticate);
 
 /* ─────────────────────────────────────────────
    HEALTH
@@ -62,7 +152,7 @@ app.get("/", async (req, res) => {
         redis
           ? "enabled"
           : "disabled",
-      version: "v1",
+      version: "v2",
     });
 
   } catch (e) {
@@ -70,6 +160,72 @@ app.get("/", async (req, res) => {
     return res.status(500).json({
       status: "error",
       database: "offline",
+    });
+
+  }
+
+});
+
+/* ─────────────────────────────────────────────
+   EVENT TRACKING
+───────────────────────────────────────────── */
+
+app.post("/event", async (req, res) => {
+
+  try {
+
+    const {
+      site_id,
+      session_id,
+      event,
+      payload,
+      url,
+      path,
+      title,
+    } = req.body;
+
+    await db.query(
+      `
+      INSERT INTO event_logs
+      (
+        site_id,
+        session_id,
+        event,
+        payload,
+        url,
+        path,
+        title
+      )
+      VALUES
+      (
+        $1,$2,$3,$4,$5,$6,$7
+      )
+      `,
+      [
+        site_id,
+        session_id,
+        event,
+        payload || {},
+        url || null,
+        path || null,
+        title || null,
+      ]
+    );
+
+    return res.json({
+      ok: true,
+    });
+
+  } catch (e) {
+
+    console.error(
+      "[EVENT ERROR]",
+      e.message
+    );
+
+    return res.status(500).json({
+      error:
+        "event_failed",
     });
 
   }
@@ -97,7 +253,8 @@ app.post("/score", async (req, res) => {
     ) {
 
       return res.status(400).json({
-        error: "missing_fields",
+        error:
+          "missing_fields",
       });
 
     }
@@ -130,27 +287,21 @@ app.post("/score", async (req, res) => {
       action ===
       "INCENTIVE_LOW"
     ) {
-
       discount = 5;
-
     }
 
     if (
       action ===
       "INCENTIVE_MED"
     ) {
-
       discount = 10;
-
     }
 
     if (
       action ===
       "INCENTIVE_HIGH"
     ) {
-
       discount = 20;
-
     }
 
     const expected_value =
@@ -173,11 +324,7 @@ app.post("/score", async (req, res) => {
         )
         VALUES
         (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
+          $1,$2,$3,$4,$5,
           'SCORED'
         )
         RETURNING id
@@ -193,8 +340,6 @@ app.post("/score", async (req, res) => {
 
     const decision_id =
       result.rows[0].id;
-
-    /* OPTIONAL REDIS CACHE */
 
     if (redis) {
 
@@ -234,7 +379,8 @@ app.post("/score", async (req, res) => {
     );
 
     return res.status(500).json({
-      error: "score_failed",
+      error:
+        "score_failed",
     });
 
   }
@@ -249,8 +395,9 @@ app.post("/action", async (req, res) => {
 
   try {
 
-    const { decision_id } =
-      req.body;
+    const {
+      decision_id,
+    } = req.body;
 
     if (!decision_id) {
 
@@ -277,7 +424,8 @@ app.post("/action", async (req, res) => {
     ) {
 
       return res.status(409).json({
-        error: "invalid_state",
+        error:
+          "invalid_state",
       });
 
     }
@@ -294,7 +442,8 @@ app.post("/action", async (req, res) => {
     );
 
     return res.status(500).json({
-      error: "action_failed",
+      error:
+        "action_failed",
     });
 
   }
@@ -327,9 +476,7 @@ app.post("/outcome", async (req, res) => {
     const existing =
       await db.query(
         `
-        SELECT
-          action,
-          state
+        SELECT action, state
         FROM decisions
         WHERE id=$1
         `,
@@ -537,7 +684,8 @@ app.get(
 app.use((req, res) => {
 
   return res.status(404).json({
-    error: "route_not_found",
+    error:
+      "route_not_found",
   });
 
 });
