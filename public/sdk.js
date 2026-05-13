@@ -11,7 +11,7 @@
      VERSION
   ───────────────────────────────────────────── */
 
-  const SDK_VERSION = "2.0.0";
+  const SDK_VERSION = "1.0.0";
 
   /* ─────────────────────────────────────────────
      DEFAULT CONFIG
@@ -19,14 +19,22 @@
 
   const DEFAULTS = {
     apiBase: "https://api.dcore.name.ng",
-    apiKey: "",
+
+    publicKey: "",
+
     siteId: "",
+
     debug: false,
+
     autoTrack: true,
+
     autoPageview: true,
+
     autoOptimize: false,
+
     sessionKey: "__reden_session",
-    decisionTTL: 1000 * 60 * 30,
+
+    timeout: 10000,
   };
 
   /* ─────────────────────────────────────────────
@@ -37,14 +45,16 @@
 
   const state = {
     initialized: false,
+
     sessionId: null,
+
     activeDecision: null,
+
     pageStart: Date.now(),
-    queue: [],
   };
 
   /* ─────────────────────────────────────────────
-     LOGGING
+     LOGGER
   ───────────────────────────────────────────── */
 
   function log(...args) {
@@ -67,14 +77,24 @@
     }
 
     return (
-      "reden-" +
-      Math.random().toString(36).slice(2) +
+      "reden_" +
+      Math.random()
+        .toString(36)
+        .slice(2) +
       Date.now()
     );
   }
 
   function now() {
     return Date.now();
+  }
+
+  function safeJsonParse(value) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
   }
 
   function persistSession(id) {
@@ -113,54 +133,80 @@
     const current =
       document.currentScript;
 
-    if (!current) return {};
+    if (!current) {
+      return {};
+    }
 
     return {
-      apiKey:
-        current.dataset.apiKey || "",
+      publicKey:
+        current.dataset.publicKey ||
+        "",
+
       siteId:
-        current.dataset.siteId || "",
-      autoOptimize:
-        current.dataset.autoOptimize ===
-        "true",
+        current.dataset.siteId ||
+        "",
+
       debug:
         current.dataset.debug ===
         "true",
+
+      autoOptimize:
+        current.dataset
+          .autoOptimize === "true",
     };
   }
 
   /* ─────────────────────────────────────────────
-     NETWORK
+     REQUEST ENGINE
   ───────────────────────────────────────────── */
 
   async function request(
     path,
     options = {}
   ) {
-    const url =
-      config.apiBase + path;
+    const controller =
+      new AbortController();
+
+    const timeout = setTimeout(
+      () => controller.abort(),
+      config.timeout
+    );
 
     try {
 
-      const res = await fetch(url, {
-        headers: {
-          "Content-Type":
-            "application/json",
+      const response =
+        await fetch(
+          config.apiBase + path,
+          {
+            method: "GET",
 
-          "x-api-key":
-            config.apiKey || "",
+            headers: {
+              "Content-Type":
+                "application/json",
 
-          "x-site-id":
-            config.siteId || "",
-        },
+              "x-public-key":
+                config.publicKey,
 
-        ...options,
-      });
+              "x-site-id":
+                config.siteId,
+
+              "x-sdk-version":
+                SDK_VERSION,
+            },
+
+            signal:
+              controller.signal,
+
+            ...options,
+          }
+        );
+
+      clearTimeout(timeout);
 
       const data =
-        await res.json();
+        await response.json();
 
-      if (!res.ok) {
+      if (!response.ok) {
         throw new Error(
           data.error ||
             "request_failed"
@@ -171,8 +217,10 @@
 
     } catch (e) {
 
+      clearTimeout(timeout);
+
       warn(
-        "API request failed",
+        "request failed",
         path,
         e.message
       );
@@ -189,32 +237,6 @@
     event,
     payload = {}
   ) {
-    const body = {
-      session_id:
-        state.sessionId,
-
-      site_id:
-        config.siteId,
-
-      event,
-
-      payload,
-
-      url: location.href,
-
-      path:
-        location.pathname,
-
-      title: document.title,
-
-      ts: now(),
-
-      sdk_version:
-        SDK_VERSION,
-    };
-
-    log("track", body);
-
     try {
 
       return await request(
@@ -222,9 +244,28 @@
         {
           method: "POST",
 
-          body: JSON.stringify(
-            body
-          ),
+          body: JSON.stringify({
+            site_id:
+              config.siteId,
+
+            session_id:
+              state.sessionId,
+
+            event,
+
+            payload,
+
+            url:
+              location.href,
+
+            path:
+              location.pathname,
+
+            title:
+              document.title,
+
+            ts: now(),
+          }),
         }
       );
 
@@ -236,7 +277,7 @@
   }
 
   /* ─────────────────────────────────────────────
-     DECISION SYSTEM
+     DECISION ENGINE
   ───────────────────────────────────────────── */
 
   async function score(
@@ -259,11 +300,6 @@
       meta,
     };
 
-    log(
-      "score request",
-      body
-    );
-
     const decision =
       await request(
         "/score",
@@ -278,10 +314,9 @@
 
     state.activeDecision = {
       ...decision,
+
       created_at: now(),
     };
-
-    log("decision", decision);
 
     return decision;
   }
@@ -290,10 +325,6 @@
     decisionId
   ) {
     if (!decisionId) {
-      warn(
-        "missing decision_id"
-      );
-
       return null;
     }
 
@@ -313,11 +344,6 @@
     revenue,
   }) {
     if (!decision_id) {
-
-      warn(
-        "missing decision_id"
-      );
-
       return null;
     }
 
@@ -347,50 +373,47 @@
      DOM ENGINE
   ───────────────────────────────────────────── */
 
+  function query(selector) {
+    return document.querySelector(
+      selector
+    );
+  }
+
   function updateText(
     selector,
-    text
+    value
   ) {
-    const el =
-      document.querySelector(
-        selector
-      );
+    const el = query(selector);
 
     if (!el) return false;
 
-    el.textContent = text;
+    el.textContent = value;
 
     return true;
   }
 
   function updateHTML(
     selector,
-    html
+    value
   ) {
-    const el =
-      document.querySelector(
-        selector
-      );
+    const el = query(selector);
 
     if (!el) return false;
 
-    el.innerHTML = html;
+    el.innerHTML = value;
 
     return true;
   }
 
   function addClass(
     selector,
-    className
+    value
   ) {
-    const el =
-      document.querySelector(
-        selector
-      );
+    const el = query(selector);
 
     if (!el) return false;
 
-    el.classList.add(className);
+    el.classList.add(value);
 
     return true;
   }
@@ -414,9 +437,6 @@
     banner.style.right =
       "20px";
 
-    banner.style.zIndex =
-      "999999";
-
     banner.style.padding =
       "14px 18px";
 
@@ -424,16 +444,19 @@
       "#111827";
 
     banner.style.color =
-      "#fff";
+      "#ffffff";
+
+    banner.style.zIndex =
+      "999999";
 
     banner.style.borderRadius =
       "14px";
 
     banner.style.fontFamily =
-      "Inter,sans-serif";
+      "Inter, sans-serif";
 
     banner.style.boxShadow =
-      "0 10px 40px rgba(0,0,0,0.4)";
+      "0 10px 40px rgba(0,0,0,0.35)";
 
     document.body.appendChild(
       banner
@@ -443,11 +466,10 @@
   }
 
   /* ─────────────────────────────────────────────
-     REMOTE RULE ENGINE
+     RULE ENGINE
   ───────────────────────────────────────────── */
 
   function applyRule(rule) {
-
     if (!rule) return;
 
     const {
@@ -494,16 +516,18 @@
       default:
 
         warn(
-          "unknown rule action",
+          "unknown rule",
           action
         );
     }
   }
 
   function applyRules(rules) {
-
-    if (!Array.isArray(rules))
+    if (
+      !Array.isArray(rules)
+    ) {
       return;
+    }
 
     for (const rule of rules) {
       applyRule(rule);
@@ -511,7 +535,7 @@
   }
 
   /* ─────────────────────────────────────────────
-     OPTIMIZATION ENGINE
+     OPTIMIZER
   ───────────────────────────────────────────── */
 
   async function optimize(
@@ -532,12 +556,12 @@
         decision.rules
       )
     ) {
+
       applyRules(
         decision.rules
       );
-    }
 
-    else {
+    } else {
 
       switch (
         decision.action
@@ -588,7 +612,6 @@
   ───────────────────────────────────────────── */
 
   function setupPageTracking() {
-
     if (
       !config.autoPageview
     ) {
@@ -603,7 +626,6 @@
   }
 
   function setupClickTracking() {
-
     if (!config.autoTrack) {
       return;
     }
@@ -611,17 +633,15 @@
     document.addEventListener(
       "click",
 
-      (e) => {
+      function (e) {
 
-        const el =
-          e.target;
+        const el = e.target;
 
         if (!el) return;
 
         track("click", {
           tag:
-            el.tagName ||
-            null,
+            el.tagName || null,
 
           id:
             el.id || null,
@@ -632,8 +652,7 @@
 
           text:
             (
-              el.innerText ||
-              ""
+              el.innerText || ""
             )
               .trim()
               .slice(0, 120),
@@ -646,11 +665,10 @@
   }
 
   function setupUnloadTracking() {
-
     window.addEventListener(
       "beforeunload",
 
-      () => {
+      function () {
 
         const duration =
           now() -
@@ -661,11 +679,11 @@
             "/event",
 
           JSON.stringify({
-            session_id:
-              state.sessionId,
-
             site_id:
               config.siteId,
+
+            session_id:
+              state.sessionId,
 
             event:
               "session_end",
@@ -677,6 +695,7 @@
             ts: now(),
           })
         );
+
       }
     );
   }
@@ -720,9 +739,27 @@
 
     config = {
       ...DEFAULTS,
+
       ...scriptConfig,
+
       ...userConfig,
     };
+
+    if (!config.siteId) {
+
+      warn(
+        "missing siteId"
+      );
+
+    }
+
+    if (!config.publicKey) {
+
+      warn(
+        "missing publicKey"
+      );
+
+    }
 
     ensureSession();
 
@@ -746,6 +783,7 @@
       optimize().catch(
         () => {}
       );
+
     }
 
     return api;
@@ -756,7 +794,8 @@
   ───────────────────────────────────────────── */
 
   const api = {
-    version: SDK_VERSION,
+    version:
+      SDK_VERSION,
 
     init,
 
@@ -794,7 +833,7 @@
       return state.activeDecision;
     },
 
-    config() {
+    getConfig() {
       return config;
     },
   };
@@ -813,12 +852,14 @@
     getScriptConfig();
 
   if (
-    autoConfig.siteId
+    autoConfig.siteId &&
+    autoConfig.publicKey
   ) {
 
     window.Reden.init(
       autoConfig
     );
+
   }
 
 })(window, document);
