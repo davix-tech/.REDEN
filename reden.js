@@ -36,7 +36,7 @@ const __dirname =
 
 app.use(express.json());
 
-/* SERVE SDK */
+/* STATIC FILES */
 
 app.use(
   express.static(
@@ -45,7 +45,7 @@ app.use(
 );
 
 /* ─────────────────────────────────────────────
-   API KEY AUTH
+   AUTHENTICATION
 ───────────────────────────────────────────── */
 
 async function authenticate(
@@ -56,27 +56,34 @@ async function authenticate(
 
   try {
 
-    const publicKey =
+    /* PUBLIC ROUTES */
+
+    const publicRoutes = [
+      "/",
+      "/sdk.js",
+      "/style.css",
+    ];
+
+    const isPublic =
+      publicRoutes.includes(req.path) ||
+      req.path.startsWith("/logo") ||
+      req.path.includes(".png") ||
+      req.path.includes(".jpg") ||
+      req.path.includes(".svg");
+
+    if (isPublic) {
+      return next();
+    }
+
+    /* API HEADERS */
+
+    const apiKey =
       req.headers["x-api-key"];
 
     const siteId =
       req.headers["x-site-id"];
 
-    /* ALLOW ROOT + SDK */
-
-    if (
-      req.path === "/" ||
-      req.path.includes(".js")
-    ) {
-
-      return next();
-
-    }
-
-    if (
-      !publicKey ||
-      !siteId
-    ) {
+    if (!apiKey || !siteId) {
 
       return res.status(401).json({
         error:
@@ -85,17 +92,25 @@ async function authenticate(
 
     }
 
+    /* VERIFY CLIENT */
+
     const result =
       await db.query(
         `
-        SELECT *
-        FROM api_keys
-        WHERE public_key=$1
-        AND site_id=$2
-        AND active=true
+        SELECT
+          id,
+          site_id,
+          name,
+          active
+        FROM sites
+        WHERE
+          api_key = $1
+          AND site_id = $2
+          AND active = true
+        LIMIT 1
         `,
         [
-          publicKey,
+          apiKey,
           siteId,
         ]
       );
@@ -106,7 +121,7 @@ async function authenticate(
 
       return res.status(403).json({
         error:
-          "invalid_api_key",
+          "invalid_credentials",
       });
 
     }
@@ -152,7 +167,7 @@ app.get("/", async (req, res) => {
         redis
           ? "enabled"
           : "disabled",
-      version: "v2",
+      version: "v3",
     });
 
   } catch (e) {
@@ -175,7 +190,6 @@ app.post("/event", async (req, res) => {
   try {
 
     const {
-      site_id,
       session_id,
       event,
       payload,
@@ -202,7 +216,7 @@ app.post("/event", async (req, res) => {
       )
       `,
       [
-        site_id,
+        req.site.site_id,
         session_id,
         event,
         payload || {},
@@ -315,6 +329,7 @@ app.post("/score", async (req, res) => {
         `
         INSERT INTO decisions
         (
+          site_id,
           session_id,
           cart_id,
           action,
@@ -324,12 +339,13 @@ app.post("/score", async (req, res) => {
         )
         VALUES
         (
-          $1,$2,$3,$4,$5,
+          $1,$2,$3,$4,$5,$6,
           'SCORED'
         )
         RETURNING id
         `,
         [
+          req.site.site_id,
           session_id,
           cart_id,
           action,
@@ -559,7 +575,8 @@ app.get("/metrics", async (req, res) => {
   try {
 
     const result =
-      await db.query(`
+      await db.query(
+        `
         SELECT
           COUNT(*) AS total,
 
@@ -574,8 +591,12 @@ app.get("/metrics", async (req, res) => {
 
         FROM decisions
 
-        WHERE state='COMPLETED'
-      `);
+        WHERE
+          state='COMPLETED'
+          AND site_id=$1
+        `,
+        [req.site.site_id]
+      );
 
     const row =
       result.rows[0];
@@ -633,7 +654,8 @@ app.get(
     try {
 
       const result =
-        await db.query(`
+        await db.query(
+          `
           SELECT
             action,
 
@@ -649,12 +671,16 @@ app.get(
 
           FROM decisions
 
-          WHERE state='COMPLETED'
+          WHERE
+            state='COMPLETED'
+            AND site_id=$1
 
           GROUP BY action
 
           ORDER BY conversion_rate DESC
-        `);
+          `,
+          [req.site.site_id]
+        );
 
       return res.json(
         result.rows
