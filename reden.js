@@ -8,6 +8,13 @@ import { db, initDB } from "./db.js";
 import { pickAction, updateBandit } from "./bandit.js";
 import { initRedis, redis } from "./redis.js";
 
+import {
+  sendEmail,
+  sendWelcomeEmail,
+  sendDailyReport,
+  sendRecoveryEmail
+} from "./email.js";
+
 dotenv.config();
 
 /* ─────────────────────────────────────────────
@@ -62,6 +69,7 @@ async function authenticate(
       "/",
       "/sdk.js",
       "/style.css",
+      "/test-email",
     ];
 
     const isPublic =
@@ -167,7 +175,7 @@ app.get("/", async (req, res) => {
         redis
           ? "enabled"
           : "disabled",
-      version: "v3",
+      version: "v4",
     });
 
   } catch (e) {
@@ -696,6 +704,68 @@ app.get(
       return res.status(500).json({
         error:
           "metrics_actions_failed",
+      });
+
+    }
+
+  }
+);
+
+/* ─────────────────────────────────────────────
+   TEST EMAIL
+───────────────────────────────────────────── */
+
+app.get(
+  "/test-email",
+
+  async (req, res) => {
+
+    try {
+
+      const result =
+        await sendEmail({
+
+          to:
+            "redenbydcore@gmail.com",
+
+          subject:
+            "REDEN Email System Online",
+
+          html: `
+            <div
+              style="
+                background:#05070b;
+                color:#ffffff;
+                padding:40px;
+                font-family:Arial,sans-serif;
+              "
+            >
+
+              <h1>
+                REDEN Operational
+              </h1>
+
+              <p>
+                Outbound communication
+                infrastructure active.
+              </p>
+
+            </div>
+          `,
+        });
+
+      return res.json(result);
+
+    } catch (e) {
+
+      console.error(
+        "[TEST EMAIL ERROR]",
+        e.message
+      );
+
+      return res.status(500).json({
+        error:
+          "test_email_failed",
       });
 
     }
