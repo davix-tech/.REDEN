@@ -2,7 +2,13 @@ import express from "express";
 import dotenv from "dotenv";
 
 import path from "path";
+import crypto from "crypto";
+
 import { fileURLToPath } from "url";
+
+import helmet from "helmet";
+import compression from "compression";
+import rateLimit from "express-rate-limit";
 
 import { db, initDB } from "./db.js";
 import { pickAction, updateBandit } from "./bandit.js";
@@ -23,7 +29,7 @@ dotenv.config();
 
 await initDB();
 
-initRedis();
+await initRedis();
 
 const app = express();
 
@@ -38,18 +44,140 @@ const __dirname =
   path.dirname(__filename);
 
 /* ─────────────────────────────────────────────
+   SECURITY
+───────────────────────────────────────────── */
+
+app.disable("x-powered-by");
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+  })
+);
+
+app.use(compression());
+
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+/* ─────────────────────────────────────────────
    MIDDLEWARE
 ───────────────────────────────────────────── */
 
-app.use(express.json());
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+  })
+);
+
+/* REQUEST ID */
+
+app.use((req, res, next) => {
+
+  req.requestId =
+    crypto.randomUUID();
+
+  res.setHeader(
+    "x-request-id",
+    req.requestId
+  );
+
+  next();
+
+});
+
+/* RESPONSE TIME */
+
+app.use((req, res, next) => {
+
+  const start = Date.now();
+
+  res.on("finish", () => {
+
+    const duration =
+      Date.now() - start;
+
+    console.log(
+      `[${req.method}] ${req.path} ${res.statusCode} ${duration}ms`
+    );
+
+  });
+
+  next();
+
+});
 
 /* STATIC FILES */
 
 app.use(
   express.static(
-    path.join(__dirname, "public")
+    path.join(__dirname, "public"),
+    {
+      maxAge: "7d",
+      etag: true,
+    }
   )
 );
+
+/* ─────────────────────────────────────────────
+   HELPERS
+───────────────────────────────────────────── */
+
+function success(data = {}) {
+
+  return {
+    ok: true,
+    timestamp:
+      new Date().toISOString(),
+    ...data,
+  };
+
+}
+
+function failure(
+  error,
+  details = null
+) {
+
+  return {
+    ok: false,
+    error,
+    details,
+    timestamp:
+      new Date().toISOString(),
+  };
+
+}
+
+function validateNumber(
+  value
+) {
+
+  const num =
+    Number(value);
+
+  if (
+    Number.isNaN(num) ||
+    !Number.isFinite(num)
+  ) {
+    return null;
+  }
+
+  return num;
+
+}
 
 /* ─────────────────────────────────────────────
    AUTHENTICATION
@@ -63,10 +191,9 @@ async function authenticate(
 
   try {
 
-    /* PUBLIC ROUTES */
-
     const publicRoutes = [
       "/",
+      "/health",
       "/sdk.js",
       "/style.css",
       "/test-email",
@@ -77,13 +204,13 @@ async function authenticate(
       req.path.startsWith("/logo") ||
       req.path.includes(".png") ||
       req.path.includes(".jpg") ||
-      req.path.includes(".svg");
+      req.path.includes(".jpeg") ||
+      req.path.includes(".svg") ||
+      req.path.includes(".webp");
 
     if (isPublic) {
       return next();
     }
-
-    /* API HEADERS */
 
     const apiKey =
       req.headers["x-api-key"];
@@ -93,14 +220,42 @@ async function authenticate(
 
     if (!apiKey || !siteId) {
 
-      return res.status(401).json({
-        error:
-          "missing_credentials",
-      });
+      return res
+        .status(401)
+        .json(
+          failure(
+            "missing_credentials"
+          )
+        );
 
     }
 
-    /* VERIFY CLIENT */
+    let cacheKey =
+      `site:${siteId}:${apiKey}`;
+
+    /* REDIS CACHE */
+
+    if (redis) {
+
+      try {
+
+        const cached =
+          await redis.get(
+            cacheKey
+          );
+
+        if (cached) {
+
+          req.site =
+            JSON.parse(cached);
+
+          return next();
+
+        }
+
+      } catch {}
+
+    }
 
     const result =
       await db.query(
@@ -109,7 +264,8 @@ async function authenticate(
           id,
           site_id,
           name,
-          active
+          active,
+          created_at
         FROM sites
         WHERE
           api_key = $1
@@ -127,15 +283,37 @@ async function authenticate(
       result.rowCount === 0
     ) {
 
-      return res.status(403).json({
-        error:
-          "invalid_credentials",
-      });
+      return res
+        .status(403)
+        .json(
+          failure(
+            "invalid_credentials"
+          )
+        );
 
     }
 
     req.site =
       result.rows[0];
+
+    /* CACHE SITE */
+
+    if (redis) {
+
+      try {
+
+        await redis.set(
+          cacheKey,
+          JSON.stringify(
+            req.site
+          ),
+          "EX",
+          300
+        );
+
+      } catch {}
+
+    }
 
     next();
 
@@ -146,10 +324,13 @@ async function authenticate(
       e.message
     );
 
-    return res.status(500).json({
-      error:
-        "authentication_failed",
-    });
+    return res
+      .status(500)
+      .json(
+        failure(
+          "authentication_failed"
+        )
+      );
 
   }
 
@@ -167,25 +348,46 @@ app.get("/", async (req, res) => {
 
     await db.query("SELECT 1");
 
-    return res.json({
-      status: "ok",
-      service: "REDEN",
-      database: "connected",
-      redis:
-        redis
-          ? "enabled"
-          : "disabled",
-      version: "v4",
-    });
+    return res.json(
+      success({
+        service: "REDEN",
+        status: "operational",
+        database: "connected",
+        redis:
+          redis
+            ? "enabled"
+            : "disabled",
+        runtime: "adaptive",
+        version: "v5",
+      })
+    );
 
   } catch (e) {
 
-    return res.status(500).json({
-      status: "error",
-      database: "offline",
-    });
+    return res
+      .status(500)
+      .json(
+        failure(
+          "database_offline"
+        )
+      );
 
   }
+
+});
+
+app.get("/health", async (req, res) => {
+
+  return res.json(
+    success({
+      uptime:
+        process.uptime(),
+      memory:
+        process.memoryUsage(),
+      node:
+        process.version,
+    })
+  );
 
 });
 
@@ -205,6 +407,21 @@ app.post("/event", async (req, res) => {
       path,
       title,
     } = req.body;
+
+    if (
+      !session_id ||
+      !event
+    ) {
+
+      return res
+        .status(400)
+        .json(
+          failure(
+            "missing_fields"
+          )
+        );
+
+    }
 
     await db.query(
       `
@@ -234,9 +451,9 @@ app.post("/event", async (req, res) => {
       ]
     );
 
-    return res.json({
-      ok: true,
-    });
+    return res.json(
+      success()
+    );
 
   } catch (e) {
 
@@ -245,10 +462,13 @@ app.post("/event", async (req, res) => {
       e.message
     );
 
-    return res.status(500).json({
-      error:
-        "event_failed",
-    });
+    return res
+      .status(500)
+      .json(
+        failure(
+          "event_failed"
+        )
+      );
 
   }
 
@@ -274,25 +494,33 @@ app.post("/score", async (req, res) => {
       cart_value === undefined
     ) {
 
-      return res.status(400).json({
-        error:
-          "missing_fields",
-      });
+      return res
+        .status(400)
+        .json(
+          failure(
+            "missing_fields"
+          )
+        );
 
     }
 
     const value =
-      Number(cart_value);
+      validateNumber(
+        cart_value
+      );
 
     if (
-      isNaN(value) ||
+      value === null ||
       value <= 0
     ) {
 
-      return res.status(400).json({
-        error:
-          "invalid_cart_value",
-      });
+      return res
+        .status(400)
+        .json(
+          failure(
+            "invalid_cart_value"
+          )
+        );
 
     }
 
@@ -303,28 +531,15 @@ app.post("/score", async (req, res) => {
       action = "NONE";
     }
 
-    let discount = 0;
+    const discounts = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
 
-    if (
-      action ===
-      "INCENTIVE_LOW"
-    ) {
-      discount = 5;
-    }
-
-    if (
-      action ===
-      "INCENTIVE_MED"
-    ) {
-      discount = 10;
-    }
-
-    if (
-      action ===
-      "INCENTIVE_HIGH"
-    ) {
-      discount = 20;
-    }
+    const discount =
+      discounts[action] || 0;
 
     const expected_value =
       Math.max(
@@ -350,7 +565,9 @@ app.post("/score", async (req, res) => {
           $1,$2,$3,$4,$5,$6,
           'SCORED'
         )
-        RETURNING id
+        RETURNING
+          id,
+          created_at
         `,
         [
           req.site.site_id,
@@ -362,22 +579,22 @@ app.post("/score", async (req, res) => {
         ]
       );
 
-    const decision_id =
-      result.rows[0].id;
+    const decision =
+      result.rows[0];
+
+    /* REDIS */
 
     if (redis) {
 
       try {
 
         await redis.set(
-          `decision:${decision_id}`,
-
+          `decision:${decision.id}`,
           JSON.stringify({
             action,
             discount,
             expected_value,
           }),
-
           "EX",
           300
         );
@@ -386,14 +603,17 @@ app.post("/score", async (req, res) => {
 
     }
 
-    return res.json({
-      decision_id,
-      action,
-      discount,
-      expected_value,
-      explored:
-        Math.random() < 0.1,
-    });
+    return res.json(
+      success({
+        decision_id:
+          decision.id,
+        action,
+        discount,
+        expected_value,
+        explored:
+          Math.random() < 0.1,
+      })
+    );
 
   } catch (e) {
 
@@ -402,10 +622,13 @@ app.post("/score", async (req, res) => {
       e.message
     );
 
-    return res.status(500).json({
-      error:
-        "score_failed",
-    });
+    return res
+      .status(500)
+      .json(
+        failure(
+          "score_failed"
+        )
+      );
 
   }
 
@@ -425,10 +648,13 @@ app.post("/action", async (req, res) => {
 
     if (!decision_id) {
 
-      return res.status(400).json({
-        error:
-          "missing_decision_id",
-      });
+      return res
+        .status(400)
+        .json(
+          failure(
+            "missing_decision_id"
+          )
+        );
 
     }
 
@@ -436,9 +662,13 @@ app.post("/action", async (req, res) => {
       await db.query(
         `
         UPDATE decisions
-        SET state='ACTIONED'
-        WHERE id=$1
-        AND state='SCORED'
+        SET
+          state='ACTIONED',
+          actioned_at=NOW()
+
+        WHERE
+          id=$1
+          AND state='SCORED'
         `,
         [decision_id]
       );
@@ -447,16 +677,19 @@ app.post("/action", async (req, res) => {
       result.rowCount === 0
     ) {
 
-      return res.status(409).json({
-        error:
-          "invalid_state",
-      });
+      return res
+        .status(409)
+        .json(
+          failure(
+            "invalid_state"
+          )
+        );
 
     }
 
-    return res.json({
-      ok: true,
-    });
+    return res.json(
+      success()
+    );
 
   } catch (e) {
 
@@ -465,10 +698,13 @@ app.post("/action", async (req, res) => {
       e.message
     );
 
-    return res.status(500).json({
-      error:
-        "action_failed",
-    });
+    return res
+      .status(500)
+      .json(
+        failure(
+          "action_failed"
+        )
+      );
 
   }
 
@@ -490,17 +726,22 @@ app.post("/outcome", async (req, res) => {
 
     if (!decision_id) {
 
-      return res.status(400).json({
-        error:
-          "missing_decision_id",
-      });
+      return res
+        .status(400)
+        .json(
+          failure(
+            "missing_decision_id"
+          )
+        );
 
     }
 
     const existing =
       await db.query(
         `
-        SELECT action, state
+        SELECT
+          action,
+          state
         FROM decisions
         WHERE id=$1
         `,
@@ -511,10 +752,13 @@ app.post("/outcome", async (req, res) => {
       existing.rowCount === 0
     ) {
 
-      return res.status(404).json({
-        error:
-          "decision_not_found",
-      });
+      return res
+        .status(404)
+        .json(
+          failure(
+            "decision_not_found"
+          )
+        );
 
     }
 
@@ -526,10 +770,13 @@ app.post("/outcome", async (req, res) => {
       "COMPLETED"
     ) {
 
-      return res.status(409).json({
-        error:
-          "already_completed",
-      });
+      return res
+        .status(409)
+        .json(
+          failure(
+            "already_completed"
+          )
+        );
 
     }
 
@@ -539,7 +786,8 @@ app.post("/outcome", async (req, res) => {
       SET
         state='COMPLETED',
         converted=$1,
-        revenue=$2
+        revenue=$2,
+        completed_at=NOW()
       WHERE id=$3
       `,
       [
@@ -554,9 +802,11 @@ app.post("/outcome", async (req, res) => {
       Boolean(converted)
     );
 
-    return res.json({
-      ok: true,
-    });
+    return res.json(
+      success({
+        updated: true,
+      })
+    );
 
   } catch (e) {
 
@@ -565,10 +815,13 @@ app.post("/outcome", async (req, res) => {
       e.message
     );
 
-    return res.status(500).json({
-      error:
-        "outcome_failed",
-    });
+    return res
+      .status(500)
+      .json(
+        failure(
+          "outcome_failed"
+        )
+      );
 
   }
 
@@ -595,7 +848,12 @@ app.get("/metrics", async (req, res) => {
           COALESCE(
             AVG(revenue),
             0
-          ) AS avg_revenue
+          ) AS avg_revenue,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          ) AS total_revenue
 
         FROM decisions
 
@@ -617,22 +875,28 @@ app.get("/metrics", async (req, res) => {
         row.conversions || 0
       );
 
-    return res.json({
-      total,
+    return res.json(
+      success({
+        total,
+        conversions,
 
-      conversions,
+        conversion_rate:
+          total > 0
+            ? conversions /
+              total
+            : 0,
 
-      conversion_rate:
-        total > 0
-          ? conversions /
-            total
-          : 0,
+        avg_revenue:
+          Number(
+            row.avg_revenue || 0
+          ),
 
-      avg_revenue:
-        Number(
-          row.avg_revenue || 0
-        ),
-    });
+        total_revenue:
+          Number(
+            row.total_revenue || 0
+          ),
+      })
+    );
 
   } catch (e) {
 
@@ -641,10 +905,13 @@ app.get("/metrics", async (req, res) => {
       e.message
     );
 
-    return res.status(500).json({
-      error:
-        "metrics_failed",
-    });
+    return res
+      .status(500)
+      .json(
+        failure(
+          "metrics_failed"
+        )
+      );
 
   }
 
@@ -675,7 +942,12 @@ app.get(
                 THEN 1
                 ELSE 0
               END
-            ) AS conversion_rate
+            ) AS conversion_rate,
+
+            COALESCE(
+              AVG(revenue),
+              0
+            ) AS avg_revenue
 
           FROM decisions
 
@@ -691,7 +963,10 @@ app.get(
         );
 
       return res.json(
-        result.rows
+        success({
+          actions:
+            result.rows,
+        })
       );
 
     } catch (e) {
@@ -701,10 +976,64 @@ app.get(
         e.message
       );
 
-      return res.status(500).json({
-        error:
-          "metrics_actions_failed",
-      });
+      return res
+        .status(500)
+        .json(
+          failure(
+            "metrics_actions_failed"
+          )
+        );
+
+    }
+
+  }
+);
+
+/* ─────────────────────────────────────────────
+   RUNTIME INSIGHTS
+───────────────────────────────────────────── */
+
+app.get(
+  "/runtime",
+
+  async (req, res) => {
+
+    try {
+
+      const result =
+        await db.query(
+          `
+          SELECT
+            state,
+            COUNT(*) AS total
+          FROM decisions
+          WHERE site_id=$1
+          GROUP BY state
+          `,
+          [req.site.site_id]
+        );
+
+      return res.json(
+        success({
+          runtime:
+            result.rows,
+        })
+      );
+
+    } catch (e) {
+
+      console.error(
+        "[RUNTIME ERROR]",
+        e.message
+      );
+
+      return res
+        .status(500)
+        .json(
+          failure(
+            "runtime_failed"
+          )
+        );
 
     }
 
@@ -729,7 +1058,7 @@ app.get(
             "redenbydcore@gmail.com",
 
           subject:
-            "REDEN Email System Online",
+            "REDEN Runtime Operational",
 
           html: `
             <div
@@ -742,19 +1071,26 @@ app.get(
             >
 
               <h1>
-                REDEN Operational
+                REDEN Runtime Online
               </h1>
 
               <p>
-                Outbound communication
-                infrastructure active.
+                Adaptive infrastructure
+                communication layer active.
+              </p>
+
+              <p>
+                Timestamp:
+                ${new Date().toISOString()}
               </p>
 
             </div>
           `,
         });
 
-      return res.json(result);
+      return res.json(
+        success(result)
+      );
 
     } catch (e) {
 
@@ -763,10 +1099,13 @@ app.get(
         e.message
       );
 
-      return res.status(500).json({
-        error:
-          "test_email_failed",
-      });
+      return res
+        .status(500)
+        .json(
+          failure(
+            "test_email_failed"
+          )
+        );
 
     }
 
@@ -779,10 +1118,39 @@ app.get(
 
 app.use((req, res) => {
 
-  return res.status(404).json({
-    error:
-      "route_not_found",
-  });
+  return res
+    .status(404)
+    .json(
+      failure(
+        "route_not_found"
+      )
+    );
+
+});
+
+/* ─────────────────────────────────────────────
+   GLOBAL ERROR HANDLER
+───────────────────────────────────────────── */
+
+app.use((
+  err,
+  req,
+  res,
+  next
+) => {
+
+  console.error(
+    "[UNHANDLED ERROR]",
+    err
+  );
+
+  return res
+    .status(500)
+    .json(
+      failure(
+        "internal_server_error"
+      )
+    );
 
 });
 
@@ -795,8 +1163,13 @@ const PORT =
 
 app.listen(PORT, () => {
 
-  console.log(
-    `REDEN running on port ${PORT}`
-  );
+  console.log(`
+  ┌──────────────────────────────┐
+   REDEN Runtime Operational
+   Port: ${PORT}
+   Environment:
+   ${process.env.NODE_ENV || "development"}
+  └──────────────────────────────┘
+  `);
 
 });
