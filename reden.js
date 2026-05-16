@@ -1,9 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
-
 import path from "path";
 import crypto from "crypto";
-
 import { fileURLToPath } from "url";
 
 import helmet from "helmet";
@@ -16,7 +14,6 @@ import { initRedis, redis } from "./redis.js";
 
 import {
   sendEmail,
-  sendWelcomeEmail,
   sendDailyReport,
   sendRecoveryEmail
 } from "./email.js";
@@ -28,7 +25,6 @@ dotenv.config();
 ───────────────────────────────────────────── */
 
 await initDB();
-
 await initRedis();
 
 const app = express();
@@ -37,11 +33,8 @@ const app = express();
    PATH SETUP
 ───────────────────────────────────────────── */
 
-const __filename =
-  fileURLToPath(import.meta.url);
-
-const __dirname =
-  path.dirname(__filename);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /* ─────────────────────────────────────────────
    SECURITY
@@ -70,65 +63,32 @@ app.use(
    MIDDLEWARE
 ───────────────────────────────────────────── */
 
-app.use(
-  express.json({
-    limit: "1mb",
-  })
-);
-
-app.use(
-  express.urlencoded({
-    extended: true,
-  })
-);
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 /* REQUEST ID */
-
 app.use((req, res, next) => {
-
-  req.requestId =
-    crypto.randomUUID();
-
-  res.setHeader(
-    "x-request-id",
-    req.requestId
-  );
-
+  req.requestId = crypto.randomUUID();
+  res.setHeader("x-request-id", req.requestId);
   next();
-
 });
 
 /* RESPONSE TIME */
-
 app.use((req, res, next) => {
-
   const start = Date.now();
-
   res.on("finish", () => {
-
-    const duration =
-      Date.now() - start;
-
-    console.log(
-      `[${req.method}] ${req.path} ${res.statusCode} ${duration}ms`
-    );
-
+    const duration = Date.now() - start;
+    console.log(`[${req.method}] ${req.path} ${res.statusCode} ${duration}ms`);
   });
-
   next();
-
 });
 
 /* STATIC FILES */
-
 app.use(
-  express.static(
-    path.join(__dirname, "public"),
-    {
-      maxAge: "7d",
-      etag: true,
-    }
-  )
+  express.static(path.join(__dirname, "public"), {
+    maxAge: "7d",
+    etag: true,
+  })
 );
 
 /* ─────────────────────────────────────────────
@@ -136,61 +96,36 @@ app.use(
 ───────────────────────────────────────────── */
 
 function success(data = {}) {
-
   return {
     ok: true,
-    timestamp:
-      new Date().toISOString(),
+    timestamp: new Date().toISOString(),
     ...data,
   };
-
 }
 
-function failure(
-  error,
-  details = null
-) {
-
+function failure(error, details = null) {
   return {
     ok: false,
     error,
     details,
-    timestamp:
-      new Date().toISOString(),
+    timestamp: new Date().toISOString(),
   };
-
 }
 
-function validateNumber(
-  value
-) {
-
-  const num =
-    Number(value);
-
-  if (
-    Number.isNaN(num) ||
-    !Number.isFinite(num)
-  ) {
+function validateNumber(value) {
+  const num = Number(value);
+  if (Number.isNaN(num) || !Number.isFinite(num)) {
     return null;
   }
-
   return num;
-
 }
 
 /* ─────────────────────────────────────────────
    AUTHENTICATION
 ───────────────────────────────────────────── */
 
-async function authenticate(
-  req,
-  res,
-  next
-) {
-
+async function authenticate(req, res, next) {
   try {
-
     const publicRoutes = [
       "/",
       "/health",
@@ -212,128 +147,62 @@ async function authenticate(
       return next();
     }
 
-    const apiKey =
-      req.headers["x-api-key"];
-
-    const siteId =
-      req.headers["x-site-id"];
+    const apiKey = req.headers["x-api-key"];
+    const siteId = req.headers["x-site-id"];
 
     if (!apiKey || !siteId) {
-
-      return res
-        .status(401)
-        .json(
-          failure(
-            "missing_credentials"
-          )
-        );
-
+      return res.status(401).json(failure("missing_credentials"));
     }
 
-    let cacheKey =
-      `site:${siteId}:${apiKey}`;
+    let cacheKey = `site:${siteId}:${apiKey}`;
 
     /* REDIS CACHE */
-
     if (redis) {
-
       try {
-
-        const cached =
-          await redis.get(
-            cacheKey
-          );
-
+        const cached = await redis.get(cacheKey);
         if (cached) {
-
-          req.site =
-            JSON.parse(cached);
-
+          req.site = JSON.parse(cached);
           return next();
-
         }
-
       } catch {}
-
     }
 
-    const result =
-      await db.query(
-        `
-        SELECT
-          id,
-          site_id,
-          name,
-          active,
-          created_at
-        FROM sites
-        WHERE
-          api_key = $1
-          AND site_id = $2
-          AND active = true
-        LIMIT 1
-        `,
-        [
-          apiKey,
-          siteId,
-        ]
-      );
+    const result = await db.query(
+      `
+      SELECT
+        id,
+        site_id,
+        name,
+        active,
+        created_at
+      FROM sites
+      WHERE
+        api_key = $1
+        AND site_id = $2
+        AND active = true
+      LIMIT 1
+      `,
+      [apiKey, siteId]
+    );
 
-    if (
-      result.rowCount === 0
-    ) {
-
-      return res
-        .status(403)
-        .json(
-          failure(
-            "invalid_credentials"
-          )
-        );
-
+    if (result.rowCount === 0) {
+      return res.status(403).json(failure("invalid_credentials"));
     }
 
-    req.site =
-      result.rows[0];
+    req.site = result.rows[0];
 
     /* CACHE SITE */
-
     if (redis) {
-
       try {
-
-        await redis.set(
-          cacheKey,
-          JSON.stringify(
-            req.site
-          ),
-          "EX",
-          300
-        );
-
+        await redis.set(cacheKey, JSON.stringify(req.site), "EX", 300);
       } catch {}
-
     }
 
     next();
-
   } catch (e) {
-
-    console.error(
-      "[AUTH ERROR]",
-      e.message
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "authentication_failed"
-        )
-      );
-
+    console.error("[AUTH ERROR]", e.message);
+    return res.status(500).json(failure("authentication_failed"));
   }
-
 }
 
 app.use(authenticate);
@@ -343,52 +212,31 @@ app.use(authenticate);
 ───────────────────────────────────────────── */
 
 app.get("/", async (req, res) => {
-
   try {
-
     await db.query("SELECT 1");
-
     return res.json(
       success({
         service: "REDEN",
         status: "operational",
         database: "connected",
-        redis:
-          redis
-            ? "enabled"
-            : "disabled",
+        redis: redis ? "enabled" : "disabled",
         runtime: "adaptive",
         version: "v5",
       })
     );
-
   } catch (e) {
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "database_offline"
-        )
-      );
-
+    return res.status(500).json(failure("database_offline"));
   }
-
 });
 
 app.get("/health", async (req, res) => {
-
   return res.json(
     success({
-      uptime:
-        process.uptime(),
-      memory:
-        process.memoryUsage(),
-      node:
-        process.version,
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      node: process.version,
     })
   );
-
 });
 
 /* ─────────────────────────────────────────────
@@ -396,31 +244,11 @@ app.get("/health", async (req, res) => {
 ───────────────────────────────────────────── */
 
 app.post("/event", async (req, res) => {
-
   try {
+    const { session_id, event, payload, url, path, title } = req.body;
 
-    const {
-      session_id,
-      event,
-      payload,
-      url,
-      path,
-      title,
-    } = req.body;
-
-    if (
-      !session_id ||
-      !event
-    ) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_fields"
-          )
-        );
-
+    if (!session_id || !event) {
+      return res.status(400).json(failure("missing_fields"));
     }
 
     await db.query(
@@ -437,7 +265,7 @@ app.post("/event", async (req, res) => {
       )
       VALUES
       (
-        $1,$2,$3,$4,$5,$6,$7
+        $1, $2, $3, $4, $5, $6, $7
       )
       `,
       [
@@ -451,27 +279,140 @@ app.post("/event", async (req, res) => {
       ]
     );
 
-    return res.json(
-      success()
-    );
-
+    return res.json(success());
   } catch (e) {
+    console.error("[EVENT ERROR]", e.message);
+    return res.status(500).json(failure("event_failed"));
+  }
+});
 
-    console.error(
-      "[EVENT ERROR]",
-      e.message
+/* ─────────────────────────────────────────────
+   IDENTIFY CUSTOMER
+───────────────────────────────────────────── */
+
+app.post("/identify", async (req, res) => {
+  try {
+    const {
+      session_id,
+      customer_id,
+      email,
+      first_name,
+      last_name,
+      metadata,
+    } = req.body;
+
+    if (!session_id || !email) {
+      return res.status(400).json(failure("missing_fields"));
+    }
+
+    /* FIND EXISTING CUSTOMER */
+    const existing = await db.query(
+      `
+      SELECT id, email 
+      FROM customers 
+      WHERE site_id = $1 AND email = $2 
+      LIMIT 1
+      `,
+      [req.site.site_id, email]
     );
 
-    return res
-      .status(500)
-      .json(
-        failure(
-          "event_failed"
+    let customerRef;
+
+    /* CREATE CUSTOMER */
+    if (existing.rowCount === 0) {
+      const created = await db.query(
+        `
+        INSERT INTO customers
+        (
+          site_id,
+          customer_id,
+          email,
+          first_name,
+          last_name,
+          metadata,
+          created_at
         )
+        VALUES
+        (
+          $1, $2, $3, $4, $5, $6, NOW()
+        )
+        RETURNING id
+        `,
+        [
+          req.site.site_id,
+          customer_id || null,
+          email,
+          first_name || null,
+          last_name || null,
+          metadata || {},
+        ]
       );
 
-  }
+      customerRef = created.rows[0].id;
 
+      /* SEND WELCOME EMAIL */
+      try {
+        await sendEmail({
+          to: email,
+          subject: "Your Session With REDEN Is Active",
+          html: `
+            <div style="background:#05070b; color:#ffffff; padding:40px; font-family:Inter,Arial,sans-serif;">
+              <h1 style="font-size:30px; margin-bottom:10px;">Connected</h1>
+              <p style="color:#9ca3af; line-height:1.7;">Your interaction session has been initialized successfully.</p>
+              <div style="margin-top:30px; padding:24px; border-radius:14px; background:#0b0f17; border:1px solid #1f2937;">
+                <p>Session ID:</p>
+                <code>${session_id}</code>
+              </div>
+            </div>
+          `,
+        });
+      } catch (emailError) {
+        console.error("[WELCOME EMAIL ERROR]", emailError.message);
+      }
+    } else {
+      customerRef = existing.rows[0].id;
+    }
+
+    /* PREVENT DUPLICATE SESSION LINKS */
+    const existingSession = await db.query(
+      `
+      SELECT id 
+      FROM customer_sessions 
+      WHERE site_id = $1 AND session_id = $2 
+      LIMIT 1
+      `,
+      [req.site.site_id, session_id]
+    );
+
+    if (existingSession.rowCount === 0) {
+      await db.query(
+        `
+        INSERT INTO customer_sessions
+        (
+          site_id,
+          customer_ref,
+          session_id,
+          created_at
+        )
+        VALUES
+        (
+          $1, $2, $3, NOW()
+        )
+        `,
+        [req.site.site_id, customerRef, session_id]
+      );
+    }
+
+    return res.json(
+      success({
+        customer_ref: customerRef,
+        identified: true,
+      })
+    );
+  } catch (e) {
+    console.error("[IDENTIFY ERROR]", e.message);
+    return res.status(500).json(failure("identify_failed"));
+  }
 });
 
 /* ─────────────────────────────────────────────
@@ -479,53 +420,20 @@ app.post("/event", async (req, res) => {
 ───────────────────────────────────────────── */
 
 app.post("/score", async (req, res) => {
-
   try {
+    const { session_id, cart_id, cart_value } = req.body;
 
-    const {
-      session_id,
-      cart_id,
-      cart_value,
-    } = req.body;
-
-    if (
-      !session_id ||
-      !cart_id ||
-      cart_value === undefined
-    ) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_fields"
-          )
-        );
-
+    if (!session_id || !cart_id || cart_value === undefined) {
+      return res.status(400).json(failure("missing_fields"));
     }
 
-    const value =
-      validateNumber(
-        cart_value
-      );
+    const value = validateNumber(cart_value);
 
-    if (
-      value === null ||
-      value <= 0
-    ) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "invalid_cart_value"
-          )
-        );
-
+    if (value === null || value <= 0) {
+      return res.status(400).json(failure("invalid_cart_value"));
     }
 
-    let action =
-      await pickAction();
+    let action = await pickAction();
 
     if (!action) {
       action = "NONE";
@@ -538,56 +446,42 @@ app.post("/score", async (req, res) => {
       INCENTIVE_HIGH: 20,
     };
 
-    const discount =
-      discounts[action] || 0;
+    const discount = discounts[action] || 0;
+    const expected_value = Math.max(value - discount, 0);
 
-    const expected_value =
-      Math.max(
-        value - discount,
-        0
-      );
+    const result = await db.query(
+      `
+      INSERT INTO decisions
+      (
+        site_id,
+        session_id,
+        cart_id,
+        action,
+        discount,
+        expected_value,
+        state
+      )
+      VALUES
+      (
+        $1, $2, $3, $4, $5, $6, 'SCORED'
+      )
+      RETURNING id, created_at
+      `,
+      [
+        req.site.site_id,
+        session_id,
+        cart_id,
+        action,
+        discount,
+        expected_value,
+      ]
+    );
 
-    const result =
-      await db.query(
-        `
-        INSERT INTO decisions
-        (
-          site_id,
-          session_id,
-          cart_id,
-          action,
-          discount,
-          expected_value,
-          state
-        )
-        VALUES
-        (
-          $1,$2,$3,$4,$5,$6,
-          'SCORED'
-        )
-        RETURNING
-          id,
-          created_at
-        `,
-        [
-          req.site.site_id,
-          session_id,
-          cart_id,
-          action,
-          discount,
-          expected_value,
-        ]
-      );
-
-    const decision =
-      result.rows[0];
+    const decision = result.rows[0];
 
     /* REDIS */
-
     if (redis) {
-
       try {
-
         await redis.set(
           `decision:${decision.id}`,
           JSON.stringify({
@@ -598,40 +492,22 @@ app.post("/score", async (req, res) => {
           "EX",
           300
         );
-
       } catch {}
-
     }
 
     return res.json(
       success({
-        decision_id:
-          decision.id,
+        decision_id: decision.id,
         action,
         discount,
         expected_value,
-        explored:
-          Math.random() < 0.1,
+        explored: Math.random() < 0.1,
       })
     );
-
   } catch (e) {
-
-    console.error(
-      "[SCORE ERROR]",
-      e.message
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "score_failed"
-        )
-      );
-
+    console.error("[SCORE ERROR]", e.message);
+    return res.status(500).json(failure("score_failed"));
   }
-
 });
 
 /* ─────────────────────────────────────────────
@@ -639,75 +515,35 @@ app.post("/score", async (req, res) => {
 ───────────────────────────────────────────── */
 
 app.post("/action", async (req, res) => {
-
   try {
-
-    const {
-      decision_id,
-    } = req.body;
+    const { decision_id } = req.body;
 
     if (!decision_id) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_decision_id"
-          )
-        );
-
+      return res.status(400).json(failure("missing_decision_id"));
     }
 
-    const result =
-      await db.query(
-        `
-        UPDATE decisions
-        SET
-          state='ACTIONED',
-          actioned_at=NOW()
-
-        WHERE
-          id=$1
-          AND state='SCORED'
-        `,
-        [decision_id]
-      );
-
-    if (
-      result.rowCount === 0
-    ) {
-
-      return res
-        .status(409)
-        .json(
-          failure(
-            "invalid_state"
-          )
-        );
-
-    }
-
-    return res.json(
-      success()
+    const result = await db.query(
+      `
+      UPDATE decisions
+      SET
+        state = 'ACTIONED',
+        actioned_at = NOW()
+      WHERE
+        id = $1
+        AND state = 'SCORED'
+      `,
+      [decision_id]
     );
 
+    if (result.rowCount === 0) {
+      return res.status(409).json(failure("invalid_state"));
+    }
+
+    return res.json(success());
   } catch (e) {
-
-    console.error(
-      "[ACTION ERROR]",
-      e.message
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "action_failed"
-        )
-      );
-
+    console.error("[ACTION ERROR]", e.message);
+    return res.status(500).json(failure("action_failed"));
   }
-
 });
 
 /* ─────────────────────────────────────────────
@@ -715,116 +551,56 @@ app.post("/action", async (req, res) => {
 ───────────────────────────────────────────── */
 
 app.post("/outcome", async (req, res) => {
-
   try {
-
-    const {
-      decision_id,
-      converted,
-      revenue,
-    } = req.body;
+    const { decision_id, converted, revenue } = req.body;
 
     if (!decision_id) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_decision_id"
-          )
-        );
-
+      return res.status(400).json(failure("missing_decision_id"));
     }
 
-    const existing =
-      await db.query(
-        `
-        SELECT
-          action,
-          state
-        FROM decisions
-        WHERE id=$1
-        `,
-        [decision_id]
-      );
+    const existing = await db.query(
+      `
+      SELECT action, state
+      FROM decisions
+      WHERE id = $1
+      `,
+      [decision_id]
+    );
 
-    if (
-      existing.rowCount === 0
-    ) {
-
-      return res
-        .status(404)
-        .json(
-          failure(
-            "decision_not_found"
-          )
-        );
-
+    if (existing.rowCount === 0) {
+      return res.status(404).json(failure("decision_not_found"));
     }
 
-    const row =
-      existing.rows[0];
+    const row = existing.rows[0];
 
-    if (
-      row.state ===
-      "COMPLETED"
-    ) {
-
-      return res
-        .status(409)
-        .json(
-          failure(
-            "already_completed"
-          )
-        );
-
+    if (row.state === "COMPLETED") {
+      return res.status(409).json(failure("already_completed"));
     }
 
     await db.query(
       `
       UPDATE decisions
       SET
-        state='COMPLETED',
-        converted=$1,
-        revenue=$2,
-        completed_at=NOW()
-      WHERE id=$3
+        state = 'COMPLETED',
+        converted = $1,
+        revenue = $2,
+        completed_at = NOW()
+      WHERE id = $3
       `,
-      [
-        Boolean(converted),
-        Number(revenue || 0),
-        decision_id,
-      ]
+      [Boolean(converted), Number(revenue || 0), decision_id]
     );
 
-    await updateBandit(
-      row.action,
-      Boolean(converted)
-    );
+    await updateBandit(row.action, Boolean(converted));
 
     return res.json(
       success({
         updated: true,
       })
     );
-
   } catch (e) {
-
-    console.error(
-      "[OUTCOME ERROR]",
-      e.message
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "outcome_failed"
-        )
-      );
-
+    console.error("[OUTCOME ERROR]", e.message);
+    return res.status(500).json(failure("outcome_failed"));
   }
-
 });
 
 /* ─────────────────────────────────────────────
@@ -832,344 +608,158 @@ app.post("/outcome", async (req, res) => {
 ───────────────────────────────────────────── */
 
 app.get("/metrics", async (req, res) => {
-
   try {
+    const result = await db.query(
+      `
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE converted = true) AS conversions,
+        COALESCE(AVG(revenue), 0) AS avg_revenue,
+        COALESCE(SUM(revenue), 0) AS total_revenue
+      FROM decisions
+      WHERE
+        state = 'COMPLETED'
+        AND site_id = $1
+      `,
+      [req.site.site_id]
+    );
 
-    const result =
-      await db.query(
-        `
-        SELECT
-          COUNT(*) AS total,
-
-          COUNT(*) FILTER (
-            WHERE converted = true
-          ) AS conversions,
-
-          COALESCE(
-            AVG(revenue),
-            0
-          ) AS avg_revenue,
-
-          COALESCE(
-            SUM(revenue),
-            0
-          ) AS total_revenue
-
-        FROM decisions
-
-        WHERE
-          state='COMPLETED'
-          AND site_id=$1
-        `,
-        [req.site.site_id]
-      );
-
-    const row =
-      result.rows[0];
-
-    const total =
-      Number(row.total || 0);
-
-    const conversions =
-      Number(
-        row.conversions || 0
-      );
+    const row = result.rows[0];
+    const total = Number(row.total || 0);
+    const conversions = Number(row.conversions || 0);
 
     return res.json(
       success({
         total,
         conversions,
-
-        conversion_rate:
-          total > 0
-            ? conversions /
-              total
-            : 0,
-
-        avg_revenue:
-          Number(
-            row.avg_revenue || 0
-          ),
-
-        total_revenue:
-          Number(
-            row.total_revenue || 0
-          ),
+        conversion_rate: total > 0 ? conversions / total : 0,
+        avg_revenue: Number(row.avg_revenue || 0),
+        total_revenue: Number(row.total_revenue || 0),
       })
     );
-
   } catch (e) {
-
-    console.error(
-      "[METRICS ERROR]",
-      e.message
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "metrics_failed"
-        )
-      );
-
+    console.error("[METRICS ERROR]", e.message);
+    return res.status(500).json(failure("metrics_failed"));
   }
-
 });
 
 /* ─────────────────────────────────────────────
    ACTION METRICS
 ───────────────────────────────────────────── */
 
-app.get(
-  "/metrics/actions",
+app.get("/metrics/actions", async (req, res) => {
+  try {
+    const result = await db.query(
+      `
+      SELECT
+        action,
+        COUNT(*) AS total,
+        AVG(CASE WHEN converted = true THEN 1 ELSE 0 END) AS conversion_rate,
+        COALESCE(AVG(revenue), 0) AS avg_revenue
+      FROM decisions
+      WHERE
+        state = 'COMPLETED'
+        AND site_id = $1
+      GROUP BY action
+      ORDER BY conversion_rate DESC
+      `,
+      [req.site.site_id]
+    );
 
-  async (req, res) => {
-
-    try {
-
-      const result =
-        await db.query(
-          `
-          SELECT
-            action,
-
-            COUNT(*) AS total,
-
-            AVG(
-              CASE
-                WHEN converted = true
-                THEN 1
-                ELSE 0
-              END
-            ) AS conversion_rate,
-
-            COALESCE(
-              AVG(revenue),
-              0
-            ) AS avg_revenue
-
-          FROM decisions
-
-          WHERE
-            state='COMPLETED'
-            AND site_id=$1
-
-          GROUP BY action
-
-          ORDER BY conversion_rate DESC
-          `,
-          [req.site.site_id]
-        );
-
-      return res.json(
-        success({
-          actions:
-            result.rows,
-        })
-      );
-
-    } catch (e) {
-
-      console.error(
-        "[ACTION METRICS ERROR]",
-        e.message
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "metrics_actions_failed"
-          )
-        );
-
-    }
-
+    return res.json(
+      success({
+        actions: result.rows,
+      })
+    );
+  } catch (e) {
+    console.error("[ACTION METRICS ERROR]", e.message);
+    return res.status(500).json(failure("metrics_actions_failed"));
   }
-);
+});
 
 /* ─────────────────────────────────────────────
    RUNTIME INSIGHTS
 ───────────────────────────────────────────── */
 
-app.get(
-  "/runtime",
+app.get("/runtime", async (req, res) => {
+  try {
+    const result = await db.query(
+      `
+      SELECT
+        state,
+        COUNT(*) AS total
+      FROM decisions
+      WHERE site_id = $1
+      GROUP BY state
+      `,
+      [req.site.site_id]
+    );
 
-  async (req, res) => {
-
-    try {
-
-      const result =
-        await db.query(
-          `
-          SELECT
-            state,
-            COUNT(*) AS total
-          FROM decisions
-          WHERE site_id=$1
-          GROUP BY state
-          `,
-          [req.site.site_id]
-        );
-
-      return res.json(
-        success({
-          runtime:
-            result.rows,
-        })
-      );
-
-    } catch (e) {
-
-      console.error(
-        "[RUNTIME ERROR]",
-        e.message
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "runtime_failed"
-          )
-        );
-
-    }
-
+    return res.json(
+      success({
+        runtime: result.rows,
+      })
+    );
+  } catch (e) {
+    console.error("[RUNTIME ERROR]", e.message);
+    return res.status(500).json(failure("runtime_failed"));
   }
-);
+});
 
 /* ─────────────────────────────────────────────
    TEST EMAIL
 ───────────────────────────────────────────── */
 
-app.get(
-  "/test-email",
+app.get("/test-email", async (req, res) => {
+  try {
+    const result = await sendEmail({
+      to: "redenbydcore@gmail.com",
+      subject: "REDEN Runtime Operational",
+      html: `
+        <div style="background:#05070b; color:#ffffff; padding:40px; font-family:Arial,sans-serif;">
+          <h1>REDEN Runtime Online</h1>
+          <p>Adaptive infrastructure communication layer active.</p>
+          <p>Timestamp: ${new Date().toISOString()}</p>
+        </div>
+      `,
+    });
 
-  async (req, res) => {
-
-    try {
-
-      const result =
-        await sendEmail({
-
-          to:
-            "redenbydcore@gmail.com",
-
-          subject:
-            "REDEN Runtime Operational",
-
-          html: `
-            <div
-              style="
-                background:#05070b;
-                color:#ffffff;
-                padding:40px;
-                font-family:Arial,sans-serif;
-              "
-            >
-
-              <h1>
-                REDEN Runtime Online
-              </h1>
-
-              <p>
-                Adaptive infrastructure
-                communication layer active.
-              </p>
-
-              <p>
-                Timestamp:
-                ${new Date().toISOString()}
-              </p>
-
-            </div>
-          `,
-        });
-
-      return res.json(
-        success(result)
-      );
-
-    } catch (e) {
-
-      console.error(
-        "[TEST EMAIL ERROR]",
-        e.message
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "test_email_failed"
-          )
-        );
-
-    }
-
+    return res.json(success(result));
+  } catch (e) {
+    console.error("[TEST EMAIL ERROR]", e.message);
+    return res.status(500).json(failure("test_email_failed"));
   }
-);
+});
 
 /* ─────────────────────────────────────────────
    404
 ───────────────────────────────────────────── */
 
 app.use((req, res) => {
-
-  return res
-    .status(404)
-    .json(
-      failure(
-        "route_not_found"
-      )
-    );
-
+  return res.status(404).json(failure("route_not_found"));
 });
 
 /* ─────────────────────────────────────────────
    GLOBAL ERROR HANDLER
 ───────────────────────────────────────────── */
 
-app.use((
-  err,
-  req,
-  res,
-  next
-) => {
-
-  console.error(
-    "[UNHANDLED ERROR]",
-    err
-  );
-
-  return res
-    .status(500)
-    .json(
-      failure(
-        "internal_server_error"
-      )
-    );
-
+app.use((err, req, res, next) => {
+  console.error("[UNHANDLED ERROR]", err);
+  return res.status(500).json(failure("internal_server_error"));
 });
 
 /* ─────────────────────────────────────────────
    START
 ───────────────────────────────────────────── */
 
-const PORT =
-  process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-
   console.log(`
-  ┌──────────────────────────────┐
-   REDEN Runtime Operational
-   Port: ${PORT}
-   Environment:
-   ${process.env.NODE_ENV || "development"}
-  └──────────────────────────────┘
+  ┌────────────────────────────────────────┐
+    REDEN Runtime Operational               
+    Port: ${PORT}                            
+    Environment: ${process.env.NODE_ENV || "development"} 
+  └────────────────────────────────────────┘
   `);
-
 });
