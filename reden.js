@@ -1384,11 +1384,15 @@ app.get(
       }
 
       const tokenData =
-        await tokenRequest.json();
+  await tokenRequest.json();
 
-      const accessToken =
-        tokenData.access_token;
+console.log(
+  "[SHOPIFY TOKEN RESPONSE]",
+  tokenData
+);
 
+const accessToken =
+  tokenData.access_token;
       if (!accessToken) {
 
         console.error(
