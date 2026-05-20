@@ -3,7 +3,6 @@ import dotenv from "dotenv";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
-import fetch from "node-fetch";
 
 import helmet from "helmet";
 import compression from "compression";
@@ -36,8 +35,11 @@ const app = express();
    PATH SETUP
 ───────────────────────────────────────────── */
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename =
+  fileURLToPath(import.meta.url);
+
+const __dirname =
+  path.dirname(__filename);
 
 /* ─────────────────────────────────────────────
    SECURITY
@@ -63,17 +65,29 @@ app.use(
 );
 
 /* ─────────────────────────────────────────────
-   MIDDLEWARE
+   BODY PARSERS
 ───────────────────────────────────────────── */
 
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
 
-/* REQUEST ID */
+app.use(
+  express.urlencoded({
+    extended: true,
+  })
+);
+
+/* ─────────────────────────────────────────────
+   REQUEST ID
+───────────────────────────────────────────── */
 
 app.use((req, res, next) => {
 
-  req.requestId = crypto.randomUUID();
+  req.requestId =
+    crypto.randomUUID();
 
   res.setHeader(
     "x-request-id",
@@ -83,11 +97,14 @@ app.use((req, res, next) => {
   next();
 });
 
-/* RESPONSE TIME */
+/* ─────────────────────────────────────────────
+   RESPONSE LOGGER
+───────────────────────────────────────────── */
 
 app.use((req, res, next) => {
 
-  const start = Date.now();
+  const start =
+    Date.now();
 
   res.on("finish", () => {
 
@@ -102,7 +119,9 @@ app.use((req, res, next) => {
   next();
 });
 
-/* STATIC FILES */
+/* ─────────────────────────────────────────────
+   STATIC FILES
+───────────────────────────────────────────── */
 
 app.use(
   express.static(
@@ -128,7 +147,10 @@ function success(data = {}) {
   };
 }
 
-function failure(error, details = null) {
+function failure(
+  error,
+  details = null
+) {
 
   return {
     ok: false,
@@ -141,7 +163,8 @@ function failure(error, details = null) {
 
 function validateNumber(value) {
 
-  const num = Number(value);
+  const num =
+    Number(value);
 
   if (
     Number.isNaN(num) ||
@@ -154,7 +177,7 @@ function validateNumber(value) {
 }
 
 /* ─────────────────────────────────────────────
-   AUTHENTICATION
+   AUTH
 ───────────────────────────────────────────── */
 
 async function authenticate(
@@ -226,7 +249,13 @@ async function authenticate(
           return next();
         }
 
-      } catch {}
+      } catch (e) {
+
+        console.error(
+          "[REDIS CACHE ERROR]",
+          e
+        );
+      }
     }
 
     const result =
@@ -251,7 +280,9 @@ async function authenticate(
         ]
       );
 
-    if (result.rowCount === 0) {
+    if (
+      result.rowCount === 0
+    ) {
 
       return res
         .status(403)
@@ -276,7 +307,13 @@ async function authenticate(
           300
         );
 
-      } catch {}
+      } catch (e) {
+
+        console.error(
+          "[REDIS SET ERROR]",
+          e
+        );
+      }
     }
 
     next();
@@ -301,7 +338,7 @@ async function authenticate(
 app.use(authenticate);
 
 /* ─────────────────────────────────────────────
-   HEALTH
+   ROOT
 ───────────────────────────────────────────── */
 
 app.get("/", async (req, res) => {
@@ -341,6 +378,10 @@ app.get("/", async (req, res) => {
   }
 });
 
+/* ─────────────────────────────────────────────
+   HEALTH
+───────────────────────────────────────────── */
+
 app.get("/health", async (req, res) => {
 
   return res.json(
@@ -367,14 +408,55 @@ app.get("/app", (req, res) => {
     <html>
       <body style="background:#05070b;color:white;font-family:Arial;padding:40px;">
         <h1>REDEN Runtime</h1>
-
-        <p>
-          Embedded app online.
-        </p>
+        <p>Embedded app online.</p>
       </body>
     </html>
   `);
 
+});
+
+/* ─────────────────────────────────────────────
+   TEST EMAIL
+───────────────────────────────────────────── */
+
+app.get("/test-email", async (req, res) => {
+
+  try {
+
+    const result =
+      await sendEmail({
+        to:
+          "redenbydcore@gmail.com",
+
+        subject:
+          "REDEN Runtime Operational",
+
+        html: `
+          <div style="background:#05070b;color:#ffffff;padding:40px;font-family:Arial,sans-serif;">
+            <h1>REDEN Runtime Online</h1>
+          </div>
+        `,
+      });
+
+    return res.json(
+      success(result)
+    );
+
+  } catch (e) {
+
+    console.error(
+      "[TEST EMAIL ERROR]",
+      e
+    );
+
+    return res
+      .status(500)
+      .json(
+        failure(
+          "test_email_failed"
+        )
+      );
+  }
 });
 
 /* ─────────────────────────────────────────────
@@ -387,6 +469,11 @@ app.get("/auth", async (req, res) => {
 
     const { shop } =
       req.query;
+
+    console.log(
+      "[SHOPIFY AUTH HIT]",
+      shop
+    );
 
     if (!shop) {
 
@@ -444,17 +531,6 @@ app.get(
         "[SHOPIFY QUERY]",
         req.query
       );
-
-      console.log({
-        SHOPIFY_APP_URL:
-          process.env.SHOPIFY_APP_URL,
-
-        SHOPIFY_API_KEY:
-          !!process.env.SHOPIFY_API_KEY,
-
-        SHOPIFY_API_SECRET:
-          !!process.env.SHOPIFY_API_SECRET,
-      });
 
       const {
         shop,
@@ -518,15 +594,15 @@ app.get(
         tokenRequest.status
       );
 
+      const raw =
+        await tokenRequest.text();
+
+      console.log(
+        "[SHOPIFY TOKEN RAW]",
+        raw
+      );
+
       if (!tokenRequest.ok) {
-
-        const raw =
-          await tokenRequest.text();
-
-        console.error(
-          "[SHOPIFY TOKEN ERROR]",
-          raw
-        );
 
         return res
           .status(500)
@@ -536,12 +612,7 @@ app.get(
       }
 
       const tokenData =
-        await tokenRequest.json();
-
-      console.log(
-        "[SHOPIFY TOKEN RESPONSE]",
-        tokenData
-      );
+        JSON.parse(raw);
 
       const accessToken =
         tokenData.access_token;
@@ -549,8 +620,7 @@ app.get(
       if (!accessToken) {
 
         console.error(
-          "[SHOPIFY ACCESS TOKEN MISSING]",
-          tokenData
+          "[SHOPIFY ACCESS TOKEN MISSING]"
         );
 
         return res
@@ -610,10 +680,9 @@ app.get(
     } catch (e) {
 
       console.error(
-        "[SHOPIFY CALLBACK ERROR]"
+        "[SHOPIFY CALLBACK ERROR]",
+        e
       );
-
-      console.error(e);
 
       console.error(
         e?.stack
@@ -685,4 +754,5 @@ app.listen(PORT, () => {
     ${process.env.NODE_ENV || "development"}
   └────────────────────────────────────────┘
   `);
+
 });
