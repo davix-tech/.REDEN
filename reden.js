@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import fetch from "node-fetch";
 
 import helmet from "helmet";
 import compression from "compression";
