@@ -3,7 +3,6 @@ import dotenv from "dotenv";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
-import fetch from "node-fetch";
 
 import helmet from "helmet";
 import compression from "compression";
@@ -18,8 +17,6 @@ import {
   sendDailyReport,
   sendRecoveryEmail
 } from "./email.js";
-
-import { verifyHmac } from "./shopify.js";
 
 dotenv.config();
 
@@ -195,8 +192,6 @@ async function authenticate(
       "/sdk.js",
       "/style.css",
       "/test-email",
-      "/auth",
-      "/auth/callback",
       "/app",
     ];
 
@@ -358,7 +353,7 @@ app.get("/", async (req, res) => {
             ? "enabled"
             : "disabled",
         runtime: "adaptive",
-        version: "v5",
+        version: "v6",
       })
     );
 
@@ -400,7 +395,7 @@ app.get("/health", async (req, res) => {
 });
 
 /* ─────────────────────────────────────────────
-   EMBEDDED APP
+   EMBEDDED APP PAGE
 ───────────────────────────────────────────── */
 
 app.get("/app", (req, res) => {
@@ -409,9 +404,112 @@ app.get("/app", (req, res) => {
     <html>
       <body style="background:#05070b;color:white;font-family:Arial;padding:40px;">
         <h1>REDEN Runtime</h1>
-        <p>Embedded app online.</p>
+        <p>Runtime online.</p>
       </body>
     </html>
+  `);
+
+});
+
+/* ─────────────────────────────────────────────
+   SDK
+───────────────────────────────────────────── */
+
+app.get("/sdk.js", (req, res) => {
+
+  res.setHeader(
+    "Content-Type",
+    "application/javascript"
+  );
+
+  res.send(`
+    (() => {
+
+      const current =
+        document.currentScript;
+
+      const siteId =
+        current?.dataset?.siteId;
+
+      const apiKey =
+        current?.dataset?.apiKey;
+
+      if (!siteId || !apiKey) {
+
+        console.error(
+          "[REDEN] Missing credentials"
+        );
+
+        return;
+      }
+
+      const sessionId =
+        crypto.randomUUID();
+
+      async function track(
+        event,
+        payload = {}
+      ) {
+
+        try {
+
+          await fetch(
+            "/event",
+            {
+              method: "POST",
+
+              headers: {
+                "Content-Type":
+                  "application/json",
+
+                "x-site-id":
+                  siteId,
+
+                "x-api-key":
+                  apiKey,
+              },
+
+              body: JSON.stringify({
+                session_id:
+                  sessionId,
+
+                event,
+
+                payload,
+
+                url:
+                  window.location.href,
+
+                path:
+                  window.location.pathname,
+
+                title:
+                  document.title,
+              }),
+            }
+          );
+
+        } catch (e) {
+
+          console.error(
+            "[REDEN TRACK ERROR]",
+            e
+          );
+        }
+      }
+
+      track("page_view");
+
+      window.REDEN = {
+        track,
+        sessionId,
+      };
+
+      console.log(
+        "[REDEN ACTIVE]"
+      );
+
+    })();
   `);
 
 });
@@ -461,240 +559,403 @@ app.get("/test-email", async (req, res) => {
 });
 
 /* ─────────────────────────────────────────────
-   SHOPIFY AUTH
+   EVENT TRACKING
 ───────────────────────────────────────────── */
 
-app.get("/auth", async (req, res) => {
+app.post("/event", async (req, res) => {
 
   try {
 
-    const { shop } =
-      req.query;
+    const {
+      session_id,
+      event,
+      payload,
+      url,
+      path,
+      title
+    } = req.body;
 
-    console.log(
-      "[SHOPIFY AUTH HIT]",
-      shop
-    );
-
-    if (!shop) {
+    if (
+      !session_id ||
+      !event
+    ) {
 
       return res
         .status(400)
-        .send("Missing shop");
+        .json(
+          failure(
+            "missing_fields"
+          )
+        );
     }
 
-    const redirectUri =
-      `${process.env.SHOPIFY_APP_URL}/auth/callback`;
-
-    const installUrl =
-      `https://${shop}/admin/oauth/authorize` +
-      `?client_id=${process.env.SHOPIFY_API_KEY}` +
-      `&scope=${encodeURIComponent(process.env.SHOPIFY_SCOPES)}` +
-      `&redirect_uri=${encodeURIComponent(redirectUri)}`;
-
-    console.log(
-      "[SHOPIFY INSTALL URL]",
-      installUrl
+    await db.query(
+      `
+      INSERT INTO event_logs
+      (
+        site_id,
+        session_id,
+        event,
+        payload,
+        url,
+        path,
+        title
+      )
+      VALUES
+      (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7
+      )
+      `,
+      [
+        req.site.site_id,
+        session_id,
+        event,
+        payload || {},
+        url || null,
+        path || null,
+        title || null,
+      ]
     );
 
-    return res.redirect(
-      installUrl
+    return res.json(
+      success()
     );
 
   } catch (e) {
 
     console.error(
-      "[SHOPIFY AUTH ERROR]",
+      "[EVENT ERROR]",
       e
     );
 
     return res
       .status(500)
-      .send("auth_failed");
+      .json(
+        failure(
+          "event_failed"
+        )
+      );
   }
 });
 
 /* ─────────────────────────────────────────────
-   SHOPIFY CALLBACK
+   SCORE
 ───────────────────────────────────────────── */
 
-app.get(
-  "/auth/callback",
-  async (req, res) => {
+app.post("/score", async (req, res) => {
 
-    try {
+  try {
 
-      console.log(
-        "[SHOPIFY CALLBACK HIT]"
-      );
+    const {
+      session_id,
+      cart_id,
+      cart_value
+    } = req.body;
 
-      console.log(
-        "[SHOPIFY QUERY]",
-        req.query
-      );
+    if (
+      !session_id ||
+      !cart_id ||
+      cart_value === undefined
+    ) {
 
-      const {
-        shop,
-        code,
-        hmac
-      } = req.query;
-
-      if (
-        !shop ||
-        !code ||
-        !hmac
-      ) {
-
-        return res
-          .status(400)
-          .send(
-            "Missing parameters"
-          );
-      }
-
-      const validHmac =
-        verifyHmac(req.query);
-
-      console.log(
-        "[SHOPIFY HMAC VALID]",
-        validHmac
-      );
-
-      if (!validHmac) {
-
-        return res
-          .status(403)
-          .send("Invalid HMAC");
-      }
-
-      const tokenRequest =
-        await fetch(
-          `https://${shop}/admin/oauth/access_token`,
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type":
-                "application/json",
-            },
-
-            body: JSON.stringify({
-              client_id:
-                process.env.SHOPIFY_API_KEY,
-
-              client_secret:
-                process.env.SHOPIFY_API_SECRET,
-
-              code,
-            }),
-          }
+      return res
+        .status(400)
+        .json(
+          failure(
+            "missing_fields"
+          )
         );
+    }
 
-      console.log(
-        "[SHOPIFY TOKEN STATUS]",
-        tokenRequest.status
+    const value =
+      validateNumber(
+        cart_value
       );
 
-      const raw =
-        await tokenRequest.text();
+    if (
+      value === null ||
+      value <= 0
+    ) {
 
-      console.log(
-        "[SHOPIFY TOKEN RAW]",
-        raw
-      );
-
-      if (!tokenRequest.ok) {
-
-        return res
-          .status(500)
-          .send(
-            "token_exchange_failed"
-          );
-      }
-
-      const tokenData =
-        JSON.parse(raw);
-
-      const accessToken =
-        tokenData.access_token;
-
-      if (!accessToken) {
-
-        console.error(
-          "[SHOPIFY ACCESS TOKEN MISSING]"
+      return res
+        .status(400)
+        .json(
+          failure(
+            "invalid_cart_value"
+          )
         );
+    }
 
-        return res
-          .status(500)
-          .send("token_failed");
-      }
+    let action =
+      await pickAction();
 
+    if (!action) {
+      action = "NONE";
+    }
+
+    const discounts = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const discount =
+      discounts[action] || 0;
+
+    const expected_value =
+      Math.max(
+        value - discount,
+        0
+      );
+
+    const result =
       await db.query(
         `
-        INSERT INTO shopify_stores
+        INSERT INTO decisions
         (
-          shop,
-          access_token,
-          created_at
+          site_id,
+          session_id,
+          cart_id,
+          action,
+          discount,
+          expected_value,
+          state
         )
-
         VALUES
         (
           $1,
           $2,
-          NOW()
+          $3,
+          $4,
+          $5,
+          $6,
+          'SCORED'
         )
-
-        ON CONFLICT (shop)
-
-        DO UPDATE
-        SET
-          access_token =
-          EXCLUDED.access_token
+        RETURNING id
         `,
         [
-          shop,
-          accessToken,
+          req.site.site_id,
+          session_id,
+          cart_id,
+          action,
+          discount,
+          expected_value,
         ]
       );
 
-      console.log(
-        "[SHOPIFY INSTALL SUCCESS]",
-        shop
+    return res.json(
+      success({
+        decision_id:
+          result.rows[0].id,
+
+        action,
+        discount,
+        expected_value,
+      })
+    );
+
+  } catch (e) {
+
+    console.error(
+      "[SCORE ERROR]",
+      e
+    );
+
+    return res
+      .status(500)
+      .json(
+        failure(
+          "score_failed"
+        )
       );
+  }
+});
 
-      return res.send(`
-        <html>
-          <body style="background:#05070b;color:white;font-family:Arial;padding:40px;">
-            <h1>
-              REDEN Installed Successfully
-            </h1>
+/* ─────────────────────────────────────────────
+   OUTCOME
+───────────────────────────────────────────── */
 
-            <p>
-              ${shop}
-              is now connected to REDEN.
-            </p>
-          </body>
-        </html>
-      `);
+app.post("/outcome", async (req, res) => {
 
-    } catch (e) {
+  try {
 
-      console.error(
-        "[SHOPIFY CALLBACK ERROR]",
-        e
-      );
+    const {
+      decision_id,
+      converted,
+      revenue
+    } = req.body;
 
-      console.error(
-        e?.stack
-      );
+    if (!decision_id) {
 
       return res
-        .status(500)
-        .send("callback_failed");
+        .status(400)
+        .json(
+          failure(
+            "missing_decision_id"
+          )
+        );
     }
+
+    const existing =
+      await db.query(
+        `
+        SELECT
+          action
+        FROM decisions
+        WHERE id = $1
+        `,
+        [decision_id]
+      );
+
+    if (
+      existing.rowCount === 0
+    ) {
+
+      return res
+        .status(404)
+        .json(
+          failure(
+            "decision_not_found"
+          )
+        );
+    }
+
+    await db.query(
+      `
+      UPDATE decisions
+      SET
+        state = 'COMPLETED',
+        converted = $1,
+        revenue = $2,
+        completed_at = NOW()
+      WHERE id = $3
+      `,
+      [
+        Boolean(converted),
+        Number(revenue || 0),
+        decision_id
+      ]
+    );
+
+    await updateBandit(
+      existing.rows[0].action,
+      Boolean(converted)
+    );
+
+    return res.json(
+      success({
+        updated: true,
+      })
+    );
+
+  } catch (e) {
+
+    console.error(
+      "[OUTCOME ERROR]",
+      e
+    );
+
+    return res
+      .status(500)
+      .json(
+        failure(
+          "outcome_failed"
+        )
+      );
   }
-);
+});
+
+/* ─────────────────────────────────────────────
+   METRICS
+───────────────────────────────────────────── */
+
+app.get("/metrics", async (req, res) => {
+
+  try {
+
+    const result =
+      await db.query(
+        `
+        SELECT
+          COUNT(*) AS total,
+
+          COUNT(*) FILTER (
+            WHERE converted = true
+          ) AS conversions,
+
+          COALESCE(
+            AVG(revenue),
+            0
+          ) AS avg_revenue,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          ) AS total_revenue
+
+        FROM decisions
+
+        WHERE
+          state = 'COMPLETED'
+          AND site_id = $1
+        `,
+        [req.site.site_id]
+      );
+
+    const row =
+      result.rows[0];
+
+    const total =
+      Number(row.total || 0);
+
+    const conversions =
+      Number(row.conversions || 0);
+
+    return res.json(
+      success({
+        total,
+        conversions,
+
+        conversion_rate:
+          total > 0
+            ? conversions / total
+            : 0,
+
+        avg_revenue:
+          Number(
+            row.avg_revenue || 0
+          ),
+
+        total_revenue:
+          Number(
+            row.total_revenue || 0
+          ),
+      })
+    );
+
+  } catch (e) {
+
+    console.error(
+      "[METRICS ERROR]",
+      e
+    );
+
+    return res
+      .status(500)
+      .json(
+        failure(
+          "metrics_failed"
+        )
+      );
+  }
+});
 
 /* ─────────────────────────────────────────────
    404
