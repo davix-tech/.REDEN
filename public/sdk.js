@@ -1,7 +1,7 @@
 /*!
- * REDEN SDK v1
- * Autonomous Decision Runtime
- * https://api.dcore.name.ng
+ * REDEN SDK v2
+ * Adaptive Revenue Runtime
+ * https://reden.dcore.name.ng
  */
 
 (function (window, document) {
@@ -11,25 +11,22 @@
      VERSION
   ───────────────────────────────────────────── */
 
-  const SDK_VERSION = "1.0.0";
+  const SDK_VERSION = "2.0.0";
 
   /* ─────────────────────────────────────────────
-     DEFAULT CONFIG
+     CONFIG
   ───────────────────────────────────────────── */
 
   const DEFAULTS = {
-    apiBase: "https://api.dcore.name.ng",
-
-    publicKey: "",
+    apiBase: "https://reden.dcore.name.ng",
 
     siteId: "",
+    apiKey: "",
 
     debug: false,
 
     autoTrack: true,
-
     autoPageview: true,
-
     autoOptimize: false,
 
     sessionKey: "__reden_session",
@@ -37,19 +34,16 @@
     timeout: 10000,
   };
 
-  /* ─────────────────────────────────────────────
-     INTERNAL STATE
-  ───────────────────────────────────────────── */
-
   let config = { ...DEFAULTS };
+
+  /* ─────────────────────────────────────────────
+     STATE
+  ───────────────────────────────────────────── */
 
   const state = {
     initialized: false,
-
     sessionId: null,
-
     activeDecision: null,
-
     pageStart: Date.now(),
   };
 
@@ -78,9 +72,7 @@
 
     return (
       "reden_" +
-      Math.random()
-        .toString(36)
-        .slice(2) +
+      Math.random().toString(36).slice(2) +
       Date.now()
     );
   }
@@ -89,15 +81,7 @@
     return Date.now();
   }
 
-  function safeJsonParse(value) {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return null;
-    }
-  }
-
-  function persistSession(id) {
+  function saveSession(id) {
     try {
       localStorage.setItem(
         config.sessionKey,
@@ -106,7 +90,7 @@
     } catch {}
   }
 
-  function getStoredSession() {
+  function getSession() {
     try {
       return localStorage.getItem(
         config.sessionKey
@@ -117,16 +101,16 @@
   }
 
   function ensureSession() {
-    let sid = getStoredSession();
+    let session = getSession();
 
-    if (!sid) {
-      sid = uuid();
-      persistSession(sid);
+    if (!session) {
+      session = uuid();
+      saveSession(session);
     }
 
-    state.sessionId = sid;
+    state.sessionId = session;
 
-    return sid;
+    return session;
   }
 
   function getScriptConfig() {
@@ -138,21 +122,18 @@
     }
 
     return {
-      publicKey:
-        current.dataset.publicKey ||
-        "",
-
       siteId:
-        current.dataset.siteId ||
-        "",
+        current.dataset.siteId || "",
+
+      apiKey:
+        current.dataset.apiKey || "",
 
       debug:
-        current.dataset.debug ===
-        "true",
+        current.dataset.debug === "true",
 
       autoOptimize:
-        current.dataset
-          .autoOptimize === "true",
+        current.dataset.autoOptimize ===
+        "true",
     };
   }
 
@@ -174,32 +155,31 @@
 
     try {
 
-      const response =
-        await fetch(
-          config.apiBase + path,
-          {
-            method: "GET",
+      const response = await fetch(
+        config.apiBase + path,
+        {
+          method: "GET",
 
-            headers: {
-              "Content-Type":
-                "application/json",
+          headers: {
+            "Content-Type":
+              "application/json",
 
-              "x-public-key":
-                config.publicKey,
+            "x-site-id":
+              config.siteId,
 
-              "x-site-id":
-                config.siteId,
+            "x-api-key":
+              config.apiKey,
 
-              "x-sdk-version":
-                SDK_VERSION,
-            },
+            "x-sdk-version":
+              SDK_VERSION,
+          },
 
-            signal:
-              controller.signal,
+          signal:
+            controller.signal,
 
-            ...options,
-          }
-        );
+          ...options,
+        }
+      );
 
       clearTimeout(timeout);
 
@@ -209,7 +189,7 @@
       if (!response.ok) {
         throw new Error(
           data.error ||
-            "request_failed"
+          "request_failed"
         );
       }
 
@@ -220,7 +200,7 @@
       clearTimeout(timeout);
 
       warn(
-        "request failed",
+        "Request failed:",
         path,
         e.message
       );
@@ -230,7 +210,7 @@
   }
 
   /* ─────────────────────────────────────────────
-     TRACKING
+     EVENT TRACKING
   ───────────────────────────────────────────── */
 
   async function track(
@@ -245,9 +225,6 @@
           method: "POST",
 
           body: JSON.stringify({
-            site_id:
-              config.siteId,
-
             session_id:
               state.sessionId,
 
@@ -256,15 +233,13 @@
             payload,
 
             url:
-              location.href,
+              window.location.href,
 
             path:
-              location.pathname,
+              window.location.pathname,
 
             title:
               document.title,
-
-            ts: now(),
           }),
         }
       );
@@ -277,72 +252,73 @@
   }
 
   /* ─────────────────────────────────────────────
-     DECISION ENGINE
+     SCORING
   ───────────────────────────────────────────── */
 
   async function score(
     cartValue = 0,
     meta = {}
   ) {
-    const body = {
-      site_id:
-        config.siteId,
 
-      session_id:
-        state.sessionId,
-
-      cart_id:
-        meta.cart_id || uuid(),
-
-      cart_value:
-        Number(cartValue || 0),
-
-      meta,
-    };
-
-    const decision =
+    const result =
       await request(
         "/score",
         {
           method: "POST",
 
-          body: JSON.stringify(
-            body
-          ),
+          body: JSON.stringify({
+            session_id:
+              state.sessionId,
+
+            cart_id:
+              meta.cart_id || uuid(),
+
+            cart_value:
+              Number(cartValue || 0),
+          }),
         }
       );
 
-    state.activeDecision = {
-      ...decision,
+    state.activeDecision = result;
 
-      created_at: now(),
-    };
-
-    return decision;
+    return result;
   }
+
+  /* ─────────────────────────────────────────────
+     ACTION
+  ───────────────────────────────────────────── */
 
   async function action(
     decisionId
   ) {
+
     if (!decisionId) {
       return null;
     }
 
-    return request("/action", {
-      method: "POST",
+    return request(
+      "/action",
+      {
+        method: "POST",
 
-      body: JSON.stringify({
-        decision_id:
-          decisionId,
-      }),
-    });
+        body: JSON.stringify({
+          decision_id:
+            decisionId,
+        }),
+      }
+    );
   }
+
+  /* ─────────────────────────────────────────────
+     OUTCOME
+  ───────────────────────────────────────────── */
 
   async function outcome({
     decision_id,
     converted,
     revenue,
   }) {
+
     if (!decision_id) {
       return null;
     }
@@ -356,14 +332,10 @@
           decision_id,
 
           converted:
-            Boolean(
-              converted
-            ),
+            Boolean(converted),
 
           revenue:
-            Number(
-              revenue || 0
-            ),
+            Number(revenue || 0),
         }),
       }
     );
@@ -373,19 +345,18 @@
      DOM ENGINE
   ───────────────────────────────────────────── */
 
-  function query(selector) {
-    return document.querySelector(
-      selector
-    );
-  }
-
   function updateText(
     selector,
     value
   ) {
-    const el = query(selector);
+    const el =
+      document.querySelector(
+        selector
+      );
 
-    if (!el) return false;
+    if (!el) {
+      return false;
+    }
 
     el.textContent = value;
 
@@ -396,9 +367,14 @@
     selector,
     value
   ) {
-    const el = query(selector);
+    const el =
+      document.querySelector(
+        selector
+      );
 
-    if (!el) return false;
+    if (!el) {
+      return false;
+    }
 
     el.innerHTML = value;
 
@@ -407,13 +383,18 @@
 
   function addClass(
     selector,
-    value
+    className
   ) {
-    const el = query(selector);
+    const el =
+      document.querySelector(
+        selector
+      );
 
-    if (!el) return false;
+    if (!el) {
+      return false;
+    }
 
-    el.classList.add(value);
+    el.classList.add(className);
 
     return true;
   }
@@ -421,6 +402,7 @@
   function injectBanner(
     content
   ) {
+
     const banner =
       document.createElement(
         "div"
@@ -437,23 +419,23 @@
     banner.style.right =
       "20px";
 
-    banner.style.padding =
-      "14px 18px";
-
     banner.style.background =
-      "#111827";
+      "#05070b";
 
     banner.style.color =
       "#ffffff";
 
-    banner.style.zIndex =
-      "999999";
+    banner.style.padding =
+      "14px 18px";
 
     banner.style.borderRadius =
       "14px";
 
+    banner.style.zIndex =
+      "999999";
+
     banner.style.fontFamily =
-      "Inter, sans-serif";
+      "Arial, sans-serif";
 
     banner.style.boxShadow =
       "0 10px 40px rgba(0,0,0,0.35)";
@@ -466,81 +448,13 @@
   }
 
   /* ─────────────────────────────────────────────
-     RULE ENGINE
-  ───────────────────────────────────────────── */
-
-  function applyRule(rule) {
-    if (!rule) return;
-
-    const {
-      selector,
-      action,
-      value,
-    } = rule;
-
-    switch (action) {
-
-      case "replace_text":
-
-        updateText(
-          selector,
-          value
-        );
-
-        break;
-
-      case "replace_html":
-
-        updateHTML(
-          selector,
-          value
-        );
-
-        break;
-
-      case "add_class":
-
-        addClass(
-          selector,
-          value
-        );
-
-        break;
-
-      case "banner":
-
-        injectBanner(value);
-
-        break;
-
-      default:
-
-        warn(
-          "unknown rule",
-          action
-        );
-    }
-  }
-
-  function applyRules(rules) {
-    if (
-      !Array.isArray(rules)
-    ) {
-      return;
-    }
-
-    for (const rule of rules) {
-      applyRule(rule);
-    }
-  }
-
-  /* ─────────────────────────────────────────────
      OPTIMIZER
   ───────────────────────────────────────────── */
 
   async function optimize(
     options = {}
   ) {
+
     const decision =
       await score(
         options.cartValue || 0,
@@ -551,58 +465,50 @@
       return null;
     }
 
-    if (
-      Array.isArray(
-        decision.rules
-      )
+    switch (
+      decision.action
     ) {
 
-      applyRules(
-        decision.rules
-      );
+      case "INCENTIVE_HIGH":
 
-    } else {
+        injectBanner(`
+          <strong>Special Offer</strong><br>
+          Unlock premium savings now.
+        `);
 
-      switch (
-        decision.action
-      ) {
+        break;
 
-        case "INCENTIVE_HIGH":
+      case "INCENTIVE_MED":
 
-          injectBanner(`
-            <strong>Special Offer</strong><br/>
-            Unlock premium savings today.
-          `);
+        updateText(
+          options.ctaSelector ||
+          "button",
 
-          break;
+          "Claim Offer"
+        );
 
-        case "INCENTIVE_MED":
+        break;
 
-          updateText(
-            options.ctaSelector ||
-              "button",
+      case "INCENTIVE_LOW":
 
-            "Claim Offer"
-          );
+        updateText(
+          options.ctaSelector ||
+          "button",
 
-          break;
+          "Continue"
+        );
 
-        case "INCENTIVE_LOW":
-
-          updateText(
-            options.ctaSelector ||
-              "button",
-
-            "Continue"
-          );
-
-          break;
-      }
+        break;
     }
 
-    await action(
+    if (
       decision.decision_id
-    );
+    ) {
+
+      await action(
+        decision.decision_id
+      );
+    }
 
     return decision;
   }
@@ -612,6 +518,7 @@
   ───────────────────────────────────────────── */
 
   function setupPageTracking() {
+
     if (
       !config.autoPageview
     ) {
@@ -620,12 +527,12 @@
 
     track("pageview", {
       referrer:
-        document.referrer ||
-        null,
+        document.referrer || null,
     });
   }
 
   function setupClickTracking() {
+
     if (!config.autoTrack) {
       return;
     }
@@ -637,7 +544,9 @@
 
         const el = e.target;
 
-        if (!el) return;
+        if (!el) {
+          return;
+        }
 
         track("click", {
           tag:
@@ -647,8 +556,7 @@
             el.id || null,
 
           class:
-            el.className ||
-            null,
+            el.className || null,
 
           text:
             (
@@ -665,6 +573,7 @@
   }
 
   function setupUnloadTracking() {
+
     window.addEventListener(
       "beforeunload",
 
@@ -675,13 +584,9 @@
           state.pageStart;
 
         navigator.sendBeacon(
-          config.apiBase +
-            "/event",
+          config.apiBase + "/event",
 
           JSON.stringify({
-            site_id:
-              config.siteId,
-
             session_id:
               state.sessionId,
 
@@ -691,29 +596,18 @@
             payload: {
               duration,
             },
-
-            ts: now(),
           })
         );
-
       }
     );
   }
 
   /* ─────────────────────────────────────────────
-     ANALYTICS
+     METRICS
   ───────────────────────────────────────────── */
 
   async function metrics() {
-    return request(
-      "/metrics"
-    );
-  }
-
-  async function actionMetrics() {
-    return request(
-      "/metrics/actions"
-    );
+    return request("/metrics");
   }
 
   /* ─────────────────────────────────────────────
@@ -723,12 +617,13 @@
   function init(
     userConfig = {}
   ) {
+
     if (
       state.initialized
     ) {
 
       warn(
-        "already initialized"
+        "Already initialized"
       );
 
       return api;
@@ -739,26 +634,16 @@
 
     config = {
       ...DEFAULTS,
-
       ...scriptConfig,
-
       ...userConfig,
     };
 
     if (!config.siteId) {
-
-      warn(
-        "missing siteId"
-      );
-
+      warn("Missing siteId");
     }
 
-    if (!config.publicKey) {
-
-      warn(
-        "missing publicKey"
-      );
-
+    if (!config.apiKey) {
+      warn("Missing apiKey");
     }
 
     ensureSession();
@@ -783,7 +668,6 @@
       optimize().catch(
         () => {}
       );
-
     }
 
     return api;
@@ -811,12 +695,6 @@
 
     metrics,
 
-    actionMetrics,
-
-    applyRule,
-
-    applyRules,
-
     updateText,
 
     updateHTML,
@@ -839,7 +717,7 @@
   };
 
   /* ─────────────────────────────────────────────
-     GLOBAL EXPORT
+     EXPORT
   ───────────────────────────────────────────── */
 
   window.Reden = api;
@@ -853,13 +731,12 @@
 
   if (
     autoConfig.siteId &&
-    autoConfig.publicKey
+    autoConfig.apiKey
   ) {
 
     window.Reden.init(
       autoConfig
     );
-
   }
 
 })(window, document);
