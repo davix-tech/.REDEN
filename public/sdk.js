@@ -1,5 +1,5 @@
 /*!
- * REDEN SDK v2 (FIXED)
+ * REDEN SDK v2
  * Adaptive Revenue Runtime
  * https://reden.dcore.name.ng
  */
@@ -7,19 +7,36 @@
 (function (window, document) {
   "use strict";
 
-  const SDK_VERSION = "2.0.1";
+  /* ─────────────────────────────────────────────
+     VERSION
+  ───────────────────────────────────────────── */
+
+  const SDK_VERSION = "2.0.0";
+
+  /* ─────────────────────────────────────────────
+     DEFAULT CONFIG
+  ───────────────────────────────────────────── */
 
   const DEFAULTS = {
     apiBase: "https://reden.dcore.name.ng",
-    siteId: "",
+
     apiKey: "",
+    siteId: "",
+
     debug: false,
+
     autoTrack: true,
     autoPageview: true,
     autoOptimize: false,
+
     sessionKey: "__reden_session",
+
     timeout: 10000,
   };
+
+  /* ─────────────────────────────────────────────
+     INTERNAL STATE
+  ───────────────────────────────────────────── */
 
   let config = { ...DEFAULTS };
 
@@ -30,205 +47,678 @@
     pageStart: Date.now(),
   };
 
+  /* ─────────────────────────────────────────────
+     LOGGER
+  ───────────────────────────────────────────── */
+
   function log(...args) {
-    if (config.debug) console.log("[REDEN]", ...args);
+    if (config.debug) {
+      console.log("[REDEN]", ...args);
+    }
   }
 
   function warn(...args) {
     console.warn("[REDEN]", ...args);
   }
 
+  /* ─────────────────────────────────────────────
+     UTILITIES
+  ───────────────────────────────────────────── */
+
   function uuid() {
-    if (window.crypto?.randomUUID) return window.crypto.randomUUID();
-    return "reden_" + Math.random().toString(36).slice(2) + Date.now();
+    if (window.crypto?.randomUUID) {
+      return window.crypto.randomUUID();
+    }
+
+    return (
+      "reden_" +
+      Math.random().toString(36).slice(2) +
+      Date.now()
+    );
   }
 
   function now() {
     return Date.now();
   }
 
-  function saveSession(id) {
+  function persistSession(id) {
     try {
-      localStorage.setItem(config.sessionKey, id);
+      localStorage.setItem(
+        config.sessionKey,
+        id
+      );
     } catch {}
   }
 
-  function getSession() {
+  function getStoredSession() {
     try {
-      return localStorage.getItem(config.sessionKey);
+      return localStorage.getItem(
+        config.sessionKey
+      );
     } catch {
       return null;
     }
   }
 
   function ensureSession() {
-    let session = getSession();
-    if (!session) {
-      session = uuid();
-      saveSession(session);
+    let sid = getStoredSession();
+
+    if (!sid) {
+      sid = uuid();
+      persistSession(sid);
     }
-    state.sessionId = session;
-    return session;
+
+    state.sessionId = sid;
+
+    return sid;
   }
 
   function getScriptConfig() {
-    const current = document.currentScript;
-    if (!current) return {};
+    const current =
+      document.currentScript;
+
+    if (!current) {
+      return {};
+    }
 
     return {
-      siteId: current.dataset.siteId || "",
-      apiKey: current.dataset.apiKey || "",
-      debug: current.dataset.debug === "true",
-      autoOptimize: current.dataset.autoOptimize === "true",
+      apiKey:
+        current.dataset.apiKey || "",
+
+      siteId:
+        current.dataset.siteId || "",
+
+      debug:
+        current.dataset.debug ===
+        "true",
+
+      autoOptimize:
+        current.dataset
+          .autoOptimize === "true",
     };
   }
 
   /* ─────────────────────────────────────────────
-     REQUEST ENGINE (FIXED)
+     REQUEST ENGINE
   ───────────────────────────────────────────── */
 
-  async function request(path, options = {}) {
-    const controller = new AbortController();
+  async function request(
+    path,
+    options = {}
+  ) {
 
-    const timeout = setTimeout(() => controller.abort(), config.timeout);
+    const controller =
+      new AbortController();
+
+    const timeout = setTimeout(
+      () => controller.abort(),
+      config.timeout
+    );
 
     try {
-      const method = options.method || "GET";
 
-      const response = await fetch(config.apiBase + path, {
-        method,
+      const response =
+        await fetch(
+          config.apiBase + path,
+          {
+            method:
+              options.method || "GET",
 
-        headers: {
-          "Content-Type": "application/json",
-          "x-site-id": config.siteId,
-          "x-api-key": config.apiKey,
-          "x-sdk-version": SDK_VERSION,
-        },
+            headers: {
+              "Content-Type":
+                "application/json",
 
-        body: method !== "GET" ? options.body : undefined,
-        signal: controller.signal,
-      });
+              "x-api-key":
+                config.apiKey,
+
+              "x-site-id":
+                config.siteId,
+
+              "x-sdk-version":
+                SDK_VERSION,
+
+              ...(options.headers || {})
+            },
+
+            body:
+              options.body || null,
+
+            signal:
+              controller.signal,
+          }
+        );
 
       clearTimeout(timeout);
 
-      const data = await response.json();
+      let data = null;
+
+      try {
+
+        data =
+          await response.json();
+
+      } catch {
+
+        data = {
+          ok: false,
+          error:
+            "invalid_json_response",
+        };
+      }
 
       if (!response.ok) {
-        throw new Error(data.error || "request_failed");
+
+        throw new Error(
+          data?.error ||
+          "request_failed"
+        );
       }
 
       return data;
+
     } catch (e) {
+
       clearTimeout(timeout);
-      warn("Request failed:", path, e.message);
+
+      warn(
+        "request failed",
+        path,
+        e.message
+      );
+
       throw e;
     }
   }
 
-  async function track(event, payload = {}) {
+  /* ─────────────────────────────────────────────
+     TRACKING
+  ───────────────────────────────────────────── */
+
+  async function track(
+    event,
+    payload = {}
+  ) {
+
     try {
-      return await request("/event", {
-        method: "POST",
-        body: JSON.stringify({
-          session_id: state.sessionId,
-          event,
-          payload,
-          url: window.location.href,
-          path: window.location.pathname,
-          title: document.title,
-        }),
-      });
+
+      return await request(
+        "/event",
+        {
+          method: "POST",
+
+          body: JSON.stringify({
+            session_id:
+              state.sessionId,
+
+            event,
+
+            payload,
+
+            url:
+              location.href,
+
+            path:
+              location.pathname,
+
+            title:
+              document.title,
+
+            ts: now(),
+          }),
+        }
+      );
+
     } catch {
+
       return null;
     }
   }
 
-  async function score(cartValue = 0, meta = {}) {
-    const result = await request("/score", {
-      method: "POST",
-      body: JSON.stringify({
-        session_id: state.sessionId,
-        cart_id: meta.cart_id || uuid(),
-        cart_value: Number(cartValue || 0),
-      }),
-    });
+  /* ─────────────────────────────────────────────
+     DECISION ENGINE
+  ───────────────────────────────────────────── */
 
-    state.activeDecision = result;
-    return result;
+  async function score(
+    cartValue = 0,
+    meta = {}
+  ) {
+
+    const body = {
+      session_id:
+        state.sessionId,
+
+      cart_id:
+        meta.cart_id || uuid(),
+
+      cart_value:
+        Number(cartValue || 0),
+
+      meta,
+    };
+
+    const decision =
+      await request(
+        "/score",
+        {
+          method: "POST",
+
+          body: JSON.stringify(
+            body
+          ),
+        }
+      );
+
+    state.activeDecision = {
+      ...decision,
+      created_at: now(),
+    };
+
+    return decision;
   }
 
-  async function action(decisionId) {
-    if (!decisionId) return null;
+  async function action(
+    decisionId
+  ) {
 
-    return request("/action", {
-      method: "POST",
-      body: JSON.stringify({
-        decision_id: decisionId,
-      }),
-    });
+    if (!decisionId) {
+      return null;
+    }
+
+    return request(
+      "/action",
+      {
+        method: "POST",
+
+        body: JSON.stringify({
+          decision_id:
+            decisionId,
+        }),
+      }
+    );
   }
 
-  async function outcome({ decision_id, converted, revenue }) {
-    if (!decision_id) return null;
+  async function outcome({
+    decision_id,
+    converted,
+    revenue,
+  }) {
 
-    return request("/outcome", {
-      method: "POST",
-      body: JSON.stringify({
-        decision_id,
-        converted: Boolean(converted),
-        revenue: Number(revenue || 0),
-      }),
-    });
+    if (!decision_id) {
+      return null;
+    }
+
+    return request(
+      "/outcome",
+      {
+        method: "POST",
+
+        body: JSON.stringify({
+          decision_id,
+
+          converted:
+            Boolean(converted),
+
+          revenue:
+            Number(revenue || 0),
+        }),
+      }
+    );
   }
+
+  /* ─────────────────────────────────────────────
+     DOM ENGINE
+  ───────────────────────────────────────────── */
+
+  function query(selector) {
+    return document.querySelector(
+      selector
+    );
+  }
+
+  function updateText(
+    selector,
+    value
+  ) {
+
+    const el = query(selector);
+
+    if (!el) return false;
+
+    el.textContent = value;
+
+    return true;
+  }
+
+  function updateHTML(
+    selector,
+    value
+  ) {
+
+    const el = query(selector);
+
+    if (!el) return false;
+
+    el.innerHTML = value;
+
+    return true;
+  }
+
+  function addClass(
+    selector,
+    value
+  ) {
+
+    const el = query(selector);
+
+    if (!el) return false;
+
+    el.classList.add(value);
+
+    return true;
+  }
+
+  function injectBanner(
+    content
+  ) {
+
+    const banner =
+      document.createElement(
+        "div"
+      );
+
+    banner.innerHTML = content;
+
+    banner.style.position =
+      "fixed";
+
+    banner.style.bottom =
+      "20px";
+
+    banner.style.right =
+      "20px";
+
+    banner.style.padding =
+      "14px 18px";
+
+    banner.style.background =
+      "#111827";
+
+    banner.style.color =
+      "#ffffff";
+
+    banner.style.zIndex =
+      "999999";
+
+    banner.style.borderRadius =
+      "14px";
+
+    banner.style.fontFamily =
+      "Inter, sans-serif";
+
+    banner.style.boxShadow =
+      "0 10px 40px rgba(0,0,0,0.35)";
+
+    document.body.appendChild(
+      banner
+    );
+
+    return banner;
+  }
+
+  /* ─────────────────────────────────────────────
+     RULE ENGINE
+  ───────────────────────────────────────────── */
+
+  function applyRule(rule) {
+
+    if (!rule) return;
+
+    const {
+      selector,
+      action,
+      value,
+    } = rule;
+
+    switch (action) {
+
+      case "replace_text":
+
+        updateText(
+          selector,
+          value
+        );
+
+        break;
+
+      case "replace_html":
+
+        updateHTML(
+          selector,
+          value
+        );
+
+        break;
+
+      case "add_class":
+
+        addClass(
+          selector,
+          value
+        );
+
+        break;
+
+      case "banner":
+
+        injectBanner(value);
+
+        break;
+
+      default:
+
+        warn(
+          "unknown rule",
+          action
+        );
+    }
+  }
+
+  function applyRules(rules) {
+
+    if (
+      !Array.isArray(rules)
+    ) {
+      return;
+    }
+
+    for (const rule of rules) {
+      applyRule(rule);
+    }
+  }
+
+  /* ─────────────────────────────────────────────
+     OPTIMIZER
+  ───────────────────────────────────────────── */
+
+  async function optimize(
+    options = {}
+  ) {
+
+    const decision =
+      await score(
+        options.cartValue || 0,
+        options.meta || {}
+      );
+
+    if (!decision) {
+      return null;
+    }
+
+    if (
+      Array.isArray(
+        decision.rules
+      )
+    ) {
+
+      applyRules(
+        decision.rules
+      );
+
+    } else {
+
+      switch (
+        decision.action
+      ) {
+
+        case "INCENTIVE_HIGH":
+
+          injectBanner(`
+            <strong>Special Offer</strong><br/>
+            Unlock premium savings today.
+          `);
+
+          break;
+
+        case "INCENTIVE_MED":
+
+          updateText(
+            options.ctaSelector ||
+              "button",
+
+            "Claim Offer"
+          );
+
+          break;
+
+        case "INCENTIVE_LOW":
+
+          updateText(
+            options.ctaSelector ||
+              "button",
+
+            "Continue"
+          );
+
+          break;
+      }
+    }
+
+    if (
+      decision.decision_id
+    ) {
+
+      await action(
+        decision.decision_id
+      );
+    }
+
+    return decision;
+  }
+
+  /* ─────────────────────────────────────────────
+     AUTO TRACKING
+  ───────────────────────────────────────────── */
 
   function setupPageTracking() {
-    if (!config.autoPageview) return;
-    track("pageview", { referrer: document.referrer || null });
+
+    if (
+      !config.autoPageview
+    ) {
+      return;
+    }
+
+    track("pageview", {
+      referrer:
+        document.referrer ||
+        null,
+    });
   }
 
   function setupClickTracking() {
-    if (!config.autoTrack) return;
+
+    if (!config.autoTrack) {
+      return;
+    }
 
     document.addEventListener(
       "click",
-      (e) => {
+
+      function (e) {
+
         const el = e.target;
+
         if (!el) return;
 
         track("click", {
-          tag: el.tagName || null,
-          id: el.id || null,
-          class: el.className || null,
-          text: (el.innerText || "").trim().slice(0, 120),
+          tag:
+            el.tagName || null,
+
+          id:
+            el.id || null,
+
+          class:
+            el.className || null,
+
+          text:
+            (
+              el.innerText || ""
+            )
+              .trim()
+              .slice(0, 120),
         });
+
       },
+
       true
     );
   }
 
   function setupUnloadTracking() {
-    window.addEventListener("beforeunload", function () {
-      const duration = now() - state.pageStart;
 
-      navigator.sendBeacon(
-        config.apiBase + "/event",
-        JSON.stringify({
-          session_id: state.sessionId,
-          event: "session_end",
-          payload: { duration },
-        })
-      );
-    });
+    window.addEventListener(
+      "beforeunload",
+
+      function () {
+
+        track("session_end", {
+          duration:
+            now() -
+            state.pageStart,
+        });
+
+      }
+    );
   }
+
+  /* ─────────────────────────────────────────────
+     ANALYTICS
+  ───────────────────────────────────────────── */
 
   async function metrics() {
     return request("/metrics");
   }
 
-  function init(userConfig = {}) {
-    if (state.initialized) return api;
+  /* ─────────────────────────────────────────────
+     INIT
+  ───────────────────────────────────────────── */
 
-    const scriptConfig = getScriptConfig();
+  function init(
+    userConfig = {}
+  ) {
+
+    if (
+      state.initialized
+    ) {
+
+      warn(
+        "already initialized"
+      );
+
+      return api;
+    }
+
+    const scriptConfig =
+      getScriptConfig();
 
     config = {
       ...DEFAULTS,
@@ -236,44 +726,109 @@
       ...userConfig,
     };
 
-    if (!config.siteId) warn("Missing siteId");
-    if (!config.apiKey) warn("Missing apiKey");
+    if (!config.siteId) {
+      warn("missing siteId");
+    }
+
+    if (!config.apiKey) {
+      warn("missing apiKey");
+    }
 
     ensureSession();
 
     setupPageTracking();
+
     setupClickTracking();
+
     setupUnloadTracking();
 
     state.initialized = true;
 
-    log("SDK initialized", SDK_VERSION);
+    log(
+      "SDK initialized",
+      SDK_VERSION
+    );
 
-    if (config.autoOptimize) {
-      optimize().catch(() => {});
+    if (
+      config.autoOptimize
+    ) {
+
+      optimize().catch(
+        () => {}
+      );
     }
 
     return api;
   }
 
+  /* ─────────────────────────────────────────────
+     PUBLIC API
+  ───────────────────────────────────────────── */
+
   const api = {
-    version: SDK_VERSION,
+    version:
+      SDK_VERSION,
+
     init,
+
     track,
+
     score,
+
     action,
+
     outcome,
+
+    optimize,
+
     metrics,
-    getSession: () => state.sessionId,
-    getDecision: () => state.activeDecision,
-    getConfig: () => config,
+
+    applyRule,
+
+    applyRules,
+
+    updateText,
+
+    updateHTML,
+
+    addClass,
+
+    injectBanner,
+
+    getSession() {
+      return state.sessionId;
+    },
+
+    getDecision() {
+      return state.activeDecision;
+    },
+
+    getConfig() {
+      return config;
+    },
   };
+
+  /* ─────────────────────────────────────────────
+     GLOBAL EXPORT
+  ───────────────────────────────────────────── */
 
   window.Reden = api;
 
-  const autoConfig = getScriptConfig();
+  /* ─────────────────────────────────────────────
+     AUTO INIT
+  ───────────────────────────────────────────── */
 
-  if (autoConfig.siteId && autoConfig.apiKey) {
-    window.Reden.init(autoConfig);
+  const autoConfig =
+    getScriptConfig();
+
+  if (
+    autoConfig.siteId &&
+    autoConfig.apiKey
+  ) {
+
+    window.Reden.init(
+      autoConfig
+    );
   }
+
 })(window, document);
