@@ -341,6 +341,18 @@ async function authenticate(
 
 app.use(authenticate);
 
+app.use((req, res, next) => {
+  if (!req.site || !req.site.site_id) {
+    return res.status(401).json({
+      ok: false,
+      error: "invalid_site_context",
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  next();
+});
+
 /* ─────────────────────────────────────────────
    ROOT
 ───────────────────────────────────────────── */
