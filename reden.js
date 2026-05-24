@@ -594,68 +594,24 @@ app.post("/event", async (req, res) => {
    SCORE
 ───────────────────────────────────────────── */
 
+```js id="score_clean_v1"
 app.post("/score", async (req, res) => {
-
   try {
+    const { session_id, cart_id, cart_value } = req.body;
 
-    if (
-      !req.site ||
-      !req.site.site_id
-    ) {
-
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_site_context"
-          )
-        );
+    if (!session_id || !cart_id || cart_value === undefined) {
+      return res.status(400).json(failure("missing_fields"));
     }
 
-    const {
-      session_id,
-      cart_id,
-      cart_value
-    } = req.body;
+    const value = validateNumber(cart_value);
 
-    if (
-      !session_id ||
-      !cart_id ||
-      cart_value === undefined
-    ) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_fields"
-          )
-        );
+    if (value === null || value < 0) {
+      return res.status(400).json(failure("invalid_cart_value"));
     }
 
-    const value =
-      validateNumber(
-        cart_value
-      );
+    let action = await pickAction();
 
-    if (
-      value === null ||
-      value <= 0
-    ) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "invalid_cart_value"
-          )
-        );
-    }
-
-    let action =
-      await pickAction();
-
-    if (!action) {
+    if (!action || typeof action !== "string") {
       action = "NONE";
     }
 
@@ -667,74 +623,49 @@ app.post("/score", async (req, res) => {
     };
 
     const discount =
-      discounts[action] || 0;
+      Object.prototype.hasOwnProperty.call(discounts, action)
+        ? discounts[action]
+        : 0;
 
-    const expected_value =
-      Math.max(
-        value - discount,
-        0
-      );
+    const expected_value = Math.max(value - discount, 0);
 
-    const result =
-      await db.query(
-        `
-        INSERT INTO decisions
-        (
-          site_id,
-          session_id,
-          cart_id,
-          action,
-          discount,
-          expected_value,
-          state
-        )
-        VALUES
-        (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          'SCORED'
-        )
-        RETURNING id
-        `,
-        [
-          req.site.site_id,
-          session_id,
-          cart_id,
-          action,
-          discount,
-          expected_value,
-        ]
-      );
+    const result = await db.query(
+      `
+      INSERT INTO decisions
+      (
+        site_id,
+        session_id,
+        cart_id,
+        action,
+        discount,
+        expected_value,
+        state
+      )
+      VALUES
+      ($1, $2, $3, $4, $5, $6, 'SCORED')
+      RETURNING id
+      `,
+      [
+        req.site.site_id,
+        session_id,
+        cart_id,
+        action,
+        discount,
+        expected_value,
+      ]
+    );
 
     return res.json(
       success({
-        decision_id:
-          result.rows[0].id,
-
+        decision_id: result.rows[0].id,
         action,
         discount,
         expected_value,
       })
     );
-
   } catch (e) {
-
-    console.error(
-      "[SCORE ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "score_failed"
-        )
-      );
+    console.error("[SCORE ERROR]", e);
+    return res.status(500).json(failure("score_failed"));
   }
 });
 
@@ -831,68 +762,31 @@ app.post("/action", async (req, res) => {
 ───────────────────────────────────────────── */
 
 app.post("/outcome", async (req, res) => {
-
   try {
-
-    if (
-      !req.site ||
-      !req.site.site_id
-    ) {
-
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_site_context"
-          )
-        );
-    }
-
-    const {
-      decision_id,
-      converted,
-      revenue
-    } = req.body;
+    const { decision_id, converted, revenue } = req.body;
 
     if (!decision_id) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_decision_id"
-          )
-        );
+      return res.status(400).json(failure("missing_decision_id"));
     }
 
-    const existing =
-      await db.query(
-        `
-        SELECT
-          action
-        FROM decisions
-        WHERE
-          id = $1
-          AND site_id = $2
-        `,
-        [
-          decision_id,
-          req.site.site_id
-        ]
-      );
-
-    if (
-      existing.rowCount === 0
-    ) {
-
-      return res
-        .status(404)
-        .json(
-          failure(
-            "decision_not_found"
-          )
-        );
+    if (!req.site?.site_id) {
+      return res.status(401).json(failure("invalid_site_context"));
     }
+
+    const existing = await db.query(
+      `
+      SELECT action
+      FROM decisions
+      WHERE id = $1 AND site_id = $2
+      `,
+      [decision_id, req.site.site_id]
+    );
+
+    if (existing.rowCount === 0) {
+      return res.status(404).json(failure("decision_not_found"));
+    }
+
+    const action = existing.rows[0].action;
 
     await db.query(
       `
@@ -902,22 +796,22 @@ app.post("/outcome", async (req, res) => {
         converted = $1,
         revenue = $2,
         completed_at = NOW()
-      WHERE
-        id = $3
-        AND site_id = $4
+      WHERE id = $3 AND site_id = $4
       `,
       [
         Boolean(converted),
         Number(revenue || 0),
         decision_id,
-        req.site.site_id
+        req.site.site_id,
       ]
     );
 
-    await updateBandit(
-      existing.rows[0].action,
-      Boolean(converted)
-    );
+    // SAFE BANDIT UPDATE (isolated failure)
+    try {
+      await updateBandit(action, Boolean(converted), req.site.site_id);
+    } catch (e) {
+      console.error("[BANDIT UPDATE ERROR]", e);
+    }
 
     return res.json(
       success({
@@ -926,19 +820,8 @@ app.post("/outcome", async (req, res) => {
     );
 
   } catch (e) {
-
-    console.error(
-      "[OUTCOME ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "outcome_failed"
-        )
-      );
+    console.error("[OUTCOME ERROR]", e);
+    return res.status(500).json(failure("outcome_failed"));
   }
 });
 
@@ -947,97 +830,50 @@ app.post("/outcome", async (req, res) => {
 ───────────────────────────────────────────── */
 
 app.get("/metrics", async (req, res) => {
-
   try {
-
-    if (
-      !req.site ||
-      !req.site.site_id
-    ) {
-
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_site_context"
-          )
-        );
+    if (!req.site?.site_id) {
+      return res.status(401).json(failure("invalid_site_context"));
     }
 
-    const result =
-      await db.query(
-        `
-        SELECT
-          COUNT(*) AS total,
+    const result = await db.query(
+      `
+      SELECT
+        COUNT(*) AS total,
 
-          COUNT(*) FILTER (
-            WHERE converted = true
-          ) AS conversions,
+        COUNT(*) FILTER (WHERE converted = true) AS conversions,
 
-          COALESCE(
-            AVG(revenue),
-            0
-          ) AS avg_revenue,
+        COALESCE(AVG(revenue), 0) AS avg_revenue,
 
-          COALESCE(
-            SUM(revenue),
-            0
-          ) AS total_revenue
+        COALESCE(SUM(revenue), 0) AS total_revenue
 
-        FROM decisions
+      FROM decisions
+      WHERE state = 'COMPLETED'
+        AND site_id = $1
+      `,
+      [req.site.site_id]
+    );
 
-        WHERE
-          state = 'COMPLETED'
-          AND site_id = $1
-        `,
-        [req.site.site_id]
-      );
+    const row = result.rows[0];
 
-    const row =
-      result.rows[0];
+    const total = Number(row.total || 0);
+    const conversions = Number(row.conversions || 0);
 
-    const total =
-      Number(row.total || 0);
-
-    const conversions =
-      Number(row.conversions || 0);
+    const conversion_rate =
+      total > 0 ? conversions / total : 0;
 
     return res.json(
       success({
         total,
         conversions,
-
-        conversion_rate:
-          total > 0
-            ? conversions / total
-            : 0,
-
-        avg_revenue:
-          Number(
-            row.avg_revenue || 0
-          ),
-
-        total_revenue:
-          Number(
-            row.total_revenue || 0
-          ),
+        conversion_rate,
+        avg_revenue: Number(row.avg_revenue || 0),
+        total_revenue: Number(row.total_revenue || 0),
       })
     );
 
   } catch (e) {
-
-    console.error(
-      "[METRICS ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "metrics_failed"
-        )
-      );
+    console.error("[METRICS ERROR]", e);
+    return res.status(500).json(failure("metrics_failed"));
   }
 });
 
