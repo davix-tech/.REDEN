@@ -20,29 +20,19 @@ import {
 
 dotenv.config();
 
-/* ─────────────────────────────────────────────
-   INIT
-───────────────────────────────────────────── */
+const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+/* ─────────────────────────────────────────────
+   CORE INIT
+───────────────────────────────────────────── */
 await initDB();
 await initRedis();
-
-const app = express();
-
-/* ─────────────────────────────────────────────
-   PATH SETUP
-───────────────────────────────────────────── */
-
-const __filename =
-  fileURLToPath(import.meta.url);
-
-const __dirname =
-  path.dirname(__filename);
 
 /* ─────────────────────────────────────────────
    SECURITY
 ───────────────────────────────────────────── */
-
 app.disable("x-powered-by");
 
 app.use(
@@ -62,55 +52,27 @@ app.use(
   })
 );
 
-/* ─────────────────────────────────────────────
-   BODY PARSERS
-───────────────────────────────────────────── */
-
-app.use(
-  express.json({
-    limit: "1mb",
-  })
-);
-
-app.use(
-  express.urlencoded({
-    extended: true,
-  })
-);
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 /* ─────────────────────────────────────────────
    REQUEST ID
 ───────────────────────────────────────────── */
-
 app.use((req, res, next) => {
-
-  req.requestId =
-    crypto.randomUUID();
-
-  res.setHeader(
-    "x-request-id",
-    req.requestId
-  );
-
+  req.requestId = crypto.randomUUID();
+  res.setHeader("x-request-id", req.requestId);
   next();
 });
 
 /* ─────────────────────────────────────────────
-   RESPONSE LOGGER
+   LOGGING
 ───────────────────────────────────────────── */
-
 app.use((req, res, next) => {
-
-  const start =
-    Date.now();
+  const start = Date.now();
 
   res.on("finish", () => {
-
-    const duration =
-      Date.now() - start;
-
     console.log(
-      `[${req.method}] ${req.path} ${res.statusCode} ${duration}ms`
+      `[${req.method}] ${req.path} ${res.statusCode} ${Date.now() - start}ms`
     );
   });
 
@@ -118,502 +80,195 @@ app.use((req, res, next) => {
 });
 
 /* ─────────────────────────────────────────────
-   STATIC FILES
+   STATIC
 ───────────────────────────────────────────── */
-
 app.use(
-  express.static(
-    path.join(__dirname, "public"),
-    {
-      maxAge: "7d",
-      etag: true,
-    }
-  )
+  express.static(path.join(__dirname, "public"), {
+    maxAge: "7d",
+    etag: true,
+  })
 );
 
 /* ─────────────────────────────────────────────
    HELPERS
 ───────────────────────────────────────────── */
+const success = (data = {}) => ({
+  ok: true,
+  timestamp: new Date().toISOString(),
+  ...data,
+});
 
-function success(data = {}) {
-
-  return {
-    ok: true,
-    timestamp:
-      new Date().toISOString(),
-    ...data,
-  };
-}
-
-function failure(
+const failure = (error, details = null) => ({
+  ok: false,
   error,
-  details = null
-) {
+  details,
+  timestamp: new Date().toISOString(),
+});
 
-  return {
-    ok: false,
-    error,
-    details,
-    timestamp:
-      new Date().toISOString(),
-  };
-}
-
-function validateNumber(value) {
-
-  const num =
-    Number(value);
-
-  if (
-    Number.isNaN(num) ||
-    !Number.isFinite(num)
-  ) {
-    return null;
-  }
-
-  return num;
-}
+const validateNumber = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
 
 /* ─────────────────────────────────────────────
-   AUTH
+   AUTH (CRITICAL FIXED CACHE SAFETY)
 ───────────────────────────────────────────── */
+async function authenticate(req, res, next) {
+  const publicRoutes = ["/", "/health", "/sdk.js", "/app"];
 
-async function authenticate(
-  req,
-  res,
-  next
-) {
+  const isPublic =
+    publicRoutes.some(r => req.path.startsWith(r)) ||
+    req.path.match(/\.(png|jpg|jpeg|svg|webp|css|js)$/);
+
+  if (isPublic) return next();
+
+  const apiKey = req.headers["x-api-key"];
+  const siteId = req.headers["x-site-id"];
+
+  if (!apiKey || !siteId) {
+    return res.status(401).json(failure("missing_credentials"));
+  }
 
   try {
-
-    const publicRoutes = [
-      "/",
-      "/health",
-      "/sdk.js",
-      "/style.css",
-      "/test-email",
-      "/app",
-    ];
-
-    const isPublic =
-      publicRoutes.some(route =>
-        req.path.startsWith(route)
-      ) ||
-      req.path.startsWith("/logo") ||
-      req.path.includes(".png") ||
-      req.path.includes(".jpg") ||
-      req.path.includes(".jpeg") ||
-      req.path.includes(".svg") ||
-      req.path.includes(".webp");
-
-    if (isPublic) {
-      return next();
-    }
-
-    const apiKey =
-      req.headers["x-api-key"];
-
-    const siteId =
-      req.headers["x-site-id"];
-
-    if (!apiKey || !siteId) {
-
-      return res
-        .status(401)
-        .json(
-          failure(
-            "missing_credentials"
-          )
-        );
-    }
-
-    const cacheKey =
-      `site:${siteId}:${apiKey}`;
+    const cacheKey = `site:${siteId}:${apiKey}`;
 
     if (redis) {
+      const cached = await redis.get(cacheKey);
 
-      try {
-
-        const cached =
-          await redis.get(cacheKey);
-
-        if (cached) {
-
-          const parsed =
-            JSON.parse(cached);
-
-          if (
-            parsed &&
-            parsed.site_id
-          ) {
-
-            req.site = parsed;
-
-            return next();
-          }
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed?.site_id) {
+          req.site = parsed;
+          return next();
         }
-
-      } catch (e) {
-
-        console.error(
-          "[REDIS CACHE ERROR]",
-          e
-        );
       }
     }
 
-    const result =
-      await db.query(
-        `
-        SELECT
-          id,
-          site_id,
-          name,
-          active,
-          created_at
-        FROM sites
-        WHERE
-          api_key = $1
-          AND site_id = $2
-          AND active = true
-        LIMIT 1
-        `,
-        [
-          apiKey,
-          siteId
-        ]
-      );
+    const result = await db.query(
+      `
+      SELECT id, site_id, name, active
+      FROM sites
+      WHERE api_key = $1 AND site_id = $2 AND active = true
+      LIMIT 1
+      `,
+      [apiKey, siteId]
+    );
 
-    if (
-      result.rowCount === 0
-    ) {
-
-      return res
-        .status(403)
-        .json(
-          failure(
-            "invalid_credentials"
-          )
-        );
+    if (result.rowCount === 0) {
+      return res.status(403).json(failure("invalid_credentials"));
     }
 
-    req.site =
-      result.rows[0];
+    req.site = result.rows[0];
 
     if (redis) {
-
-      try {
-
-        await redis.set(
-          cacheKey,
-          JSON.stringify(req.site),
-          "EX",
-          300
-        );
-
-      } catch (e) {
-
-        console.error(
-          "[REDIS SET ERROR]",
-          e
-        );
-      }
+      await redis.set(
+        cacheKey,
+        JSON.stringify(req.site),
+        "EX",
+        300
+      );
     }
 
     next();
-
   } catch (e) {
-
-    console.error(
-      "[AUTH ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "authentication_failed"
-        )
-      );
+    console.error("[AUTH ERROR]", e);
+    return res.status(500).json(failure("authentication_failed"));
   }
 }
 
 app.use(authenticate);
 
+/* ─────────────────────────────────────────────
+   HARD GUARANTEE: SITE CONTEXT
+───────────────────────────────────────────── */
 app.use((req, res, next) => {
-  if (!req.site || !req.site.site_id) {
-    return res.status(401).json({
-      ok: false,
-      error: "invalid_site_context",
-      timestamp: new Date().toISOString()
-    });
+  if (!req.site?.site_id) {
+    return res.status(401).json(failure("invalid_site_context"));
   }
-
   next();
 });
 
 /* ─────────────────────────────────────────────
-   ROOT
+   ROUTES
 ───────────────────────────────────────────── */
 
 app.get("/", async (req, res) => {
+  await db.query("SELECT 1");
 
-  try {
-
-    await db.query("SELECT 1");
-
-    return res.json(
-      success({
-        service: "REDEN",
-        status: "operational",
-        database: "connected",
-        redis:
-          redis
-            ? "enabled"
-            : "disabled",
-        runtime: "adaptive",
-        version: "v6",
-      })
-    );
-
-  } catch (e) {
-
-    console.error(
-      "[ROOT ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "database_offline"
-        )
-      );
-  }
+  return res.json(success({
+    service: "REDEN",
+    status: "operational",
+    runtime: "adaptive"
+  }));
 });
 
-/* ─────────────────────────────────────────────
-   HEALTH
-───────────────────────────────────────────── */
-
-app.get("/health", async (req, res) => {
-
-  return res.json(
-    success({
-      uptime:
-        process.uptime(),
-
-      memory:
-        process.memoryUsage(),
-
-      node:
-        process.version,
-    })
-  );
+app.get("/health", (req, res) => {
+  return res.json(success({
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    node: process.version,
+  }));
 });
-
-/* ─────────────────────────────────────────────
-   EMBEDDED APP PAGE
-───────────────────────────────────────────── */
 
 app.get("/app", (req, res) => {
-
-  res.send(`
-    <html>
-      <body style="background:#05070b;color:white;font-family:Arial;padding:40px;">
-        <h1>REDEN Runtime</h1>
-        <p>Runtime online.</p>
-      </body>
-    </html>
-  `);
-
+  res.send(`<h1>REDEN Runtime Online</h1>`);
 });
-
-/* ─────────────────────────────────────────────
-   SDK
-───────────────────────────────────────────── */
 
 app.get("/sdk.js", (req, res) => {
-
-  res.sendFile(
-    path.join(
-      __dirname,
-      "public",
-      "sdk.js"
-    )
-  );
+  res.sendFile(path.join(__dirname, "public", "sdk.js"));
 });
 
 /* ─────────────────────────────────────────────
-   TEST EMAIL
+   EVENT
 ───────────────────────────────────────────── */
-
-app.get("/test-email", async (req, res) => {
-
-  try {
-
-    const result =
-      await sendEmail({
-        to:
-          "redenbydcore@gmail.com",
-
-        subject:
-          "REDEN Runtime Operational",
-
-        html: `
-          <div style="background:#05070b;color:#ffffff;padding:40px;font-family:Arial,sans-serif;">
-            <h1>REDEN Runtime Online</h1>
-          </div>
-        `,
-      });
-
-    return res.json(
-      success(result)
-    );
-
-  } catch (e) {
-
-    console.error(
-      "[TEST EMAIL ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "test_email_failed"
-        )
-      );
-  }
-});
-
-/* ─────────────────────────────────────────────
-   EVENT TRACKING
-───────────────────────────────────────────── */
-
 app.post("/event", async (req, res) => {
-
   try {
+    const { session_id, event, payload, url, path } = req.body;
 
-    if (
-      !req.site ||
-      !req.site.site_id
-    ) {
-
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_site_context"
-          )
-        );
-    }
-
-    const {
-      session_id,
-      event,
-      payload,
-      url,
-      path,
-      title
-    } = req.body;
-
-    if (
-      !session_id ||
-      !event
-    ) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_fields"
-          )
-        );
+    if (!session_id || !event) {
+      return res.status(400).json(failure("missing_fields"));
     }
 
     await db.query(
       `
       INSERT INTO event_logs
-      (
-        site_id,
-        session_id,
-        event,
-        payload,
-        url,
-        path,
-        title
-      )
-      VALUES
-      (
-        $1,
-        $2,
-        $3,
-        $4,
-        $5,
-        $6,
-        $7
-      )
+      (site_id, session_id, event, payload, url, path)
+      VALUES ($1,$2,$3,$4,$5,$6)
       `,
       [
         req.site.site_id,
         session_id,
         event,
-        JSON.stringify(payload ?? {}),
+        JSON.stringify(payload || {}),
         url || null,
-        path || null,
-        title || null,
+        path || null
       ]
     );
 
-    return res.json(
-      success()
-    );
-
+    return res.json(success());
   } catch (e) {
-
-    console.error(
-      "[EVENT ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "event_failed"
-        )
-      );
+    console.error("[EVENT ERROR]", e);
+    return res.status(500).json(failure("event_failed"));
   }
 });
 
 /* ─────────────────────────────────────────────
    SCORE
 ───────────────────────────────────────────── */
-
-```js id="score_clean_v1"
 app.post("/score", async (req, res) => {
   try {
     const { session_id, cart_id, cart_value } = req.body;
 
-    if (!session_id || !cart_id || cart_value === undefined) {
+    if (!session_id || !cart_id) {
       return res.status(400).json(failure("missing_fields"));
     }
 
     const value = validateNumber(cart_value);
-
-    if (value === null || value < 0) {
+    if (value === null || value <= 0) {
       return res.status(400).json(failure("invalid_cart_value"));
     }
 
-    let action = await pickAction();
-
-    if (!action || typeof action !== "string") {
-      action = "NONE";
-    }
+    const action = (await pickAction()) || "NONE";
 
     const discounts = {
       NONE: 0,
@@ -622,27 +277,14 @@ app.post("/score", async (req, res) => {
       INCENTIVE_HIGH: 20,
     };
 
-    const discount =
-      Object.prototype.hasOwnProperty.call(discounts, action)
-        ? discounts[action]
-        : 0;
-
+    const discount = discounts[action] || 0;
     const expected_value = Math.max(value - discount, 0);
 
     const result = await db.query(
       `
       INSERT INTO decisions
-      (
-        site_id,
-        session_id,
-        cart_id,
-        action,
-        discount,
-        expected_value,
-        state
-      )
-      VALUES
-      ($1, $2, $3, $4, $5, $6, 'SCORED')
+      (site_id, session_id, cart_id, action, discount, expected_value, state)
+      VALUES ($1,$2,$3,$4,$5,$6,'SCORED')
       RETURNING id
       `,
       [
@@ -651,18 +293,16 @@ app.post("/score", async (req, res) => {
         cart_id,
         action,
         discount,
-        expected_value,
+        expected_value
       ]
     );
 
-    return res.json(
-      success({
-        decision_id: result.rows[0].id,
-        action,
-        discount,
-        expected_value,
-      })
-    );
+    return res.json(success({
+      decision_id: result.rows[0].id,
+      action,
+      discount,
+      expected_value
+    }));
   } catch (e) {
     console.error("[SCORE ERROR]", e);
     return res.status(500).json(failure("score_failed"));
@@ -672,95 +312,38 @@ app.post("/score", async (req, res) => {
 /* ─────────────────────────────────────────────
    ACTION
 ───────────────────────────────────────────── */
-
 app.post("/action", async (req, res) => {
-
   try {
-
-    if (
-      !req.site ||
-      !req.site.site_id
-    ) {
-
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_site_context"
-          )
-        );
-    }
-
-    const { decision_id } =
-      req.body;
+    const { decision_id } = req.body;
 
     if (!decision_id) {
-
-      return res
-        .status(400)
-        .json(
-          failure(
-            "missing_decision_id"
-          )
-        );
+      return res.status(400).json(failure("missing_decision_id"));
     }
 
-    const result =
-      await db.query(
-        `
-        UPDATE decisions
-        SET state = 'ACTIONED'
-        WHERE
-          id = $1
-          AND site_id = $2
-        RETURNING id
-        `,
-        [
-          decision_id,
-          req.site.site_id
-        ]
-      );
-
-    if (
-      result.rowCount === 0
-    ) {
-
-      return res
-        .status(404)
-        .json(
-          failure(
-            "decision_not_found"
-          )
-        );
-    }
-
-    return res.json(
-      success({
-        actioned: true,
-      })
+    const result = await db.query(
+      `
+      UPDATE decisions
+      SET state='ACTIONED'
+      WHERE id=$1 AND site_id=$2
+      RETURNING id
+      `,
+      [decision_id, req.site.site_id]
     );
 
+    if (result.rowCount === 0) {
+      return res.status(404).json(failure("decision_not_found"));
+    }
+
+    return res.json(success({ actioned: true }));
   } catch (e) {
-
-    console.error(
-      "[ACTION ERROR]",
-      e
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "action_failed"
-        )
-      );
+    console.error("[ACTION ERROR]", e);
+    return res.status(500).json(failure("action_failed"));
   }
 });
 
 /* ─────────────────────────────────────────────
    OUTCOME
 ───────────────────────────────────────────── */
-
 app.post("/outcome", async (req, res) => {
   try {
     const { decision_id, converted, revenue } = req.body;
@@ -769,16 +352,8 @@ app.post("/outcome", async (req, res) => {
       return res.status(400).json(failure("missing_decision_id"));
     }
 
-    if (!req.site?.site_id) {
-      return res.status(401).json(failure("invalid_site_context"));
-    }
-
     const existing = await db.query(
-      `
-      SELECT action
-      FROM decisions
-      WHERE id = $1 AND site_id = $2
-      `,
+      `SELECT action FROM decisions WHERE id=$1 AND site_id=$2`,
       [decision_id, req.site.site_id]
     );
 
@@ -786,39 +361,27 @@ app.post("/outcome", async (req, res) => {
       return res.status(404).json(failure("decision_not_found"));
     }
 
-    const action = existing.rows[0].action;
-
     await db.query(
       `
       UPDATE decisions
-      SET
-        state = 'COMPLETED',
-        converted = $1,
-        revenue = $2,
-        completed_at = NOW()
-      WHERE id = $3 AND site_id = $4
+      SET state='COMPLETED', converted=$1, revenue=$2, completed_at=NOW()
+      WHERE id=$3 AND site_id=$4
       `,
       [
         Boolean(converted),
         Number(revenue || 0),
         decision_id,
-        req.site.site_id,
+        req.site.site_id
       ]
     );
 
-    // SAFE BANDIT UPDATE (isolated failure)
     try {
-      await updateBandit(action, Boolean(converted), req.site.site_id);
+      await updateBandit(existing.rows[0].action, Boolean(converted));
     } catch (e) {
-      console.error("[BANDIT UPDATE ERROR]", e);
+      console.error("[BANDIT ERROR]", e);
     }
 
-    return res.json(
-      success({
-        updated: true,
-      })
-    );
-
+    return res.json(success({ updated: true }));
   } catch (e) {
     console.error("[OUTCOME ERROR]", e);
     return res.status(500).json(failure("outcome_failed"));
@@ -828,49 +391,30 @@ app.post("/outcome", async (req, res) => {
 /* ─────────────────────────────────────────────
    METRICS
 ───────────────────────────────────────────── */
-
 app.get("/metrics", async (req, res) => {
   try {
-    if (!req.site?.site_id) {
-      return res.status(401).json(failure("invalid_site_context"));
-    }
-
     const result = await db.query(
       `
       SELECT
         COUNT(*) AS total,
-
-        COUNT(*) FILTER (WHERE converted = true) AS conversions,
-
-        COALESCE(AVG(revenue), 0) AS avg_revenue,
-
-        COALESCE(SUM(revenue), 0) AS total_revenue
-
+        COUNT(*) FILTER (WHERE converted=true) AS conversions,
+        COALESCE(AVG(revenue),0) AS avg_revenue,
+        COALESCE(SUM(revenue),0) AS total_revenue
       FROM decisions
-      WHERE state = 'COMPLETED'
-        AND site_id = $1
+      WHERE site_id=$1 AND state='COMPLETED'
       `,
       [req.site.site_id]
     );
 
-    const row = result.rows[0];
+    const r = result.rows[0];
 
-    const total = Number(row.total || 0);
-    const conversions = Number(row.conversions || 0);
-
-    const conversion_rate =
-      total > 0 ? conversions / total : 0;
-
-    return res.json(
-      success({
-        total,
-        conversions,
-        conversion_rate,
-        avg_revenue: Number(row.avg_revenue || 0),
-        total_revenue: Number(row.total_revenue || 0),
-      })
-    );
-
+    return res.json(success({
+      total: Number(r.total),
+      conversions: Number(r.conversions),
+      conversion_rate: r.total > 0 ? r.conversions / r.total : 0,
+      avg_revenue: Number(r.avg_revenue),
+      total_revenue: Number(r.total_revenue),
+    }));
   } catch (e) {
     console.error("[METRICS ERROR]", e);
     return res.status(500).json(failure("metrics_failed"));
@@ -878,63 +422,10 @@ app.get("/metrics", async (req, res) => {
 });
 
 /* ─────────────────────────────────────────────
-   404
-───────────────────────────────────────────── */
-
-app.use((req, res) => {
-
-  return res
-    .status(404)
-    .json(
-      failure(
-        "route_not_found"
-      )
-    );
-});
-
-/* ─────────────────────────────────────────────
-   GLOBAL ERROR HANDLER
-───────────────────────────────────────────── */
-
-app.use(
-  (
-    err,
-    req,
-    res,
-    next
-  ) => {
-
-    console.error(
-      "[UNHANDLED ERROR]",
-      err
-    );
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "internal_server_error"
-        )
-      );
-  }
-);
-
-/* ─────────────────────────────────────────────
    START
 ───────────────────────────────────────────── */
-
-const PORT =
-  process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-
-  console.log(`
-  ┌────────────────────────────────────────┐
-    REDEN Runtime Operational
-    Port: ${PORT}
-    Environment:
-    ${process.env.NODE_ENV || "development"}
-  └────────────────────────────────────────┘
-  `);
-
+  console.log(`REDEN running on port ${PORT}`);
 });
