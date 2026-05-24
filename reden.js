@@ -562,7 +562,7 @@ app.post("/event", async (req, res) => {
         req.site.site_id,
         session_id,
         event,
-        payload || {},
+        JSON.stringify(payload ?? {}),
         url || null,
         path || null,
         title || null,
