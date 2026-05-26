@@ -29,6 +29,24 @@ for (const key of requiredEnv) {
    INITIALIZATION
 ───────────────────────────────────────────── */
 await initDB();
+
+try {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS sites (
+      id SERIAL PRIMARY KEY,
+      site_id VARCHAR(50) UNIQUE NOT NULL,
+      api_key VARCHAR(100) UNIQUE NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      owner_email VARCHAR(255),
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  console.log("[DB INIT] 'sites' table verified/created successfully.");
+} catch (err) {
+  console.error("[DB INIT ERROR] Failed to auto-create tables:", err);
+}
+
 await initRedis();
 
 const app = express();
