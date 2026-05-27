@@ -141,8 +141,9 @@ async function authenticate(req, res, next) {
   try {
     if (isPublic(req.path)) return next();
 
-    const apiKey = req.headers["x-api-key"];
-    const siteId = req.headers["x-site-id"];
+    // FIXED: Reads from headers first, falls back to the parsed JSON body if headers are missing
+    const apiKey = req.headers["x-api-key"] || req.body?.x_api_key || req.body?.api_key;
+    const siteId = req.headers["x-site-id"] || req.body?.x_site_id || req.body?.site_id;
 
     if (!apiKey || !siteId) return res.status(401).json(failure("missing_credentials"));
 
