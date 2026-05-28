@@ -22,7 +22,7 @@ ENV VALIDATION
 ───────────────────────────────────────────── */
 const requiredEnv = ["DATABASE_URL", "ADMIN_SECRET"];
 for (const key of requiredEnv) {
-if (!process.env[key]) throw new Error(Missing mandatory environment variable: ${key});
+if (!process.env[key]) throw new Error(`Missing mandatory environment variable: ${key}`);
 }
 
 /* ─────────────────────────────────────────────
