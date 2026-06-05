@@ -1,5 +1,5 @@
 /*!
- * REDEN SDK v2
+ * REDEN SDK v1
  * Adaptive Revenue Runtime
  * https://reden.dcore.name.ng
  */
@@ -19,18 +19,13 @@
 
   const DEFAULTS = {
     apiBase: "https://reden.dcore.name.ng",
-
     apiKey: "",
     siteId: "",
-
     debug: false,
-
     autoTrack: true,
     autoPageview: true,
     autoOptimize: false,
-
     sessionKey: "__reden_session",
-
     timeout: 10000,
   };
 
@@ -69,7 +64,6 @@
     if (window.crypto?.randomUUID) {
       return window.crypto.randomUUID();
     }
-
     return (
       "reden_" +
       Math.random().toString(36).slice(2) +
@@ -83,18 +77,13 @@
 
   function persistSession(id) {
     try {
-      localStorage.setItem(
-        config.sessionKey,
-        id
-      );
+      localStorage.setItem(config.sessionKey, id);
     } catch {}
   }
 
   function getStoredSession() {
     try {
-      return localStorage.getItem(
-        config.sessionKey
-      );
+      return localStorage.getItem(config.sessionKey);
     } catch {
       return null;
     }
@@ -102,39 +91,24 @@
 
   function ensureSession() {
     let sid = getStoredSession();
-
     if (!sid) {
       sid = uuid();
       persistSession(sid);
     }
-
     state.sessionId = sid;
-
     return sid;
   }
 
   function getScriptConfig() {
-    const current =
-      document.currentScript;
-
+    const current = document.currentScript;
     if (!current) {
       return {};
     }
-
     return {
-      apiKey:
-        current.dataset.apiKey || "",
-
-      siteId:
-        current.dataset.siteId || "",
-
-      debug:
-        current.dataset.debug ===
-        "true",
-
-      autoOptimize:
-        current.dataset
-          .autoOptimize === "true",
+      apiKey: current.dataset.apiKey || "",
+      siteId: current.dataset.siteId || "",
+      debug: current.dataset.debug === "true",
+      autoOptimize: current.dataset.autoOptimize === "true",
     };
   }
 
@@ -142,90 +116,45 @@
      REQUEST ENGINE
   ───────────────────────────────────────────── */
 
-  async function request(
-    path,
-    options = {}
-  ) {
-
-    const controller =
-      new AbortController();
-
-    const timeout = setTimeout(
-      () => controller.abort(),
-      config.timeout
-    );
+  async function request(path, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.timeout);
 
     try {
-
-      const response =
-        await fetch(
-          config.apiBase + path,
-          {
-            method:
-              options.method || "GET",
-
-            headers: {
-              "Content-Type":
-                "application/json",
-
-              "x-api-key":
-                config.apiKey,
-
-              "x-site-id":
-                config.siteId,
-
-              "x-sdk-version":
-                SDK_VERSION,
-
-              ...(options.headers || {})
-            },
-
-            body:
-              options.body || null,
-
-            signal:
-              controller.signal,
-          }
-        );
+      const response = await fetch(config.apiBase + path, {
+        method: options.method || "GET",
+        keepalive: options.keepalive || false,
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": config.apiKey,
+          "x-site-id": config.siteId,
+          "x-sdk-version": SDK_VERSION,
+          ...(options.headers || {})
+        },
+        body: options.body || null,
+        signal: controller.signal,
+      });
 
       clearTimeout(timeout);
-
       let data = null;
 
       try {
-
-        data =
-          await response.json();
-
+        data = await response.json();
       } catch {
-
         data = {
           ok: false,
-          error:
-            "invalid_json_response",
+          error: "invalid_json_response",
         };
       }
 
       if (!response.ok) {
-
-        throw new Error(
-          data?.error ||
-          "request_failed"
-        );
+        throw new Error(data?.error || "request_failed");
       }
 
       return data;
-
     } catch (e) {
-
       clearTimeout(timeout);
-
-      warn(
-        "request failed",
-        path,
-        e.message
-      );
-
+      warn("request failed", path, e.message);
       throw e;
     }
   }
@@ -234,42 +163,22 @@
      TRACKING
   ───────────────────────────────────────────── */
 
-  async function track(
-    event,
-    payload = {}
-  ) {
-
+  async function track(event, payload = {}, options = {}) {
     try {
-
-      return await request(
-        "/event",
-        {
-          method: "POST",
-
-          body: JSON.stringify({
-            session_id:
-              state.sessionId,
-
-            event,
-
-            payload,
-
-            url:
-              location.href,
-
-            path:
-              location.pathname,
-
-            title:
-              document.title,
-
-            ts: now(),
-          }),
-        }
-      );
-
+      return await request("/event", {
+        method: "POST",
+        keepalive: options.keepalive || false,
+        body: JSON.stringify({
+          session_id: state.sessionId,
+          event,
+          payload,
+          url: location.href,
+          path: location.pathname,
+          title: document.title,
+          ts: now(),
+        }),
+      });
     } catch {
-
       return null;
     }
   }
@@ -278,35 +187,18 @@
      DECISION ENGINE
   ───────────────────────────────────────────── */
 
-  async function score(
-    cartValue = 0,
-    meta = {}
-  ) {
-
+  async function score(cartValue = 0, meta = {}) {
     const body = {
-      session_id:
-        state.sessionId,
-
-      cart_id:
-        meta.cart_id || uuid(),
-
-      cart_value:
-        Number(cartValue || 0),
-
+      session_id: state.sessionId,
+      cart_id: meta.cart_id || uuid(),
+      cart_value: Number(cartValue || 0),
       meta,
     };
 
-    const decision =
-      await request(
-        "/score",
-        {
-          method: "POST",
-
-          body: JSON.stringify(
-            body
-          ),
-        }
-      );
+    const decision = await request("/score", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
 
     state.activeDecision = {
       ...decision,
@@ -316,53 +208,28 @@
     return decision;
   }
 
-  async function action(
-    decisionId
-  ) {
-
+  async function action(decisionId) {
     if (!decisionId) {
       return null;
     }
-
-    return request(
-      "/action",
-      {
-        method: "POST",
-
-        body: JSON.stringify({
-          decision_id:
-            decisionId,
-        }),
-      }
-    );
+    return request("/action", {
+      method: "POST",
+      body: JSON.stringify({ decision_id: decisionId }),
+    });
   }
 
-  async function outcome({
-    decision_id,
-    converted,
-    revenue,
-  }) {
-
+  async function outcome({ decision_id, converted, revenue }) {
     if (!decision_id) {
       return null;
     }
-
-    return request(
-      "/outcome",
-      {
-        method: "POST",
-
-        body: JSON.stringify({
-          decision_id,
-
-          converted:
-            Boolean(converted),
-
-          revenue:
-            Number(revenue || 0),
-        }),
-      }
-    );
+    return request("/outcome", {
+      method: "POST",
+      body: JSON.stringify({
+        decision_id,
+        converted: Boolean(converted),
+        revenue: Number(revenue || 0),
+      }),
+    });
   }
 
   /* ─────────────────────────────────────────────
@@ -370,98 +237,45 @@
   ───────────────────────────────────────────── */
 
   function query(selector) {
-    return document.querySelector(
-      selector
-    );
+    return document.querySelector(selector);
   }
 
-  function updateText(
-    selector,
-    value
-  ) {
-
+  function updateText(selector, value) {
     const el = query(selector);
-
     if (!el) return false;
-
     el.textContent = value;
-
     return true;
   }
 
-  function updateHTML(
-    selector,
-    value
-  ) {
-
+  function updateHTML(selector, value) {
     const el = query(selector);
-
     if (!el) return false;
-
     el.innerHTML = value;
-
     return true;
   }
 
-  function addClass(
-    selector,
-    value
-  ) {
-
+  function addClass(selector, value) {
     const el = query(selector);
-
     if (!el) return false;
-
     el.classList.add(value);
-
     return true;
   }
 
-  function injectBanner(
-    content
-  ) {
-
-    const banner =
-      document.createElement(
-        "div"
-      );
-
+  function injectBanner(content) {
+    const banner = document.createElement("div");
     banner.innerHTML = content;
-
-    banner.style.position =
-      "fixed";
-
-    banner.style.bottom =
-      "20px";
-
-    banner.style.right =
-      "20px";
-
-    banner.style.padding =
-      "14px 18px";
-
-    banner.style.background =
-      "#111827";
-
-    banner.style.color =
-      "#ffffff";
-
-    banner.style.zIndex =
-      "999999";
-
-    banner.style.borderRadius =
-      "14px";
-
-    banner.style.fontFamily =
-      "Inter, sans-serif";
-
-    banner.style.boxShadow =
-      "0 10px 40px rgba(0,0,0,0.35)";
-
-    document.body.appendChild(
-      banner
-    );
-
+    banner.style.position = "fixed";
+    banner.style.bottom = "20px";
+    banner.style.right = "20px";
+    banner.style.padding = "14px 18px";
+    banner.style.background = "#111827";
+    banner.style.color = "#ffffff";
+    banner.style.zIndex = "999999";
+    banner.style.borderRadius = "14px";
+    banner.style.fontFamily = "Inter, sans-serif";
+    banner.style.boxShadow = "0 10px 40px rgba(0,0,0,0.35)";
+    
+    document.body.appendChild(banner);
     return banner;
   }
 
@@ -470,67 +284,29 @@
   ───────────────────────────────────────────── */
 
   function applyRule(rule) {
-
     if (!rule) return;
-
-    const {
-      selector,
-      action,
-      value,
-    } = rule;
+    const { selector, action, value } = rule;
 
     switch (action) {
-
       case "replace_text":
-
-        updateText(
-          selector,
-          value
-        );
-
+        updateText(selector, value);
         break;
-
       case "replace_html":
-
-        updateHTML(
-          selector,
-          value
-        );
-
+        updateHTML(selector, value);
         break;
-
       case "add_class":
-
-        addClass(
-          selector,
-          value
-        );
-
+        addClass(selector, value);
         break;
-
       case "banner":
-
         injectBanner(value);
-
         break;
-
       default:
-
-        warn(
-          "unknown rule",
-          action
-        );
+        warn("unknown rule", action);
     }
   }
 
   function applyRules(rules) {
-
-    if (
-      !Array.isArray(rules)
-    ) {
-      return;
-    }
-
+    if (!Array.isArray(rules)) return;
     for (const rule of rules) {
       applyRule(rule);
     }
@@ -540,76 +316,31 @@
      OPTIMIZER
   ───────────────────────────────────────────── */
 
-  async function optimize(
-    options = {}
-  ) {
+  async function optimize(options = {}) {
+    const decision = await score(options.cartValue || 0, options.meta || {});
+    if (!decision) return null;
 
-    const decision =
-      await score(
-        options.cartValue || 0,
-        options.meta || {}
-      );
-
-    if (!decision) {
-      return null;
-    }
-
-    if (
-      Array.isArray(
-        decision.rules
-      )
-    ) {
-
-      applyRules(
-        decision.rules
-      );
-
+    if (Array.isArray(decision.rules)) {
+      applyRules(decision.rules);
     } else {
-
-      switch (
-        decision.action
-      ) {
-
+      switch (decision.action) {
         case "INCENTIVE_HIGH":
-
           injectBanner(`
             <strong>Special Offer</strong><br/>
             Unlock premium savings today.
           `);
-
           break;
-
         case "INCENTIVE_MED":
-
-          updateText(
-            options.ctaSelector ||
-              "button",
-
-            "Claim Offer"
-          );
-
+          updateText(options.ctaSelector || "button", "Claim Offer");
           break;
-
         case "INCENTIVE_LOW":
-
-          updateText(
-            options.ctaSelector ||
-              "button",
-
-            "Continue"
-          );
-
+          updateText(options.ctaSelector || "button", "Continue");
           break;
       }
     }
 
-    if (
-      decision.decision_id
-    ) {
-
-      await action(
-        decision.decision_id
-      );
+    if (decision.decision_id) {
+      await action(decision.decision_id);
     }
 
     return decision;
@@ -620,74 +351,45 @@
   ───────────────────────────────────────────── */
 
   function setupPageTracking() {
-
-    if (
-      !config.autoPageview
-    ) {
-      return;
-    }
-
+    if (!config.autoPageview) return;
     track("pageview", {
-      referrer:
-        document.referrer ||
-        null,
+      referrer: document.referrer || null,
     });
   }
 
   function setupClickTracking() {
-
-    if (!config.autoTrack) {
-      return;
-    }
-
-    document.addEventListener(
-      "click",
-
-      function (e) {
-
-        const el = e.target;
-
-        if (!el) return;
-
-        track("click", {
-          tag:
-            el.tagName || null,
-
-          id:
-            el.id || null,
-
-          class:
-            el.className || null,
-
-          text:
-            (
-              el.innerText || ""
-            )
-              .trim()
-              .slice(0, 120),
-        });
-
-      },
-
-      true
-    );
+    if (!config.autoTrack) return;
+    document.addEventListener("click", function (e) {
+      const el = e.target;
+      if (!el) return;
+      
+      track("click", {
+        tag: el.tagName || null,
+        id: el.id || null,
+        class: el.className || null,
+        text: (el.innerText || "").trim().slice(0, 120),
+      });
+    }, true);
   }
 
   function setupUnloadTracking() {
+    const handleSessionEnd = () => {
+      track(
+        "session_end",
+        { duration: now() - state.pageStart },
+        { keepalive: true } // Crucial for reliable exit tracking
+      );
+    };
 
-    window.addEventListener(
-      "beforeunload",
+    // Standard desktop close/refresh
+    window.addEventListener("beforeunload", handleSessionEnd);
 
-      function () {
-
-        track("session_end", {
-          duration:
-            now() -
-            state.pageStart,
-        });
-
+    // Modern mobile visibility handling (iOS Safari)
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        handleSessionEnd();
       }
-    );
+    });
   }
 
   /* ─────────────────────────────────────────────
@@ -702,60 +404,32 @@
      INIT
   ───────────────────────────────────────────── */
 
-  function init(
-    userConfig = {}
-  ) {
-
-    if (
-      state.initialized
-    ) {
-
-      warn(
-        "already initialized"
-      );
-
+  function init(userConfig = {}) {
+    if (state.initialized) {
+      warn("already initialized");
       return api;
     }
 
-    const scriptConfig =
-      getScriptConfig();
-
+    const scriptConfig = getScriptConfig();
     config = {
       ...DEFAULTS,
       ...scriptConfig,
       ...userConfig,
     };
 
-    if (!config.siteId) {
-      warn("missing siteId");
-    }
-
-    if (!config.apiKey) {
-      warn("missing apiKey");
-    }
+    if (!config.siteId) warn("missing siteId");
+    if (!config.apiKey) warn("missing apiKey");
 
     ensureSession();
-
     setupPageTracking();
-
     setupClickTracking();
-
     setupUnloadTracking();
 
     state.initialized = true;
+    log("SDK initialized", SDK_VERSION);
 
-    log(
-      "SDK initialized",
-      SDK_VERSION
-    );
-
-    if (
-      config.autoOptimize
-    ) {
-
-      optimize().catch(
-        () => {}
-      );
+    if (config.autoOptimize) {
+      optimize().catch(() => {});
     }
 
     return api;
@@ -766,43 +440,26 @@
   ───────────────────────────────────────────── */
 
   const api = {
-    version:
-      SDK_VERSION,
-
+    version: SDK_VERSION,
     init,
-
     track,
-
     score,
-
     action,
-
     outcome,
-
     optimize,
-
     metrics,
-
     applyRule,
-
     applyRules,
-
     updateText,
-
     updateHTML,
-
     addClass,
-
     injectBanner,
-
     getSession() {
       return state.sessionId;
     },
-
     getDecision() {
       return state.activeDecision;
     },
-
     getConfig() {
       return config;
     },
@@ -818,17 +475,10 @@
      AUTO INIT
   ───────────────────────────────────────────── */
 
-  const autoConfig =
-    getScriptConfig();
+  const autoConfig = getScriptConfig();
 
-  if (
-    autoConfig.siteId &&
-    autoConfig.apiKey
-  ) {
-
-    window.Reden.init(
-      autoConfig
-    );
+  if (autoConfig.siteId && autoConfig.apiKey) {
+    window.Reden.init(autoConfig);
   }
 
 })(window, document);
