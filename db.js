@@ -17,19 +17,19 @@ export const db = new Pool({
 ───────────────────────────── */
 export async function initDB() {
   try {
-
     /* DECISIONS TABLE */
     await db.query(`
       CREATE TABLE IF NOT EXISTS decisions (
         id SERIAL PRIMARY KEY,
         session_id TEXT NOT NULL,
-        cart_id TEXT NOT NULL,
+        cart_id TEXT,
         action TEXT NOT NULL,
         discount NUMERIC DEFAULT 0,
         expected_value NUMERIC DEFAULT 0,
         converted BOOLEAN DEFAULT false,
         revenue NUMERIC DEFAULT 0,
         state TEXT NOT NULL,
+        completed_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
@@ -40,6 +40,50 @@ export async function initDB() {
         action TEXT PRIMARY KEY,
         pulls INTEGER DEFAULT 0,
         rewards NUMERIC DEFAULT 0
+      )
+    `);
+
+    /* EVENT LOGS TABLE (Missing from original) */
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS event_logs (
+        id SERIAL PRIMARY KEY,
+        event_id TEXT UNIQUE NOT NULL,
+        site_id VARCHAR(50) NOT NULL,
+        session_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        payload JSONB,
+        ip_address TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    /* RECOVERY QUEUE TABLE (Missing from original) */
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS recovery_queue (
+        id SERIAL PRIMARY KEY,
+        site_id VARCHAR(50) NOT NULL,
+        session_id TEXT NOT NULL,
+        customer_email TEXT NOT NULL,
+        cart_data JSONB,
+        incentive TEXT,
+        status TEXT DEFAULT 'PENDING',
+        processed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(session_id, customer_email)
+      )
+    `);
+
+    /* EMAIL LOGS TABLE (Missing from original) */
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS email_logs (
+        id SERIAL PRIMARY KEY,
+        site_id VARCHAR(50) NOT NULL,
+        email_type TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        subject TEXT,
+        status TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
       )
     `);
 
@@ -54,8 +98,7 @@ export async function initDB() {
       ON CONFLICT (action) DO NOTHING
     `);
 
-    console.log("[DB] initialized");
-
+    console.log("[DB] initialized all tables");
   } catch (e) {
     console.error("[DB INIT ERROR]", e.message);
   }
