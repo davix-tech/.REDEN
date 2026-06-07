@@ -10,10 +10,10 @@ import helmet from "helmet";
 import compression from "compression";
 import rateLimit from "express-rate-limit";
 
-import { db, initDB } from "./db.js";
-import { pickAction, updateBandit } from "./bandit.js";
-import { initRedis, redis } from "./redis.js";
-import { sendDailyReport, sendRecoveryEmail } from "./email.js";
+import { db, initDB } from "../infrastructure/db.js";
+import { pickAction, updateBandit } from "../optimization/banditEngine.js";
+import { initRedis, redis } from "../infrastructure/redis.js";
+import { sendDailyReport, sendRecoveryEmail } from "../notification/emailEngine.js";
 
 dotenv.config();
 
