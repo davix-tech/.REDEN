@@ -1,4 +1,4 @@
-import { db } from "./db.js";
+import { db } from "../infrastructure/db.js";
 
 const ACTIONS = [
   "NONE",
