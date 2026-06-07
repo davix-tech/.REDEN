@@ -2,9 +2,9 @@
   "name": "reden",
   "version": "1.0.0",
   "type": "module",
-  "main": "reden.js",
+  "main": "orchestrator/reden.js",
   "scripts": {
-    "start": "node reden.js"
+    "start": "node orchestrator/reden.js"
   },
   "engines": {
     "node": ">=18"
