@@ -1,16 +1,22 @@
 /**
- * REDEN Intent Engine v1
+ * REDEN Intent Engine v2
+ * Adaptive Revenue Intent System
  *
- * Returns:
+ * Output:
  * {
  *   score: 0-100,
- *   level: LOW | MEDIUM | HIGH,
- *   factors: {}
+ *   state: BROWSING | EXPLORING | CONSIDERING | HIGH_INTENT | BUY_READY,
+ *   actions: string[],
+ *   signals: object
  * }
  */
 
+function clamp(value, min = 0, max = 1) {
+  return Math.max(min, Math.min(max, value));
+}
+
 export function calculateIntent(session = {}) {
-  let score = 0;
+  const now = Date.now();
 
   const {
     pageViews = 0,
@@ -20,62 +26,165 @@ export function calculateIntent(session = {}) {
     purchased = false,
     cartValue = 0,
     timeOnSite = 0, // seconds
-    returnVisits = 0
+    returnVisits = 0,
+
+    // NEW (important for adaptiveness)
+    lastActivityTimestamp = now,
+    repeatProductSwitching = 0,
+    cartAbandonments = 0,
+    checkoutBounce = false
   } = session;
 
-  // Page engagement
-  score += Math.min(pageViews * 1, 10);
+  /**
+   * -------------------------
+   * 1. Normalized Signals
+   * -------------------------
+   */
+  const norm = {
+    engagement: clamp(pageViews / 10),
+    productInterest: clamp(productViews / 8),
+    cartEngagement: clamp(addToCartCount / 3),
+    checkoutSignal: checkoutStarted ? 1 : 0,
+    cartStrength: clamp(cartValue / 200),
+    loyalty: clamp(returnVisits / 5)
+  };
 
-  // Product interest
-  score += Math.min(productViews * 3, 20);
+  /**
+   * -------------------------
+   * 2. Velocity (intent speed)
+   * -------------------------
+   */
+  const velocity = clamp(
+    (productViews + addToCartCount * 2 + (checkoutStarted ? 3 : 0)) /
+      Math.max(timeOnSite / 60, 1),
+    0,
+    1
+  );
 
-  // Cart actions
-  score += Math.min(addToCartCount * 10, 20);
+  /**
+   * -------------------------
+   * 3. Recency Decay
+   * -------------------------
+   */
+  const timeSinceLastAction = (now - lastActivityTimestamp) / 1000; // seconds
+  const recencyFactor = Math.exp(-timeSinceLastAction / 600); // ~10 min decay window
 
-  // Checkout intent
-  if (checkoutStarted) {
-    score += 25;
-  }
+  /**
+   * -------------------------
+   * 4. Friction (intent reduction)
+   * -------------------------
+   */
+  const friction =
+    repeatProductSwitching * 0.15 +
+    cartAbandonments * 0.35 +
+    (checkoutBounce ? 0.5 : 0);
 
-  // Cart value influence
-  if (cartValue >= 50) score += 5;
-  if (cartValue >= 100) score += 5;
-  if (cartValue >= 250) score += 5;
+  /**
+   * -------------------------
+   * 5. Base Intent Score (non-linear)
+   * -------------------------
+   */
+  let intentRaw =
+    norm.engagement * 0.15 +
+    norm.productInterest * 0.25 +
+    norm.cartEngagement * 0.3 +
+    norm.checkoutSignal * 0.4 +
+    norm.cartStrength * 0.2 +
+    norm.loyalty * 0.1;
 
-  // Session duration
-  if (timeOnSite >= 60) score += 5;
-  if (timeOnSite >= 180) score += 5;
-  if (timeOnSite >= 300) score += 5;
+  /**
+   * Amplification layer (key differentiator)
+   */
+  intentRaw *= 0.6 + velocity * 0.6;
+  intentRaw *= recencyFactor;
 
-  // Returning visitors
-  score += Math.min(returnVisits * 3, 10);
+  /**
+   * Apply friction penalty
+   */
+  intentRaw -= friction;
 
-  // Already purchased
-  if (purchased) {
-    score = 100;
-  }
+  /**
+   * If purchase happened → force max intent
+   */
+  if (purchased) intentRaw = 1;
 
-  score = Math.max(0, Math.min(100, Math.round(score)));
+  intentRaw = clamp(intentRaw, 0, 1);
 
-  let level = "LOW";
+  const score = Math.round(intentRaw * 100);
 
-  if (score >= 70) {
-    level = "HIGH";
+  /**
+   * -------------------------
+   * 6. Intent State Machine
+   * -------------------------
+   */
+  let state = "BROWSING";
+
+  if (score >= 85 || checkoutStarted) {
+    state = "BUY_READY";
+  } else if (score >= 65) {
+    state = "HIGH_INTENT";
   } else if (score >= 40) {
-    level = "MEDIUM";
+    state = "CONSIDERING";
+  } else if (score >= 20) {
+    state = "EXPLORING";
   }
+
+  /**
+   * -------------------------
+   * 7. Action Engine (core REDEN value)
+   * -------------------------
+   */
+  const actions = getActions(state);
 
   return {
     score,
-    level,
-    factors: {
-      pageViews,
-      productViews,
-      addToCartCount,
-      checkoutStarted,
-      cartValue,
-      timeOnSite,
-      returnVisits
+    state,
+    actions,
+    signals: {
+      norm,
+      velocity,
+      recencyFactor,
+      friction
     }
   };
+}
+
+/**
+ * -------------------------
+ * 8. Action Mapping Layer
+ * -------------------------
+ */
+function getActions(state) {
+  switch (state) {
+    case "BUY_READY":
+      return [
+        "trigger_checkout_reminder",
+        "apply_dynamic_discount",
+        "priority_email_recovery"
+      ];
+
+    case "HIGH_INTENT":
+      return [
+        "show_urgency_banner",
+        "cart_nudge",
+        "social_proof_popup"
+      ];
+
+    case "CONSIDERING":
+      return [
+        "recommend_similar_products",
+        "comparison_module",
+        "email_capture"
+      ];
+
+    case "EXPLORING":
+      return [
+        "personalized_recommendations"
+      ];
+
+    default:
+      return [
+        "collect_behavior_data"
+      ];
+  }
     }
