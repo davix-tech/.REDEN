@@ -20,7 +20,11 @@ dotenv.config();
 /* ─────────────────────────────────────────────
 ENV VALIDATION
 ───────────────────────────────────────────── */
-const requiredEnv = ["DATABASE_URL", "ADMIN_SECRET"];
+const requiredEnv = [
+  "DATABASE_URL",
+  "ADMIN_SECRET",
+  "PAYSTACK_SECRET_KEY"
+];
 for (const key of requiredEnv) {
   if (!process.env[key]) throw new Error(`Missing mandatory environment variable: ${key}`);
 }
@@ -108,8 +112,15 @@ app.use(generalLimiter);
 
 /* ─────────────────────────────────────────────
 BODY PARSING
-───────────────────────────────────────────── */
-app.use(express.json({ limit: "1mb" }));
+───────────────────────────────────────────── */app.use(
+ app.use(
+  express.json({
+    limit: "1mb",
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString();
+    }
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 app.use(timeout("15s"));
 
@@ -179,8 +190,13 @@ AUTH
 ───────────────────────────────────────────── */
 async function authenticate(req, res, next) {
   try {
-    if (isPublic(req.path) || req.path === "/api/v1/onboard") return next();
-
+    if (
+  isPublic(req.path) ||
+  req.path === "/api/v1/onboard" ||
+  req.path === "/paystack"
+) {
+  return next();
+    }
     const apiKey = req.headers["x-api-key"] || req.body?.api_key;
     const siteId = req.headers["x-site-id"] || req.body?.site_id;
 
@@ -224,7 +240,13 @@ async function authenticate(req, res, next) {
 app.use(authenticate);
 
 app.use((req, res, next) => {
-  if (isPublic(req.path) || req.path === "/api/v1/onboard") return next();
+if (
+  isPublic(req.path) ||
+  req.path === "/api/v1/onboard" ||
+  req.path === "/paystack"
+) {
+  return next();
+}
   if (!req.site?.site_id)
     return res.status(401).json(failure("invalid_site_context"));
   next();
@@ -630,7 +652,80 @@ cron.schedule(
   },
   { timezone: "UTC" }
 );
+/* ─────────────────────────────────────────────
+PAYSTACK WEBHOOK
+───────────────────────────────────────────── */
+app.post("/paystack", async (req, res) => {
+  res.sendStatus(200);
 
+  try {
+    const signature = req.headers["x-paystack-signature"];
+
+    const hash = crypto
+      .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
+      .update(req.rawBody)
+      .digest("hex");
+
+    if (signature !== hash) {
+      console.log("[PAYSTACK] Invalid signature");
+      return;
+    }
+
+    const event = req.body;
+
+    if (event.event !== "charge.success") {
+      return;
+    }
+
+    const customerEmail = event.data.customer.email;
+
+    const existing = await db.query(
+      `SELECT id
+       FROM sites
+       WHERE owner_email=$1
+       LIMIT 1`,
+      [customerEmail]
+    );
+
+    if (existing.rowCount > 0) {
+      console.log(
+        `[PAYSTACK] Existing customer ${customerEmail}`
+      );
+      return;
+    }
+
+    const siteId =
+      "site_" + crypto.randomBytes(8).toString("hex");
+
+    const apiKey =
+      "rd_" + crypto.randomBytes(24).toString("hex");
+
+    await db.query(
+      `INSERT INTO sites
+       (site_id, api_key, name, owner_email, active)
+       VALUES ($1,$2,$3,$4,true)`,
+      [
+        siteId,
+        apiKey,
+        "REDEN Customer",
+        customerEmail
+      ]
+    );
+
+    console.log(
+      `[PAYSTACK] Account created for ${customerEmail}`
+    );
+  } catch (err) {
+    console.error("[PAYSTACK ERROR]", err);
+  }
+});
+
+app.get("/paystack", (req, res) => {
+  res.json({
+    ok: true,
+    service: "paystack_webhook"
+  });
+});
 /* ─────────────────────────────────────────────
 ERROR HANDLING
 ───────────────────────────────────────────── */
