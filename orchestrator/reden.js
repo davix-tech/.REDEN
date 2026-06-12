@@ -653,12 +653,7 @@ cron.schedule(
   { timezone: "UTC" }
 );
 
-/* ─────────────────────────────────────────────
-PAYSTACK WEBHOOK
-───────────────────────────────────────────── */
 app.post("/paystack", async (req, res) => {
-  res.sendStatus(200);
-
   try {
     const signature = req.headers["x-paystack-signature"];
 
@@ -667,57 +662,137 @@ app.post("/paystack", async (req, res) => {
       .update(req.rawBody)
       .digest("hex");
 
-    if (signature !== hash) {
+    if (!signature || signature !== hash) {
       console.log("[PAYSTACK] Invalid signature");
-      return;
+      return res.sendStatus(200);
     }
 
     const event = req.body;
 
     if (event.event !== "charge.success") {
-      return;
+      return res.sendStatus(200);
     }
 
-    const customerEmail = event.data.customer.email;
+    const customerEmail = event?.data?.customer?.email;
+    const eventId = event?.data?.id || event?.data?.reference;
 
+    if (!customerEmail) {
+      console.log("[PAYSTACK] Missing email");
+      return res.sendStatus(200);
+    }
+
+    // ─────────────────────────────────────
+    // 1. IDEMPOTENCY CHECK (critical)
+    // ─────────────────────────────────────
+    const alreadyProcessed = await db.query(
+      `SELECT id FROM email_logs
+       WHERE email_type='PAYSTACK_EVENT'
+       AND recipient=$1
+       AND subject=$2
+       LIMIT 1`,
+      [customerEmail, eventId]
+    );
+
+    if (alreadyProcessed.rowCount > 0) {
+      console.log(`[PAYSTACK] Duplicate event ignored: ${customerEmail}`);
+      return res.sendStatus(200);
+    }
+
+    // ─────────────────────────────────────
+    // 2. FIND OR CREATE TENANT
+    // ─────────────────────────────────────
     const existing = await db.query(
-      `SELECT id
+      `SELECT id, site_id, api_key
        FROM sites
        WHERE owner_email=$1
        LIMIT 1`,
       [customerEmail]
     );
 
+    let siteId;
+    let apiKey;
+
     if (existing.rowCount > 0) {
-      console.log(
-        `[PAYSTACK] Existing customer ${customerEmail}`
+      siteId = existing.rows[0].site_id;
+      apiKey = existing.rows[0].api_key;
+
+      await db.query(
+        `UPDATE sites
+         SET subscription_status='active'
+         WHERE owner_email=$1`,
+        [customerEmail]
       );
-      return;
+
+      console.log(`[PAYSTACK] Existing customer reused: ${customerEmail}`);
+    } else {
+      siteId = "site_" + crypto.randomBytes(8).toString("hex");
+      apiKey = "rd_" + crypto.randomBytes(24).toString("hex");
+
+      await db.query(
+        `INSERT INTO sites
+         (site_id, api_key, name, owner_email, active, plan, subscription_status)
+         VALUES ($1,$2,$3,$4,true,'basic','active')`,
+        [siteId, apiKey, "REDEN Customer", customerEmail]
+      );
+
+      console.log(`[PAYSTACK] New tenant created: ${customerEmail}`);
     }
 
-    const siteId =
-      "site_" + crypto.randomBytes(8).toString("hex");
-
-    const apiKey =
-      "rd_" + crypto.randomBytes(24).toString("hex");
-
+    // ─────────────────────────────────────
+    // 3. LOG PAYSTACK EVENT
+    // ─────────────────────────────────────
     await db.query(
-      `INSERT INTO sites
-       (site_id, api_key, name, owner_email, active)
-       VALUES ($1,$2,$3,$4,true)`,
-      [
-        siteId,
-        apiKey,
-        "REDEN Customer",
-        customerEmail
-      ]
+      `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
+       VALUES ($1,'PAYSTACK_EVENT',$2,$3,'RECEIVED')`,
+      [siteId, customerEmail, eventId]
     );
 
-    console.log(
-      `[PAYSTACK] Account created for ${customerEmail}`
-    );
+    // ─────────────────────────────────────
+    // 4. SEND WELCOME EMAIL
+    // ─────────────────────────────────────
+    try {
+      const emailAlreadySent = await db.query(
+        `SELECT id FROM email_logs
+         WHERE email_type='WELCOME'
+         AND recipient=$1
+         LIMIT 1`,
+        [customerEmail]
+      );
+
+      if (emailAlreadySent.rowCount === 0) {
+        await sendWelcomeEmail({
+          to: customerEmail,
+          siteId,
+          apiKey,
+          plan: "basic"
+        });
+
+        await db.query(
+          `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
+           VALUES ($1,'WELCOME',$2,'Your REDEN API is Ready','SENT')`,
+          [siteId, customerEmail]
+        );
+
+        console.log(`[PAYSTACK] Welcome email sent: ${customerEmail}`);
+      } else {
+        console.log(`[PAYSTACK] Welcome email skipped: ${customerEmail}`);
+      }
+    } catch (emailErr) {
+      console.error("[PAYSTACK] Email failed:", emailErr.message);
+
+      await db.query(
+        `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
+         VALUES ($1,'WELCOME',$2,'Your REDEN API is Ready','FAILED')`,
+        [siteId, customerEmail]
+      );
+    }
+
+    console.log(`[PAYSTACK] Provisioning complete: ${customerEmail}`);
+
+    return res.sendStatus(200);
   } catch (err) {
     console.error("[PAYSTACK ERROR]", err);
+    return res.sendStatus(200);
   }
 });
 
@@ -727,7 +802,6 @@ app.get("/paystack", (req, res) => {
     service: "paystack_webhook"
   });
 });
-
 /* ─────────────────────────────────────────────
 ERROR HANDLING
 ───────────────────────────────────────────── */
