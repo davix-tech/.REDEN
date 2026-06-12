@@ -180,10 +180,10 @@ STATIC ASSET HANDLING & EXPLICIT ROUTES
 ───────────────────────────────────────────── */
 app.get("/sdk.js", (req, res) => {
   res.type("application/javascript");
-  res.sendFile(path.join(__dirname, "public", "sdk.js"));
+  res.sendFile(path.join(__dirname, "..", "public", "sdk.js"));
 });
 
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "..", "public")));
 
 /* ─────────────────────────────────────────────
 AUTH
