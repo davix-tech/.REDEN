@@ -15,6 +15,9 @@ import { pickAction, updateBandit } from "../optimization/banditEngine.js";
 import { initRedis, redis } from "../infrastructure/redis.js";
 import { sendDailyReport, sendRecoveryEmail } from "../notification/emailEngine.js";
 
+// ✔ FIX 1: Explicit Import Added Cleanly
+import paystackRoutes from "./routes/paystack.js";
+
 dotenv.config();
 
 /* ─────────────────────────────────────────────
@@ -30,7 +33,7 @@ for (const key of requiredEnv) {
 }
 
 /* ─────────────────────────────────────────────
-INITIALIZATION
+INITIALIZATION & INDEX OPTIMIZATION
 ───────────────────────────────────────────── */
 await initDB();
 
@@ -43,12 +46,21 @@ try {
       name VARCHAR(100) NOT NULL,
       owner_email VARCHAR(255),
       active BOOLEAN DEFAULT true,
+      plan VARCHAR(50) DEFAULT 'basic',
+      subscription_status VARCHAR(50) DEFAULT 'inactive',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
-  console.log("[DB INIT] 'sites' table verified.");
+  
+  // ⚠️ FIX 5: High-Performance Composite Index Setup
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_email_logs_lookup
+    ON email_logs(email_type, recipient, subject);
+  `);
+  
+  console.log("[DB INIT] Core architecture tables & optimization indexes verified.");
 } catch (err) {
-  console.error("[DB INIT ERROR] Failed to auto-create tables:", err);
+  console.error("[DB INIT ERROR] Failed to auto-create schema infrastructures:", err);
 }
 
 await initRedis();
@@ -131,7 +143,7 @@ const haltOnTimeout = (req, res, next) => {
 app.use(haltOnTimeout);
 
 /* ─────────────────────────────────────────────
-UTILS
+UTILS & GLOBAL ROUTE GUARDS
 ───────────────────────────────────────────── */
 const success = (data = {}) => ({
   ok: true,
@@ -171,9 +183,14 @@ const VALID_EVENTS = new Set([
   "BEHAVIOR"
 ]);
 
-const PUBLIC_ROUTES = ["/", "/health", "/sdk.js"];
-const isPublic = (p) =>
-  PUBLIC_ROUTES.includes(p) || /\.(png|jpg|jpeg|svg|css|js)$/i.test(p);
+const isPublicAsset = (p) =>
+  ["/", "/health", "/sdk.js"].includes(p) || /\.(png|jpg|jpeg|svg|css|js)$/i.test(p);
+
+// ⚠️ FIX 2: Deduplicated Global Authentication Bypass Check
+const isPublicRoute = (req) =>
+  isPublicAsset(req.path) ||
+  req.path === "/api/v1/onboard" ||
+  req.path.startsWith("/paystack");
 
 /* ─────────────────────────────────────────────
 STATIC ASSET HANDLING & EXPLICIT ROUTES
@@ -186,15 +203,11 @@ app.get("/sdk.js", (req, res) => {
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 /* ─────────────────────────────────────────────
-AUTH
+AUTH MIDDLEWARE
 ───────────────────────────────────────────── */
 async function authenticate(req, res, next) {
   try {
-    if (
-      isPublic(req.path) ||
-      req.path === "/api/v1/onboard" ||
-      req.path === "/paystack"
-    ) {
+    if (isPublicRoute(req)) {
       return next();
     }
     const apiKey = req.headers["x-api-key"] || req.body?.api_key;
@@ -240,11 +253,7 @@ async function authenticate(req, res, next) {
 app.use(authenticate);
 
 app.use((req, res, next) => {
-  if (
-    isPublic(req.path) ||
-    req.path === "/api/v1/onboard" ||
-    req.path === "/paystack"
-  ) {
+  if (isPublicRoute(req)) {
     return next();
   }
   if (!req.site?.site_id)
@@ -255,19 +264,15 @@ app.use((req, res, next) => {
 app.use(haltOnTimeout);
 
 /* ─────────────────────────────────────────────
-ROUTES
+CORE ENGINE ROUTES
 ───────────────────────────────────────────── */
 app.get("/", (req, res) => {
-  res.json(success({ service: "REDEN", status: "operational", redis: !!redis }));
+  res.json(success({ service: "REDEN API", status: "operational", redis: !!redis }));
 });
 
 app.get("/health", async (req, res) => {
   let dbStatus = "healthy";
-  try {
-    await db.query("SELECT 1");
-  } catch {
-    dbStatus = "unhealthy";
-  }
+  try { await db.query("SELECT 1"); } catch { dbStatus = "unhealthy"; }
 
   const payload = success({
     uptime: process.uptime(),
@@ -275,9 +280,7 @@ app.get("/health", async (req, res) => {
     database: dbStatus
   });
 
-  return dbStatus === "healthy"
-    ? res.json(payload)
-    : res.status(503).json(payload);
+  return dbStatus === "healthy" ? res.json(payload) : res.status(503).json(payload);
 });
 
 /* ─────────────────────────────────────────────
@@ -291,15 +294,14 @@ app.post("/api/v1/onboard", async (req, res) => {
     }
 
     const { name, owner_email } = req.body;
-    if (!name || !owner_email)
-      return res.status(400).json(failure("missing_fields"));
+    if (!name || !owner_email) return res.status(400).json(failure("missing_fields"));
 
     const siteId = `site_${crypto.randomBytes(8).toString("hex")}`;
     const apiKey = `rd_${crypto.randomBytes(24).toString("hex")}`;
 
     await db.query(
-      `INSERT INTO sites(site_id, api_key, name, owner_email, active)
-       VALUES ($1,$2,$3,$4,true)`,
+      `INSERT INTO sites(site_id, api_key, name, owner_email, active, plan, subscription_status)
+       VALUES ($1,$2,$3,$4,true,'basic','active')`,
       [siteId, apiKey, name, owner_email]
     );
 
@@ -311,46 +313,31 @@ app.post("/api/v1/onboard", async (req, res) => {
 });
 
 /* ─────────────────────────────────────────────
-EVENTS
+MAB TELEMETRY EVENTS
 ───────────────────────────────────────────── */
 app.post("/event", async (req, res) => {
   try {
     const { session_id, event, payload, event_id } = req.body;
 
-    if (!session_id || !event)
-      return res.status(400).json(failure("missing_fields"));
+    if (!session_id || !event) return res.status(400).json(failure("missing_fields"));
 
     const normalizedEvent = event.toUpperCase();
-    if (!VALID_EVENTS.has(normalizedEvent))
-      return res.status(400).json(failure("invalid_event"));
+    if (!VALID_EVENTS.has(normalizedEvent)) return res.status(400).json(failure("invalid_event"));
 
     const safeEventId = event_id || `evt_${crypto.randomUUID()}`;
-
     const safePayload = JSON.stringify(payload || {});
     const safeCart = JSON.stringify(payload?.cart || {});
 
-    if (
-      Buffer.byteLength(safeCart) > 20000 ||
-      Buffer.byteLength(safePayload) > 50000
-    ) {
+    if (Buffer.byteLength(safeCart) > 20000 || Buffer.byteLength(safePayload) > 50000) {
       return res.status(413).json(failure("payload_bounds_exceeded"));
     }
 
-    const clientIp =
-      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
+    const clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
 
     await db.query(
       `INSERT INTO event_logs(event_id, site_id, session_id, event, payload, ip_address, user_agent)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [
-        safeEventId,
-        req.site.site_id,
-        session_id,
-        normalizedEvent,
-        safePayload,
-        clientIp,
-        req.headers["user-agent"]
-      ]
+      [safeEventId, req.site.site_id, session_id, normalizedEvent, safePayload, clientIp, req.headers["user-agent"]]
     );
 
     if (normalizedEvent === "CHECKOUT_STARTED" && payload?.email) {
@@ -369,81 +356,42 @@ app.post("/event", async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────────
-SCORE
-───────────────────────────────────────────── */
 app.post("/score", async (req, res) => {
   try {
     const { session_id, cart_id, cart_value, payload } = req.body;
-
-    if (!session_id)
-      return res.status(400).json(failure("missing_session_id"));
+    if (!session_id) return res.status(400).json(failure("missing_session_id"));
 
     const value = validateNumber(cart_value);
-    if (value === null)
-      return res.status(400).json(failure("invalid_cart_value"));
+    if (value === null) return res.status(400).json(failure("invalid_cart_value"));
 
-    const action =
-      (await pickAction({
-        session_id,
-        cart_value: value,
-        behavior: payload || {}
-      })) || "NONE";
-
-    const discountMap = {
-      NONE: 0,
-      INCENTIVE_LOW: 5,
-      INCENTIVE_MED: 10,
-      INCENTIVE_HIGH: 20
-    };
-
+    const action = (await pickAction({ session_id, cart_value: value, behavior: payload || {} })) || "NONE";
+    const discountMap = { NONE: 0, INCENTIVE_LOW: 5, INCENTIVE_MED: 10, INCENTIVE_HIGH: 20 };
     const discount = discountMap[action] || 0;
 
     const result = await db.query(
       `INSERT INTO decisions(site_id, session_id, cart_id, action, discount, expected_value, state)
-       VALUES ($1,$2,$3,$4,$5,$6,'SCORED')
-       RETURNING id`,
-      [
-        req.site.site_id,
-        session_id,
-        cart_id || null,
-        action,
-        discount,
-        Math.max(0, value - discount)
-      ]
+       VALUES ($1,$2,$3,$4,$5,$6,'SCORED') RETURNING id`,
+      [req.site.site_id, session_id, cart_id || null, action, discount, Math.max(0, value - discount)]
     );
 
-    res.json(
-      success({
-        decision_id: result.rows[0].id,
-        action,
-        discount,
-        propensity_score: payload?.scroll_depth
-          ? payload.scroll_depth / 100
-          : 0.5
-      })
-    );
+    res.json(success({
+      decision_id: result.rows[0].id,
+      action,
+      discount,
+      propensity_score: payload?.scroll_depth ? payload.scroll_depth / 100 : 0.5
+    }));
   } catch (e) {
     console.error(e);
     res.status(500).json(failure("score_failed"));
   }
 });
 
-/* ─────────────────────────────────────────────
-ACTION
-───────────────────────────────────────────── */
 app.post("/action", async (req, res) => {
   try {
     const { decision_id } = req.body;
+    if (!decision_id) return res.status(400).json(failure("missing_decision_id"));
 
-    if (!decision_id)
-      return res.status(400).json(failure("missing_decision_id"));
-
-    const r = await db.query(
-      `UPDATE decisions SET state='ACTIONED' WHERE id=$1 AND site_id=$2`,
-      [decision_id, req.site.site_id]
-    );
-
+    const r = await db.query(`UPDATE decisions SET state='ACTIONED' WHERE id=$1 AND site_id=$2`, [decision_id, req.site.site_id]);
     if (!r.rowCount) return res.status(404).json(failure("not_found"));
 
     res.json(success({ actioned: true }));
@@ -453,38 +401,23 @@ app.post("/action", async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────────
-OUTCOME
-───────────────────────────────────────────── */
 app.post("/outcome", async (req, res) => {
   try {
     const { decision_id, converted, revenue } = req.body;
-
-    if (!decision_id)
-      return res.status(400).json(failure("missing_decision_id"));
+    if (!decision_id) return res.status(400).json(failure("missing_decision_id"));
 
     const revenueValue = validateNumber(revenue);
+    const existing = await db.query(`SELECT action, state FROM decisions WHERE id=$1 AND site_id=$2`, [decision_id, req.site.site_id]);
 
-    const existing = await db.query(
-      `SELECT action, state FROM decisions WHERE id=$1 AND site_id=$2`,
-      [decision_id, req.site.site_id]
-    );
-
-    if (!existing.rowCount)
-      return res.status(404).json(failure("not_found"));
-
-    if (existing.rows[0].state === "COMPLETED")
-      return res.status(409).json(failure("already_done"));
+    if (!existing.rowCount) return res.status(404).json(failure("not_found"));
+    if (existing.rows[0].state === "COMPLETED") return res.status(409).json(failure("already_done"));
 
     await db.query(
-      `UPDATE decisions
-       SET state='COMPLETED', converted=$1, revenue=$2, completed_at=NOW()
-       WHERE id=$3 AND site_id=$4`,
+      `UPDATE decisions SET state='COMPLETED', converted=$1, revenue=$2, completed_at=NOW() WHERE id=$3 AND site_id=$4`,
       [!!converted, revenueValue || 0, decision_id, req.site.site_id]
     );
 
     await updateBandit(existing.rows[0].action, !!converted);
-
     res.json(success({ updated: true }));
   } catch (e) {
     console.error(e);
@@ -492,29 +425,14 @@ app.post("/outcome", async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────────
-METRICS
-───────────────────────────────────────────── */
 app.get("/metrics", async (req, res) => {
   try {
     const r = await db.query(
-      `SELECT COUNT(*) total,
-              COUNT(*) FILTER (WHERE converted=true) conversions,
-              COALESCE(SUM(revenue),0) revenue
-       FROM decisions
-       WHERE site_id=$1 AND state='COMPLETED'`,
-      [req.site.site_id]
+      `SELECT COUNT(*) total, COUNT(*) FILTER (WHERE converted=true) conversions, COALESCE(SUM(revenue),0) revenue
+       FROM decisions WHERE site_id=$1 AND state='COMPLETED'`, [req.site.site_id]
     );
-
     const row = r.rows[0];
-
-    res.json(
-      success({
-        total: Number(row.total),
-        conversions: Number(row.conversions),
-        revenue: Number(row.revenue)
-      })
-    );
+    res.json(success({ total: Number(row.total), conversions: Number(row.conversions), revenue: Number(row.revenue) }));
   } catch (e) {
     console.error(e);
     res.status(500).json(failure("metrics_failed"));
@@ -522,286 +440,79 @@ app.get("/metrics", async (req, res) => {
 });
 
 /* ─────────────────────────────────────────────
-CRON
+   ISOLATED PAYSTACK WEBHOOK ROUTE MOUNT
+───────────────────────────────────────────── */
+app.use("/paystack", paystackRoutes);
+
+/* ─────────────────────────────────────────────
+CRON SYSTEM ENGINE
 ───────────────────────────────────────────── */
 cron.schedule("*/15 * * * *", async () => {
   if (!db || typeof db.connect !== "function") return;
-
   const client = await db.connect();
   let claimed = [];
 
   try {
     await client.query("BEGIN");
-
     const batch = await client.query(`
-      UPDATE recovery_queue
-      SET status='PROCESSING'
-      WHERE id IN (
-        SELECT id FROM recovery_queue
-        WHERE status='PENDING'
-          AND created_at >= NOW() - INTERVAL '7 days'
-        FOR UPDATE SKIP LOCKED
-        LIMIT 20
-      )
+      UPDATE recovery_queue SET status='PROCESSING'
+      WHERE id IN (SELECT id FROM recovery_queue WHERE status='PENDING' AND created_at >= NOW() - INTERVAL '7 days' FOR UPDATE SKIP LOCKED LIMIT 20)
       RETURNING *
     `);
-
     claimed = batch.rows;
-
     await client.query("COMMIT");
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("[CRON BATCH CLAIM ERROR]", e);
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 
   for (const item of claimed) {
     try {
-      const conversionCheck = await db.query(
-        `SELECT id FROM decisions WHERE session_id=$1 AND converted=true LIMIT 1`,
-        [item.session_id]
-      );
-
+      const conversionCheck = await db.query(`SELECT id FROM decisions WHERE session_id=$1 AND converted=true LIMIT 1`, [item.session_id]);
       if (conversionCheck.rowCount > 0) {
-        await db.query(
-          `UPDATE recovery_queue SET status='COMPLETED' WHERE id=$1`,
-          [item.id]
-        );
+        await db.query(`UPDATE recovery_queue SET status='COMPLETED' WHERE id=$1`, [item.id]);
         continue;
       }
 
-      await sendRecoveryEmail({
-        to: item.customer_email,
-        incentive: item.incentive,
-        cart: item.cart_data
-      });
-
-      await db.query(
-        `UPDATE recovery_queue SET status='SENT', processed_at=NOW() WHERE id=$1`,
-        [item.id]
-      );
-
-      await db.query(
-        `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
-         VALUES ($1,'RECOVERY',$2,'Complete your checkout','SENT')`,
-        [item.site_id, item.customer_email]
-      );
+      await sendRecoveryEmail({ to: item.customer_email, incentive: item.incentive, cart: item.cart_data });
+      await db.query(`UPDATE recovery_queue SET status='SENT', processed_at=NOW() WHERE id=$1`, [item.id]);
+      await db.query(`INSERT INTO email_logs(site_id, email_type, recipient, subject, status) VALUES ($1,'RECOVERY',$2,'Complete your checkout','SENT')`, [item.site_id, item.customer_email]);
     } catch (e) {
-      console.error(
-        `[RECOVERY EMAIL SEND ERROR] Target: ${item.customer_email}`,
-        e
-      );
-
-      await db.query(
-        `UPDATE recovery_queue SET status='FAILED', processed_at=NOW() WHERE id=$1`,
-        [item.id]
-      );
+      console.error(`[RECOVERY EMAIL SEND ERROR] Target: ${item.customer_email}`, e);
+      await db.query(`UPDATE recovery_queue SET status='FAILED', processed_at=NOW() WHERE id=$1`, [item.id]);
     }
   }
 });
 
-cron.schedule(
-  "0 8 * * *",
-  async () => {
+cron.schedule("0 8 * * *", async () => {
     if (redis) {
       const lockKey = `lock:cron:daily_report:${new Date().toISOString().split('T')[0]}`;
       const acquired = await redis.set(lockKey, "locked", "NX", "PX", 3600000);
-      if (!acquired) {
-        console.log("[DAILY REPORT CRON] Lock already held by another instance. Skipping.");
-        return;
-      }
+      if (!acquired) return;
     }
 
     try {
       const merchants = await db.query(`SELECT * FROM sites WHERE active=true`);
-
       for (const m of merchants.rows) {
         const stats = await db.query(
-          `SELECT COUNT(*) total,
-                  COUNT(*) FILTER (WHERE converted=true) conversions,
-                  COALESCE(SUM(revenue),0) revenue
-           FROM decisions
-           WHERE site_id=$1
-             AND state='COMPLETED'
-             AND completed_at >= NOW() - INTERVAL '1 day'`,
-          [m.site_id]
+          `SELECT COUNT(*) total, COUNT(*) FILTER (WHERE converted=true) conversions, COALESCE(SUM(revenue),0) revenue
+           FROM decisions WHERE site_id=$1 AND state='COMPLETED' AND completed_at >= NOW() - INTERVAL '1 day'`, [m.site_id]
         );
-
         const metrics = stats.rows[0];
 
         await sendDailyReport({
           to: m.owner_email,
           merchantName: m.name,
-          metrics: {
-            total: Number(metrics.total),
-            conversions: Number(metrics.conversions),
-            revenue: Number(metrics.revenue)
-          }
+          metrics: { total: Number(metrics.total), conversions: Number(metrics.conversions), revenue: Number(metrics.revenue) }
         });
 
-        await db.query(
-          `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
-           VALUES ($1,'DAILY_REPORT',$2,'Daily REDEN Performance Report','SENT')`,
-          [m.site_id, m.owner_email]
-        );
+        await db.query(`INSERT INTO email_logs(site_id, email_type, recipient, subject, status) VALUES ($1,'DAILY_REPORT',$2,'Daily REDEN API Performance Report','SENT')`, [m.site_id, m.owner_email]);
       }
-    } catch (e) {
-      console.error("[DAILY REPORT CRON FAILURE]", e);
-    }
+    } catch (e) { console.error("[DAILY REPORT CRON FAILURE]", e); }
   },
   { timezone: "UTC" }
 );
 
-app.post("/paystack", async (req, res) => {
-  try {
-    const signature = req.headers["x-paystack-signature"];
-
-    const hash = crypto
-      .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
-      .update(req.rawBody)
-      .digest("hex");
-
-    if (!signature || signature !== hash) {
-      console.log("[PAYSTACK] Invalid signature");
-      return res.sendStatus(200);
-    }
-
-    const event = req.body;
-
-    if (event.event !== "charge.success") {
-      return res.sendStatus(200);
-    }
-
-    const customerEmail = event?.data?.customer?.email;
-    const eventId = event?.data?.id || event?.data?.reference;
-
-    if (!customerEmail) {
-      console.log("[PAYSTACK] Missing email");
-      return res.sendStatus(200);
-    }
-
-    // ─────────────────────────────────────
-    // 1. IDEMPOTENCY CHECK (critical)
-    // ─────────────────────────────────────
-    const alreadyProcessed = await db.query(
-      `SELECT id FROM email_logs
-       WHERE email_type='PAYSTACK_EVENT'
-       AND recipient=$1
-       AND subject=$2
-       LIMIT 1`,
-      [customerEmail, eventId]
-    );
-
-    if (alreadyProcessed.rowCount > 0) {
-      console.log(`[PAYSTACK] Duplicate event ignored: ${customerEmail}`);
-      return res.sendStatus(200);
-    }
-
-    // ─────────────────────────────────────
-    // 2. FIND OR CREATE TENANT
-    // ─────────────────────────────────────
-    const existing = await db.query(
-      `SELECT id, site_id, api_key
-       FROM sites
-       WHERE owner_email=$1
-       LIMIT 1`,
-      [customerEmail]
-    );
-
-    let siteId;
-    let apiKey;
-
-    if (existing.rowCount > 0) {
-      siteId = existing.rows[0].site_id;
-      apiKey = existing.rows[0].api_key;
-
-      await db.query(
-        `UPDATE sites
-         SET subscription_status='active'
-         WHERE owner_email=$1`,
-        [customerEmail]
-      );
-
-      console.log(`[PAYSTACK] Existing customer reused: ${customerEmail}`);
-    } else {
-      siteId = "site_" + crypto.randomBytes(8).toString("hex");
-      apiKey = "rd_" + crypto.randomBytes(24).toString("hex");
-
-      await db.query(
-        `INSERT INTO sites
-         (site_id, api_key, name, owner_email, active, plan, subscription_status)
-         VALUES ($1,$2,$3,$4,true,'basic','active')`,
-        [siteId, apiKey, "REDEN Customer", customerEmail]
-      );
-
-      console.log(`[PAYSTACK] New tenant created: ${customerEmail}`);
-    }
-
-    // ─────────────────────────────────────
-    // 3. LOG PAYSTACK EVENT
-    // ─────────────────────────────────────
-    await db.query(
-      `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
-       VALUES ($1,'PAYSTACK_EVENT',$2,$3,'RECEIVED')`,
-      [siteId, customerEmail, eventId]
-    );
-
-    // ─────────────────────────────────────
-    // 4. SEND WELCOME EMAIL
-    // ─────────────────────────────────────
-    try {
-      const emailAlreadySent = await db.query(
-        `SELECT id FROM email_logs
-         WHERE email_type='WELCOME'
-         AND recipient=$1
-         LIMIT 1`,
-        [customerEmail]
-      );
-
-      if (emailAlreadySent.rowCount === 0) {
-        await sendWelcomeEmail({
-          to: customerEmail,
-          siteId,
-          apiKey,
-          plan: "basic"
-        });
-
-        await db.query(
-          `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
-           VALUES ($1,'WELCOME',$2,'Your REDEN API is Ready','SENT')`,
-          [siteId, customerEmail]
-        );
-
-        console.log(`[PAYSTACK] Welcome email sent: ${customerEmail}`);
-      } else {
-        console.log(`[PAYSTACK] Welcome email skipped: ${customerEmail}`);
-      }
-    } catch (emailErr) {
-      console.error("[PAYSTACK] Email failed:", emailErr.message);
-
-      await db.query(
-        `INSERT INTO email_logs(site_id, email_type, recipient, subject, status)
-         VALUES ($1,'WELCOME',$2,'Your REDEN API is Ready','FAILED')`,
-        [siteId, customerEmail]
-      );
-    }
-
-    console.log(`[PAYSTACK] Provisioning complete: ${customerEmail}`);
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("[PAYSTACK ERROR]", err);
-    return res.sendStatus(200);
-  }
-});
-
-app.get("/paystack", (req, res) => {
-  res.json({
-    ok: true,
-    service: "paystack_webhook"
-  });
-});
 /* ─────────────────────────────────────────────
 ERROR HANDLING
 ───────────────────────────────────────────── */
@@ -813,14 +524,10 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-
-const server = app.listen(PORT, () =>
-  console.log(`REDEN fully hardened instance up on port ${PORT}`)
-);
+const server = app.listen(PORT, () => console.log(`REDEN API fully hardened instance up on port ${PORT}`));
 
 const shutdownHandler = async (signal) => {
   console.log(`\n[${signal}] processing teardown signal. Draining server threads.`);
-
   server.close(async () => {
     try {
       if (db && typeof db.end === "function") await db.end();
