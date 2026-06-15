@@ -16,7 +16,7 @@ import { initRedis, redis } from "../infrastructure/redis.js";
 import { sendDailyReport, sendRecoveryEmail } from "../notification/emailEngine.js";
 
 // ✔ FIX 1: Explicit Import Added Cleanly
-import paystackRoutes from "./routes/paystack.js";
+import paystackRoutes from "./orchestrator/routes/paystack.js";
 
 dotenv.config();
 
