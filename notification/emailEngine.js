@@ -1,6 +1,6 @@
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend = new Resend(process.env.re_dpn1smF1_Jgfz9M7eNZAWGkvnsnHSvES7);
 
 /* ─────────────────────────────────────────────
    CORE SEND ENGINE
