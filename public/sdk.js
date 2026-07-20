@@ -1,3 +1,19 @@
+(function (window, document) {
+  "use strict";
+
+  const SDK_VERSION = "1.0.0";
+
+  const DEFAULTS = {
+    apiBase: "https://reden.dcore.name.ng",
+    sessionKey: "reden_session_id",
+    timeout: 8000,
+    autoTrack: true,
+    autoPageview: true,
+    autoOptimize: false,
+    debug: false,
+  };
+
+  let config = { ...DEFAULTS };
 
   const state = {
     initialized: false,
@@ -238,7 +254,7 @@
     banner.style.borderRadius = "14px";
     banner.style.fontFamily = "Inter, sans-serif";
     banner.style.boxShadow = "0 10px 40px rgba(0,0,0,0.35)";
-    
+
     document.body.appendChild(banner);
     return banner;
   }
@@ -326,7 +342,19 @@
     document.addEventListener("click", function (e) {
       const el = e.target;
       if (!el) return;
-      
+
+      const tag = (el.tagName || "").toLowerCase();
+
+      // Skip capturing text content from form fields — may contain PII
+      if (["input", "textarea", "select"].includes(tag)) {
+        track("click", {
+          tag: el.tagName || null,
+          id: el.id || null,
+          class: el.className || null,
+        });
+        return;
+      }
+
       track("click", {
         tag: el.tagName || null,
         id: el.id || null,
