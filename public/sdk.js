@@ -1,26 +1,4 @@
-import Script from "next/script";
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
-  return (
-    <html lang="en">
-      <body>
-        {children}
-
-        <Script
-          src="https://reden.dcore.name.ng/sdk.js"
-          data-site-id="YOUR_SITE_ID"
-          data-api-key="YOUR_API_KEY"
-          data-auto-optimize="true"
-          strategy="afterInteractive"
-        />
-      </body>
-    </html>
-  );
-            }
   const state = {
     initialized: false,
     sessionId: null,
