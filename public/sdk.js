@@ -332,7 +332,7 @@
 
   function setupPageTracking() {
     if (!config.autoPageview) return;
-    track("pageview", {
+    track("PAGE_VIEW", {
       referrer: document.referrer || null,
     });
   }
