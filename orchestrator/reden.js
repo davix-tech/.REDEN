@@ -101,7 +101,10 @@ app.disable("x-powered-by");
 
 app.use(
   helmet({
-    contentSecurityPolicy: false
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: {
+      policy: "cross-origin"
+    }
   })
 );
 
