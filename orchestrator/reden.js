@@ -1207,6 +1207,109 @@ app.get(
   }
 );
 
+/* ─────────────────────────────────────────────
+   INSTALLATION LOOKUP
+───────────────────────────────────────────── */
+
+app.get(
+  "/api/v1/installation",
+  async (req, res) => {
+    try {
+      if (!req.isAdminRoute) {
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized_internal_access"
+            )
+          );
+      }
+
+      const ownerEmail =
+        typeof req.query.owner_email === "string"
+          ? req.query.owner_email
+              .trim()
+              .toLowerCase()
+          : "";
+
+      if (!ownerEmail) {
+        return res
+          .status(400)
+          .json(
+            failure(
+              "owner_email_required"
+            )
+          );
+      }
+
+      const result =
+        await db.query(
+          `
+            SELECT
+              site_id,
+              name,
+              owner_email,
+              active,
+              plan,
+              subscription_status,
+              created_at
+            FROM sites
+            WHERE LOWER(owner_email) = $1
+              AND active = true
+            ORDER BY created_at DESC
+            LIMIT 1
+          `,
+          [ownerEmail]
+        );
+
+      if (!result.rowCount) {
+        return res
+          .status(404)
+          .json(
+            failure(
+              "installation_not_found"
+            )
+          );
+      }
+
+      const site =
+        result.rows[0];
+
+      return res.json(
+        success({
+          installation: {
+            site_id: site.site_id,
+            store_name: site.name,
+            name: site.name,
+            owner_email: site.owner_email,
+            active: site.active,
+            status: site.active
+              ? "active"
+              : "inactive",
+            plan: site.plan,
+            subscription_status:
+              site.subscription_status,
+            created_at: site.created_at
+          }
+        })
+      );
+    } catch (error) {
+      console.error(
+        "[INSTALLATION LOOKUP ERROR]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json(
+          failure(
+            "installation_lookup_failed"
+          )
+        );
+    }
+  }
+);
+
 /* =========================================================
    REDEN INTELLIGENCE
 ========================================================= */
