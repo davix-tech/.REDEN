@@ -11,6 +11,7 @@ import compression from "compression";
 import rateLimit from "express-rate-limit";
 
 import { db, initDB } from "../infrastructure/db.js";
+
 import {
   pickAction,
   updateBandit
@@ -26,18 +27,20 @@ import {
   sendRecoveryEmail
 } from "../notification/emailEngine.js";
 
-// Paystack routes
 import paystackRoutes from "./routes/paystack.js";
 
 dotenv.config();
 
-/* ─────────────────────────────────────────────
-   ENV VALIDATION
-───────────────────────────────────────────── */
+/* =========================================================
+   ENVIRONMENT
+========================================================= */
+
+const INTERNAL_ADMIN_SECRET =
+  process.env.ADMIN_SECRET ||
+  process.env.REDEN_ADMIN_SECRET;
 
 const requiredEnv = [
   "DATABASE_URL",
-  "ADMIN_SECRET",
   "PAYSTACK_SECRET_KEY"
 ];
 
@@ -49,9 +52,15 @@ for (const key of requiredEnv) {
   }
 }
 
-/* ─────────────────────────────────────────────
-   INITIALIZATION & INDEX OPTIMIZATION
-───────────────────────────────────────────── */
+if (!INTERNAL_ADMIN_SECRET) {
+  throw new Error(
+    "Missing REDEN internal admin secret. Set ADMIN_SECRET."
+  );
+}
+
+/* =========================================================
+   DATABASE INITIALIZATION
+========================================================= */
 
 await initDB();
 
@@ -85,25 +94,28 @@ try {
   );
 } catch (err) {
   console.error(
-    "[DB INIT ERROR] Failed to auto-create schema infrastructures:",
+    "[DB INIT ERROR] Failed to verify schema infrastructure:",
     err
   );
 }
 
 await initRedis();
 
+/* =========================================================
+   APP
+========================================================= */
+
 const app = express();
 
 app.set("trust proxy", true);
+app.disable("x-powered-by");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/* ─────────────────────────────────────────────
-   SECURITY AND GLOBAL CORS LAYER
-───────────────────────────────────────────── */
-
-app.disable("x-powered-by");
+/* =========================================================
+   SECURITY
+========================================================= */
 
 app.use(
   helmet({
@@ -115,6 +127,10 @@ app.use(
 );
 
 app.use(compression());
+
+/* =========================================================
+   CORS
+========================================================= */
 
 app.use((req, res, next) => {
   const publicOrigins = [
@@ -159,9 +175,9 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ─────────────────────────────────────────────
-   RATE LIMITERS
-───────────────────────────────────────────── */
+/* =========================================================
+   RATE LIMITING
+========================================================= */
 
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -194,9 +210,9 @@ const telemetryLimiter = rateLimit({
 app.use("/event", telemetryLimiter);
 app.use(generalLimiter);
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    BODY PARSING
-───────────────────────────────────────────── */
+========================================================= */
 
 app.use(
   express.json({
@@ -216,11 +232,7 @@ app.use(
 
 app.use(timeout("15s"));
 
-const haltOnTimeout = (
-  req,
-  res,
-  next
-) => {
+const haltOnTimeout = (req, res, next) => {
   if (req.timedout) {
     return;
   }
@@ -230,9 +242,9 @@ const haltOnTimeout = (
 
 app.use(haltOnTimeout);
 
-/* ─────────────────────────────────────────────
-   UTILS
-───────────────────────────────────────────── */
+/* =========================================================
+   RESPONSE HELPERS
+========================================================= */
 
 const success = (data = {}) => ({
   ok: true,
@@ -250,6 +262,10 @@ const failure = (
   timestamp: new Date().toISOString()
 });
 
+/* =========================================================
+   UTILS
+========================================================= */
+
 function validateNumber(value) {
   if (
     value === undefined ||
@@ -266,10 +282,7 @@ function validateNumber(value) {
     : num;
 }
 
-function safeCompare(
-  input,
-  secret
-) {
+function safeCompare(input, secret) {
   if (
     !input ||
     !secret ||
@@ -298,29 +311,15 @@ const VALID_EVENTS = new Set([
 ]);
 
 const isPublicAsset = (p) =>
-  ["/", "/health", "/sdk.js"].includes(
-    p
-  ) ||
-  /\.(png|jpg|jpeg|svg|css|js)$/i.test(
-    p
-  );
+  ["/", "/health", "/sdk.js"].includes(p) ||
+  /\.(png|jpg|jpeg|svg|css|js)$/i.test(p);
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    ROUTE CLASSIFICATION
-───────────────────────────────────────────── */
+========================================================= */
 
 /*
- * Public routes.
- *
- * These do NOT require merchant SDK credentials.
- *
- * /api/v1/verify
- *    Installation verification
- *
- * /paystack/*
- *    Paystack webhook/payment routes
- *
- * Static assets and health are also public.
+ * These routes do NOT require merchant credentials.
  */
 const isPublicRoute = (req) =>
   isPublicAsset(req.path) ||
@@ -328,30 +327,27 @@ const isPublicRoute = (req) =>
   req.path.startsWith("/paystack");
 
 /*
- * Internal PRETHIM → REDEN routes.
+ * These routes are internal PRETHIM -> REDEN routes.
  *
- * These use REDEN ADMIN_SECRET.
+ * They use ADMIN_SECRET.
  *
- * /api/v1/onboard
- *    Create/retrieve a REDEN installation
- *
- * /api/v1/intelligence
- *    Internal intelligence access
+ * IMPORTANT:
+ * They must NEVER fall through to merchant
+ * x-api-key authentication.
  */
 const isAdminRoute = (req) =>
   req.path === "/api/v1/intelligence" ||
+  req.path === "/api/v1/installation" ||
   req.path === "/api/v1/onboard";
 
-/* ─────────────────────────────────────────────
-   STATIC ASSET HANDLING
-───────────────────────────────────────────── */
+/* =========================================================
+   STATIC ASSETS
+========================================================= */
 
 app.get(
   "/sdk.js",
   (req, res) => {
-    res.type(
-      "application/javascript"
-    );
+    res.type("application/javascript");
 
     res.sendFile(
       path.join(
@@ -374,15 +370,11 @@ app.use(
   )
 );
 
-/* ─────────────────────────────────────────────
-   AUTH MIDDLEWARE
-───────────────────────────────────────────── */
+/* =========================================================
+   AUTHENTICATION
+========================================================= */
 
-async function authenticate(
-  req,
-  res,
-  next
-) {
+async function authenticate(req, res, next) {
   try {
     /*
      * Public routes bypass authentication.
@@ -392,9 +384,9 @@ async function authenticate(
     }
 
     /*
-     * Internal PRETHIM → REDEN routes.
+     * INTERNAL PRETHIM -> REDEN
      *
-     * These MUST use x-admin-secret.
+     * These routes use ADMIN_SECRET.
      */
     if (isAdminRoute(req)) {
       const adminSecret =
@@ -404,9 +396,13 @@ async function authenticate(
         typeof adminSecret !== "string" ||
         !safeCompare(
           adminSecret,
-          process.env.ADMIN_SECRET
+          INTERNAL_ADMIN_SECRET
         )
       ) {
+        console.error(
+          `[AUTH] Unauthorized internal access: ${req.method} ${req.path}`
+        );
+
         return res
           .status(401)
           .json(
@@ -422,12 +418,9 @@ async function authenticate(
     }
 
     /*
-     * Merchant SDK authentication.
+     * MERCHANT SDK AUTHENTICATION
      *
-     * These routes require BOTH:
-     *
-     * x-api-key
-     * x-site-id
+     * Only actual storefront/SDK routes come here.
      */
     const apiKey =
       req.headers["x-api-key"] ||
@@ -461,14 +454,9 @@ async function authenticate(
     const cacheKey =
       `site:${normalizedSiteId}:${normalizedApiKey}`;
 
-    /*
-     * Redis authentication cache.
-     */
     if (redis) {
       const cached =
-        await redis.get(
-          cacheKey
-        );
+        await redis.get(cacheKey);
 
       if (cached) {
         req.site =
@@ -478,9 +466,6 @@ async function authenticate(
       }
     }
 
-    /*
-     * Verify merchant installation.
-     */
     const result =
       await db.query(
         `
@@ -514,16 +499,10 @@ async function authenticate(
     req.site =
       result.rows[0];
 
-    /*
-     * Cache verified merchant
-     * authentication for five minutes.
-     */
     if (redis) {
       await redis.set(
         cacheKey,
-        JSON.stringify(
-          req.site
-        ),
+        JSON.stringify(req.site),
         "EX",
         300
       );
@@ -548,50 +527,41 @@ async function authenticate(
 
 app.use(authenticate);
 
-/* ─────────────────────────────────────────────
-   SITE CONTEXT GUARD
-───────────────────────────────────────────── */
+/* =========================================================
+   SITE CONTEXT
+========================================================= */
 
-app.use(
-  (req, res, next) => {
-    /*
-     * Public routes do not need site context.
-     */
-    if (isPublicRoute(req)) {
-      return next();
-    }
-
-    /*
-     * Internal admin routes were authenticated
-     * with ADMIN_SECRET.
-     */
-    if (isAdminRoute(req)) {
-      return next();
-    }
-
-    /*
-     * All remaining routes require a verified
-     * merchant installation.
-     */
-    if (!req.site?.site_id) {
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_site_context"
-          )
-        );
-    }
-
-    next();
+app.use((req, res, next) => {
+  if (isPublicRoute(req)) {
+    return next();
   }
-);
+
+  /*
+   * Internal REDEN routes already have their
+   * own authenticated context.
+   */
+  if (isAdminRoute(req)) {
+    return next();
+  }
+
+  if (!req.site?.site_id) {
+    return res
+      .status(401)
+      .json(
+        failure(
+          "invalid_site_context"
+        )
+      );
+  }
+
+  next();
+});
 
 app.use(haltOnTimeout);
 
-/* ─────────────────────────────────────────────
-   CORE ENGINE ROUTES
-───────────────────────────────────────────── */
+/* =========================================================
+   ROOT
+========================================================= */
 
 app.get(
   "/",
@@ -606,57 +576,165 @@ app.get(
   }
 );
 
+/* =========================================================
+   HEALTH
+========================================================= */
+
 app.get(
   "/health",
   async (req, res) => {
-    let dbStatus =
-      "healthy";
+    let dbStatus = "healthy";
 
     try {
-      await db.query(
-        "SELECT 1"
-      );
+      await db.query("SELECT 1");
     } catch {
-      dbStatus =
-        "unhealthy";
+      dbStatus = "unhealthy";
     }
 
     const payload =
       success({
-        uptime:
-          process.uptime(),
-
-        memory:
-          process.memoryUsage(),
-
-        database:
-          dbStatus
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        database: dbStatus
       });
 
-    return dbStatus ===
-      "healthy"
+    return dbStatus === "healthy"
       ? res.json(payload)
-      : res
-          .status(503)
-          .json(payload);
+      : res.status(503).json(payload);
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
+   INTERNAL INSTALLATION LOOKUP
+========================================================= */
+
+/*
+ * PRETHIM uses this endpoint to resolve the REDEN
+ * installation belonging to the authenticated user.
+ *
+ * This is NOT a merchant SDK endpoint.
+ *
+ * Therefore:
+ *
+ *   x-admin-secret
+ *        ↓
+ *   REDEN installation lookup
+ *
+ * No x-api-key.
+ * No x-site-id.
+ */
+app.get(
+  "/api/v1/installation",
+  async (req, res) => {
+    try {
+      if (!req.isAdminRoute) {
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized_internal_access"
+            )
+          );
+      }
+
+      const ownerEmail =
+        typeof req.query.owner_email === "string"
+          ? req.query.owner_email
+              .trim()
+              .toLowerCase()
+          : "";
+
+      if (!ownerEmail) {
+        return res
+          .status(400)
+          .json(
+            failure(
+              "owner_email_required"
+            )
+          );
+      }
+
+      /*
+       * Return the active installation.
+       *
+       * Most PRETHIM accounts should have one
+       * installation.
+       */
+      const result =
+        await db.query(
+          `
+            SELECT
+              site_id,
+              name,
+              owner_email,
+              active,
+              plan,
+              subscription_status,
+              created_at
+            FROM sites
+            WHERE LOWER(owner_email) = $1
+              AND active = true
+            ORDER BY created_at DESC
+            LIMIT 1
+          `,
+          [ownerEmail]
+        );
+
+      if (!result.rowCount) {
+        return res
+          .status(404)
+          .json(
+            failure(
+              "reden_installation_not_found"
+            )
+          );
+      }
+
+      const site =
+        result.rows[0];
+
+      return res.json(
+        success({
+          installation: {
+            site_id: site.site_id,
+            store_name: site.name,
+            owner_email: site.owner_email,
+            status:
+              site.active
+                ? "active"
+                : "inactive",
+            plan: site.plan,
+            subscription_status:
+              site.subscription_status,
+            created_at: site.created_at
+          }
+        })
+      );
+    } catch (error) {
+      console.error(
+        "[INSTALLATION LOOKUP ERROR]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json(
+          failure(
+            "installation_lookup_failed"
+          )
+        );
+    }
+  }
+);
+
+/* =========================================================
    ONBOARD
-───────────────────────────────────────────── */
+========================================================= */
 
 app.post(
   "/api/v1/onboard",
   async (req, res) => {
     try {
-      /*
-       * authenticate() has already verified
-       * x-admin-secret for this route.
-       *
-       * The browser must NEVER know ADMIN_SECRET.
-       */
-
       if (!req.isAdminRoute) {
         return res
           .status(401)
@@ -668,24 +746,18 @@ app.post(
       }
 
       const name =
-        typeof req.body?.name ===
-        "string"
+        typeof req.body?.name === "string"
           ? req.body.name.trim()
           : "";
 
       const ownerEmail =
-        typeof req.body
-          ?.owner_email ===
-        "string"
+        typeof req.body?.owner_email === "string"
           ? req.body.owner_email
               .trim()
               .toLowerCase()
           : "";
 
-      if (
-        !name ||
-        !ownerEmail
-      ) {
+      if (!name || !ownerEmail) {
         return res
           .status(400)
           .json(
@@ -701,9 +773,6 @@ app.post(
           );
       }
 
-      /*
-       * Existing installation.
-       */
       const existing =
         await db.query(
           `
@@ -727,16 +796,10 @@ app.post(
           ]
         );
 
-      if (
-        existing.rowCount >
-        0
-      ) {
+      if (existing.rowCount > 0) {
         const site =
           existing.rows[0];
 
-        /*
-         * Re-enable disabled installation.
-         */
         if (!site.active) {
           await db.query(
             `
@@ -750,9 +813,6 @@ app.post(
           );
         }
 
-        /*
-         * Clear cached authentication.
-         */
         if (redis) {
           await redis.del(
             `site:${site.site_id}:${site.api_key}`
@@ -768,23 +828,15 @@ app.post(
           .json(
             success({
               existing: true,
-              siteId:
-                site.site_id,
-              apiKey:
-                site.api_key,
-              name:
-                site.name,
-              plan:
-                site.plan,
-              subscriptionStatus:
-                "active"
+              siteId: site.site_id,
+              apiKey: site.api_key,
+              name: site.name,
+              plan: site.plan,
+              subscriptionStatus: "active"
             })
           );
       }
 
-      /*
-       * New installation.
-       */
       const siteId =
         `site_${crypto.randomBytes(8).toString("hex")}`;
 
@@ -833,8 +885,7 @@ app.post(
             apiKey,
             name,
             plan: "basic",
-            subscriptionStatus:
-              "active"
+            subscriptionStatus: "active"
           })
         );
     } catch (error) {
@@ -854,17 +905,16 @@ app.post(
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    INSTALLATION VERIFICATION
-───────────────────────────────────────────── */
+========================================================= */
 
 app.get(
   "/api/v1/verify",
   async (req, res) => {
     try {
       const siteId =
-        typeof req.query
-          .siteId === "string"
+        typeof req.query.siteId === "string"
           ? req.query.siteId.trim()
           : "";
 
@@ -908,10 +958,6 @@ app.get(
       const site =
         result.rows[0];
 
-      /*
-       * The first storefront event proves
-       * that the SDK is actually connected.
-       */
       const eventResult =
         await db.query(
           `
@@ -926,36 +972,22 @@ app.get(
         );
 
       const lastEventAt =
-        eventResult.rowCount >
-        0
-          ? eventResult.rows[0]
-              .created_at
+        eventResult.rowCount > 0
+          ? eventResult.rows[0].created_at
           : null;
 
       return res.json(
         success({
-          siteId:
-            site.site_id,
-
-          name:
-            site.name,
-
-          active:
-            site.active,
-
-          plan:
-            site.plan,
-
+          siteId: site.site_id,
+          name: site.name,
+          active: site.active,
+          plan: site.plan,
           subscriptionStatus:
             site.subscription_status,
-
           connected:
             Boolean(lastEventAt),
-
           lastEventAt,
-
-          createdAt:
-            site.created_at
+          createdAt: site.created_at
         })
       );
     } catch (error) {
@@ -975,19 +1007,14 @@ app.get(
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    REDEN INTELLIGENCE
-───────────────────────────────────────────── */
+========================================================= */
 
 app.post(
   "/api/v1/intelligence",
   async (req, res) => {
     try {
-      /*
-       * authenticate() has already verified
-       * x-admin-secret.
-       */
-
       if (!req.isAdminRoute) {
         return res
           .status(401)
@@ -999,14 +1026,12 @@ app.post(
       }
 
       const siteId =
-        typeof req.body?.siteId ===
-        "string"
+        typeof req.body?.siteId === "string"
           ? req.body.siteId.trim()
           : "";
 
       const question =
-        typeof req.body?.question ===
-        "string"
+        typeof req.body?.question === "string"
           ? req.body.question.trim()
           : "";
 
@@ -1026,6 +1051,16 @@ app.post(
           .json(
             failure(
               "question_required"
+            )
+          );
+      }
+
+      if (question.length > 2000) {
+        return res
+          .status(400)
+          .json(
+            failure(
+              "question_too_long"
             )
           );
       }
@@ -1073,9 +1108,9 @@ app.post(
           );
       }
 
-      /* ─────────────────────────────────────────
+      /* =====================================================
          EVENT TELEMETRY
-      ───────────────────────────────────────── */
+      ===================================================== */
 
       const eventsResult =
         await db.query(
@@ -1093,9 +1128,9 @@ app.post(
           [siteId]
         );
 
-      /* ─────────────────────────────────────────
+      /* =====================================================
          DECISION PERFORMANCE
-      ───────────────────────────────────────── */
+      ===================================================== */
 
       const decisionsResult =
         await db.query(
@@ -1122,9 +1157,9 @@ app.post(
           [siteId]
         );
 
-      /* ─────────────────────────────────────────
-         RECOVERY OPERATIONS
-      ───────────────────────────────────────── */
+      /* =====================================================
+         RECOVERY
+      ===================================================== */
 
       const recoveryResult =
         await db.query(
@@ -1159,9 +1194,9 @@ app.post(
           [siteId]
         );
 
-      /* ─────────────────────────────────────────
-         EMAIL OPERATIONS
-      ───────────────────────────────────────── */
+      /* =====================================================
+         EMAILS
+      ===================================================== */
 
       const emailResult =
         await db.query(
@@ -1185,48 +1220,39 @@ app.post(
       const events =
         eventsResult.rows.map(
           (row) => ({
-            event:
-              row.event,
-
-            count:
-              Number(
-                row.count
-              )
+            event: row.event,
+            count: Number(row.count)
           })
         );
 
       const decision =
-        decisionsResult.rows[0];
+        decisionsResult.rows[0] || {};
 
       const recovery =
-        recoveryResult.rows[0];
+        recoveryResult.rows[0] || {};
 
       const emails =
         emailResult.rows.map(
           (row) => ({
-            type:
-              row.email_type,
-
-            status:
-              row.status,
-
-            count:
-              Number(
-                row.count
-              )
+            type: row.email_type,
+            status: row.status,
+            count: Number(row.count)
           })
         );
 
       const completedDecisions =
         Number(
-          decision.completed_decisions ||
-            0
+          decision.completed_decisions || 0
         );
 
       const conversions =
         Number(
-          decision.conversions ||
-            0
+          decision.conversions || 0
+        );
+
+      const revenue =
+        Number(
+          decision.revenue || 0
         );
 
       const conversionRate =
@@ -1240,42 +1266,68 @@ app.post(
             )
           : 0;
 
-      const eventCount = (
-        name
-      ) =>
+      const eventCount = (name) =>
         events.find(
           (item) =>
             item.event === name
         )?.count || 0;
 
       const pageViews =
-        eventCount(
-          "PAGE_VIEW"
-        );
+        eventCount("PAGE_VIEW");
 
       const productViews =
-        eventCount(
-          "PRODUCT_VIEW"
-        );
+        eventCount("PRODUCT_VIEW");
 
       const addToCart =
-        eventCount(
-          "ADD_TO_CART"
-        );
+        eventCount("ADD_TO_CART");
 
       const checkoutStarted =
-        eventCount(
-          "CHECKOUT_STARTED"
-        );
+        eventCount("CHECKOUT_STARTED");
 
       const purchases =
-        eventCount(
-          "PURCHASE"
+        eventCount("PURCHASE");
+
+      const checkoutGap =
+        Math.max(
+          0,
+          checkoutStarted - purchases
         );
 
-      /* ─────────────────────────────────────────
-         GROUNDED RESPONSE ENGINE
-      ───────────────────────────────────────── */
+      const recoveryPending =
+        Number(
+          recovery.pending || 0
+        );
+
+      const recoveryProcessing =
+        Number(
+          recovery.processing || 0
+        );
+
+      const recoverySent =
+        Number(
+          recovery.sent || 0
+        );
+
+      const recoveryCompleted =
+        Number(
+          recovery.completed || 0
+        );
+
+      const recoveryFailed =
+        Number(
+          recovery.failed || 0
+        );
+
+      const totalEmails =
+        emails.reduce(
+          (sum, item) =>
+            sum + item.count,
+          0
+        );
+
+      /* =====================================================
+         GROUNDED ANSWER ENGINE
+      ===================================================== */
 
       const q =
         question.toLowerCase();
@@ -1286,19 +1338,18 @@ app.post(
         q.includes("performance") ||
         q.includes("today") ||
         q.includes("happening") ||
-        q.includes("happened")
+        q.includes("happened") ||
+        q.includes("overview") ||
+        q.includes("summary")
       ) {
         answer =
-          `In the last 24 hours, REDEN recorded ` +
+          `Over the last 24 hours, ${site.name} recorded ` +
           `${completedDecisions} completed decisions, ` +
           `${conversions} conversions, and ` +
-          `${Number(
-            decision.revenue || 0
-          )} in attributed revenue. ` +
-          `The completed-decision conversion rate was ` +
+          `${revenue} in attributed revenue. ` +
+          `The decision conversion rate was ` +
           `${conversionRate}%. ` +
-          `Storefront telemetry recorded ` +
-          `${pageViews} page views, ` +
+          `Telemetry recorded ${pageViews} page views, ` +
           `${productViews} product views, ` +
           `${addToCart} add-to-cart events, ` +
           `${checkoutStarted} checkout starts, ` +
@@ -1308,90 +1359,91 @@ app.post(
         q.includes("checkout") ||
         q.includes("cart")
       ) {
-        const gap =
-          Math.max(
-            0,
-            checkoutStarted -
-              purchases
-          );
-
         answer =
-          `REDEN recorded ` +
-          `${checkoutStarted} checkout starts ` +
-          `and ${purchases} purchase events ` +
-          `in the last 24 hours. ` +
+          `REDEN recorded ${checkoutStarted} checkout starts ` +
+          `and ${purchases} purchase events in the last 24 hours. ` +
           `The observed checkout-to-purchase gap is ` +
-          `${gap}. ` +
-          `The recovery queue contains ` +
-          `${Number(
-            recovery.pending || 0
-          )} pending, ` +
-          `${Number(
-            recovery.sent || 0
-          )} sent, ` +
-          `${Number(
-            recovery.completed || 0
-          )} completed, and ` +
-          `${Number(
-            recovery.failed || 0
-          )} failed records.`;
+          `${checkoutGap}. ` +
+          `The recovery queue currently has ` +
+          `${recoveryPending} pending, ` +
+          `${recoverySent} sent, ` +
+          `${recoveryCompleted} completed, and ` +
+          `${recoveryFailed} failed records.`;
       } else if (
         q.includes("recovery") ||
         q.includes("recover")
       ) {
         answer =
           `Recovery activity over the last 24 hours: ` +
-          `${Number(
-            recovery.pending || 0
-          )} pending, ` +
-          `${Number(
-            recovery.processing || 0
-          )} processing, ` +
-          `${Number(
-            recovery.sent || 0
-          )} sent, ` +
-          `${Number(
-            recovery.completed || 0
-          )} completed, and ` +
-          `${Number(
-            recovery.failed || 0
-          )} failed.`;
+          `${recoveryPending} pending, ` +
+          `${recoveryProcessing} processing, ` +
+          `${recoverySent} sent, ` +
+          `${recoveryCompleted} completed, and ` +
+          `${recoveryFailed} failed.`;
       } else if (
         q.includes("conversion") ||
         q.includes("convert")
       ) {
         answer =
-          `REDEN recorded ` +
-          `${conversions} conversions from ` +
-          `${completedDecisions} completed decisions ` +
-          `in the last 24 hours, giving a conversion rate of ` +
-          `${conversionRate}%. ` +
-          `Attributed revenue was ` +
-          `${Number(
-            decision.revenue || 0
-          )}.`;
+          `${site.name} recorded ${conversions} conversions ` +
+          `from ${completedDecisions} completed decisions ` +
+          `in the last 24 hours. ` +
+          `That produces a ${conversionRate}% conversion rate ` +
+          `and ${revenue} in attributed revenue.`;
+      } else if (
+        q.includes("revenue") ||
+        q.includes("sales") ||
+        q.includes("money") ||
+        q.includes("earned")
+      ) {
+        answer =
+          `REDEN attributed ${revenue} in revenue to ` +
+          `completed decisions during the last 24 hours. ` +
+          `${conversions} conversions were recorded from ` +
+          `${completedDecisions} completed decisions.`;
       } else if (
         q.includes("email") ||
         q.includes("mail")
       ) {
-        const totalEmails =
-          emails.reduce(
-            (sum, item) =>
-              sum + item.count,
-            0
-          );
-
         answer =
-          `REDEN recorded ` +
-          `${totalEmails} email operations ` +
-          `in the last 24 hours.`;
+          `REDEN recorded ${totalEmails} email operations ` +
+          `during the last 24 hours. ` +
+          `The recovery queue currently has ` +
+          `${recoveryPending} pending, ` +
+          `${recoverySent} sent, ` +
+          `${recoveryCompleted} completed, and ` +
+          `${recoveryFailed} failed records.`;
+      } else if (
+        q.includes("traffic") ||
+        q.includes("visitor") ||
+        q.includes("visitors") ||
+        q.includes("views")
+      ) {
+        answer =
+          `Storefront telemetry recorded ` +
+          `${pageViews} page views and ` +
+          `${productViews} product views during the last 24 hours. ` +
+          `There were ${addToCart} add-to-cart events, ` +
+          `${checkoutStarted} checkout starts, and ` +
+          `${purchases} purchases.`;
+      } else if (
+        q.includes("site") ||
+        q.includes("store") ||
+        q.includes("status") ||
+        q.includes("connected")
+      ) {
+        answer =
+          `${site.name} is currently active on REDEN ` +
+          `under the ${site.plan} plan. ` +
+          `The subscription status is ` +
+          `${site.subscription_status}.`;
       } else {
         answer =
-          `I can analyze ${site.name}'s REDEN telemetry, ` +
-          `decision performance, conversion activity, ` +
-          `recovery queue, and email operations. ` +
-          `Ask me about performance, conversions, ` +
-          `checkout abandonment, recovery, or email activity.`;
+          `I can analyze ${site.name}'s REDEN data, including ` +
+          `performance, revenue, conversions, traffic, ` +
+          `checkout abandonment, recovery activity, ` +
+          `and email operations. ` +
+          `Ask me a question about any of those areas.`;
       }
 
       return res.json(
@@ -1399,76 +1451,41 @@ app.post(
           answer,
 
           site: {
-            siteId:
-              site.site_id,
-
-            name:
-              site.name,
-
-            plan:
-              site.plan,
-
+            siteId: site.site_id,
+            name: site.name,
+            plan: site.plan,
             subscriptionStatus:
               site.subscription_status
           },
 
           evidence: {
-            period:
-              "last_24_hours",
+            period: "last_24_hours",
 
             events,
 
             decisions: {
               completed:
                 completedDecisions,
-
               conversions,
-
               conversionRate,
-
-              revenue:
-                Number(
-                  decision.revenue ||
-                    0
-                )
+              revenue
             },
 
             recovery: {
               total:
                 Number(
-                  recovery.total ||
-                    0
+                  recovery.total || 0
                 ),
-
               pending:
-                Number(
-                  recovery.pending ||
-                    0
-                ),
-
+                recoveryPending,
               processing:
-                Number(
-                  recovery.processing ||
-                    0
-                ),
-
+                recoveryProcessing,
               sent:
-                Number(
-                  recovery.sent ||
-                    0
-                ),
-
+                recoverySent,
               completed:
-                Number(
-                  recovery.completed ||
-                    0
-                ),
-
+                recoveryCompleted,
               failed:
-                Number(
-                  recovery.failed ||
-                    0
-                )
+                recoveryFailed
             },
 
             emails
@@ -1492,9 +1509,9 @@ app.post(
   }
 );
 
-/* ─────────────────────────────────────────────
-   MAB TELEMETRY EVENTS
-───────────────────────────────────────────── */
+/* =========================================================
+   EVENT
+========================================================= */
 
 app.post(
   "/event",
@@ -1507,10 +1524,7 @@ app.post(
         event_id
       } = req.body;
 
-      if (
-        !session_id ||
-        !event
-      ) {
+      if (!session_id || !event) {
         return res
           .status(400)
           .json(
@@ -1604,9 +1618,7 @@ app.post(
           normalizedEvent,
           safePayload,
           clientIp,
-          req.headers[
-            "user-agent"
-          ]
+          req.headers["user-agent"]
         ]
       );
 
@@ -1647,10 +1659,9 @@ app.post(
         );
       }
 
-      res.json(
+      return res.json(
         success({
-          event_id:
-            safeEventId
+          event_id: safeEventId
         })
       );
     } catch (error) {
@@ -1659,7 +1670,7 @@ app.post(
         error
       );
 
-      res
+      return res
         .status(500)
         .json(
           failure(
@@ -1670,9 +1681,9 @@ app.post(
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    SCORE
-───────────────────────────────────────────── */
+========================================================= */
 
 app.post(
   "/score",
@@ -1713,8 +1724,7 @@ app.post(
       const action =
         (await pickAction({
           session_id,
-          cart_value:
-            value,
+          cart_value: value,
           behavior:
             payload || {}
         })) || "NONE";
@@ -1727,8 +1737,7 @@ app.post(
       };
 
       const discount =
-        discountMap[action] ||
-        0;
+        discountMap[action] || 0;
 
       const result =
         await db.query(
@@ -1766,20 +1775,15 @@ app.post(
           ]
         );
 
-      res.json(
+      return res.json(
         success({
           decision_id:
-            result.rows[0]
-              .id,
-
+            result.rows[0].id,
           action,
-
           discount,
-
           propensity_score:
             payload?.scroll_depth
-              ? payload.scroll_depth /
-                100
+              ? payload.scroll_depth / 100
               : 0.5
         })
       );
@@ -1789,7 +1793,7 @@ app.post(
         error
       );
 
-      res
+      return res
         .status(500)
         .json(
           failure(
@@ -1800,9 +1804,9 @@ app.post(
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    ACTION
-───────────────────────────────────────────── */
+========================================================= */
 
 app.post(
   "/action",
@@ -1846,7 +1850,7 @@ app.post(
           );
       }
 
-      res.json(
+      return res.json(
         success({
           actioned: true
         })
@@ -1857,7 +1861,7 @@ app.post(
         error
       );
 
-      res
+      return res
         .status(500)
         .json(
           failure(
@@ -1868,9 +1872,9 @@ app.post(
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    OUTCOME
-───────────────────────────────────────────── */
+========================================================= */
 
 app.post(
   "/outcome",
@@ -1924,8 +1928,7 @@ app.post(
       }
 
       if (
-        existing.rows[0]
-          .state ===
+        existing.rows[0].state ===
         "COMPLETED"
       ) {
         return res
@@ -1957,12 +1960,11 @@ app.post(
       );
 
       await updateBandit(
-        existing.rows[0]
-          .action,
+        existing.rows[0].action,
         !!converted
       );
 
-      res.json(
+      return res.json(
         success({
           updated: true
         })
@@ -1973,7 +1975,7 @@ app.post(
         error
       );
 
-      res
+      return res
         .status(500)
         .json(
           failure(
@@ -1984,9 +1986,9 @@ app.post(
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    METRICS
-───────────────────────────────────────────── */
+========================================================= */
 
 app.get(
   "/metrics",
@@ -2006,7 +2008,9 @@ app.get(
                 SUM(revenue),
                 0
               ) revenue
+
             FROM decisions
+
             WHERE site_id = $1
               AND state = 'COMPLETED'
           `,
@@ -2016,22 +2020,14 @@ app.get(
       const row =
         r.rows[0];
 
-      res.json(
+      return res.json(
         success({
           total:
-            Number(
-              row.total
-            ),
-
+            Number(row.total),
           conversions:
-            Number(
-              row.conversions
-            ),
-
+            Number(row.conversions),
           revenue:
-            Number(
-              row.revenue
-            )
+            Number(row.revenue)
         })
       );
     } catch (error) {
@@ -2040,7 +2036,7 @@ app.get(
         error
       );
 
-      res
+      return res
         .status(500)
         .json(
           failure(
@@ -2051,26 +2047,25 @@ app.get(
   }
 );
 
-/* ─────────────────────────────────────────────
-   PAYSTACK WEBHOOK
-───────────────────────────────────────────── */
+/* =========================================================
+   PAYSTACK
+========================================================= */
 
 app.use(
   "/paystack",
   paystackRoutes
 );
 
-/* ─────────────────────────────────────────────
-   CRON SYSTEM ENGINE
-───────────────────────────────────────────── */
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
 
 cron.schedule(
   "*/15 * * * *",
   async () => {
     if (
       !db ||
-      typeof db.connect !==
-        "function"
+      typeof db.connect !== "function"
     ) {
       return;
     }
@@ -2120,9 +2115,7 @@ cron.schedule(
       client.release();
     }
 
-    for (
-      const item of claimed
-    ) {
+    for (const item of claimed) {
       try {
         const conversionCheck =
           await db.query(
@@ -2137,8 +2130,7 @@ cron.schedule(
           );
 
         if (
-          conversionCheck.rowCount >
-          0
+          conversionCheck.rowCount > 0
         ) {
           await db.query(
             `
@@ -2155,10 +2147,8 @@ cron.schedule(
         await sendRecoveryEmail({
           to:
             item.customer_email,
-
           incentive:
             item.incentive,
-
           cart:
             item.cart_data
         });
@@ -2217,6 +2207,10 @@ cron.schedule(
   }
 );
 
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
 cron.schedule(
   "0 8 * * *",
   async () => {
@@ -2250,9 +2244,7 @@ cron.schedule(
           `
         );
 
-      for (
-        const m of merchants.rows
-      ) {
+      for (const m of merchants.rows) {
         const stats =
           await db.query(
             `
@@ -2267,7 +2259,9 @@ cron.schedule(
                   SUM(revenue),
                   0
                 ) revenue
+
               FROM decisions
+
               WHERE site_id = $1
                 AND state = 'COMPLETED'
                 AND completed_at >= NOW()
@@ -2339,9 +2333,9 @@ cron.schedule(
   }
 );
 
-/* ─────────────────────────────────────────────
-   ERROR HANDLING
-───────────────────────────────────────────── */
+/* =========================================================
+   404
+========================================================= */
 
 app.use(
   (req, res) =>
@@ -2353,6 +2347,10 @@ app.use(
         )
       )
 );
+
+/* =========================================================
+   ERROR HANDLER
+========================================================= */
 
 app.use(
   (
@@ -2366,7 +2364,11 @@ app.use(
       err
     );
 
-    res
+    if (res.headersSent) {
+      return next(err);
+    }
+
+    return res
       .status(500)
       .json(
         failure(
@@ -2376,26 +2378,26 @@ app.use(
   }
 );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    SERVER
-───────────────────────────────────────────── */
+========================================================= */
 
 const PORT =
-  process.env.PORT ||
-  3000;
+  process.env.PORT || 3000;
 
 const server =
   app.listen(
     PORT,
-    () =>
+    () => {
       console.log(
         `REDEN API fully hardened instance up on port ${PORT}`
-      )
+      );
+    }
   );
 
-/* ─────────────────────────────────────────────
+/* =========================================================
    GRACEFUL SHUTDOWN
-───────────────────────────────────────────── */
+========================================================= */
 
 const shutdownHandler =
   async (signal) => {
@@ -2408,8 +2410,7 @@ const shutdownHandler =
         try {
           if (
             db &&
-            typeof db.end ===
-              "function"
+            typeof db.end === "function"
           ) {
             await db.end();
           }
@@ -2434,15 +2435,11 @@ const shutdownHandler =
 process.on(
   "SIGINT",
   () =>
-    shutdownHandler(
-      "SIGINT"
-    )
+    shutdownHandler("SIGINT")
 );
 
 process.on(
   "SIGTERM",
   () =>
-    shutdownHandler(
-      "SIGTERM"
-    )
+    shutdownHandler("SIGTERM")
 );
