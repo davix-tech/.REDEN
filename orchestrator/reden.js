@@ -35,43 +35,37 @@ dotenv.config();
    ENVIRONMENT
 ========================================================= */
 
+const PORT = process.env.PORT || 3000;
+
+const DATABASE_URL = process.env.DATABASE_URL;
+
 const ADMIN_SECRET =
-  (
-    process.env.REDEN_ADMIN_SECRET ||
-    process.env.ADMIN_SECRET ||
-    ""
-  ).trim();
+  process.env.REDEN_ADMIN_SECRET ||
+  process.env.ADMIN_SECRET;
 
-const requiredEnv = [
-  "DATABASE_URL",
-  "PAYSTACK_SECRET_KEY"
-];
+const PAYSTACK_SECRET_KEY =
+  process.env.PAYSTACK_SECRET_KEY;
 
-for (const key of requiredEnv) {
-  if (!process.env[key]) {
-    throw new Error(
-      `Missing mandatory environment variable: ${key}`
-    );
-  }
+if (!DATABASE_URL) {
+  throw new Error(
+    "Missing mandatory environment variable: DATABASE_URL"
+  );
 }
 
-/*
- * ADMIN_SECRET is required for internal PRETHIM -> REDEN
- * communication.
- *
- * We deliberately do not include it in the generic startup
- * requirement above so the server can boot cleanly and give
- * a meaningful internal-auth response instead of crashing.
- */
-
 if (!ADMIN_SECRET) {
+  throw new Error(
+    "Missing mandatory environment variable: REDEN_ADMIN_SECRET or ADMIN_SECRET"
+  );
+}
+
+if (!PAYSTACK_SECRET_KEY) {
   console.warn(
-    "[REDEN SECURITY] REDEN_ADMIN_SECRET/ADMIN_SECRET is not configured. Internal PRETHIM routes will reject requests."
+    "[ENV] PAYSTACK_SECRET_KEY is missing. Paystack functionality may be unavailable."
   );
 }
 
 /* =========================================================
-   DATABASE INITIALIZATION
+   INITIALIZATION
 ========================================================= */
 
 await initDB();
@@ -92,8 +86,8 @@ try {
   `);
 
   await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_email_logs_lookup
-    ON email_logs(email_type, recipient, subject);
+    CREATE INDEX IF NOT EXISTS idx_sites_owner_email
+    ON sites(owner_email);
   `);
 
   await db.query(`
@@ -101,31 +95,59 @@ try {
     ON sites(owner_email, name);
   `);
 
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_sites_owner_email
-    ON sites(owner_email);
-  `);
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
+      ON event_logs(site_id, created_at DESC);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] event_logs index skipped:",
+      error.message
+    );
+  }
+
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_decisions_site_completed
+      ON decisions(site_id, completed_at DESC);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] decisions index skipped:",
+      error.message
+    );
+  }
+
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_email_logs_lookup
+      ON email_logs(email_type, recipient, subject);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] email_logs index skipped:",
+      error.message
+    );
+  }
 
   console.log(
-    "[DB INIT] Core REDEN schema verified."
+    "[DB INIT] REDEN database infrastructure verified."
   );
 } catch (error) {
   console.error(
     "[DB INIT ERROR]",
     error
   );
+
+  throw error;
 }
 
 await initRedis();
 
-/* =========================================================
-   APP
-========================================================= */
-
 const app = express();
 
 app.set("trust proxy", true);
-app.disable("x-powered-by");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -133,6 +155,8 @@ const __dirname = path.dirname(__filename);
 /* =========================================================
    SECURITY
 ========================================================= */
+
+app.disable("x-powered-by");
 
 app.use(
   helmet({
@@ -183,6 +207,11 @@ app.use((req, res, next) => {
         "X-Request-Id",
         "X-SDK-Version"
       ].join(", ")
+    );
+  } else {
+    res.setHeader(
+      "Access-Control-Allow-Origin",
+      "null"
     );
   }
 
@@ -236,8 +265,8 @@ app.use(
   express.json({
     limit: "1mb",
 
-    verify: (req, res, buf) => {
-      req.rawBody = buf.toString();
+    verify: (req, res, buffer) => {
+      req.rawBody = buffer.toString();
     }
   })
 );
@@ -248,7 +277,7 @@ app.use(
   })
 );
 
-app.use(timeout("30s"));
+app.use(timeout("15s"));
 
 const haltOnTimeout = (
   req,
@@ -285,7 +314,7 @@ const failure = (
 });
 
 /* =========================================================
-   UTILITY FUNCTIONS
+   UTILITIES
 ========================================================= */
 
 function validateNumber(value) {
@@ -316,40 +345,29 @@ function safeCompare(
     typeof input !== "string" ||
     typeof secret !== "string" ||
     !input ||
-    !secret ||
-    input.length !== secret.length
+    !secret
+  ) {
+    return false;
+  }
+
+  const inputBuffer =
+    Buffer.from(input, "utf8");
+
+  const secretBuffer =
+    Buffer.from(secret, "utf8");
+
+  if (
+    inputBuffer.length !==
+    secretBuffer.length
   ) {
     return false;
   }
 
   return crypto.timingSafeEqual(
-    Buffer.from(input, "utf8"),
-    Buffer.from(secret, "utf8")
+    inputBuffer,
+    secretBuffer
   );
 }
-
-function getHeader(req, name) {
-  const value = req.headers[name];
-
-  if (Array.isArray(value)) {
-    return value[0];
-  }
-
-  return value;
-}
-
-function isValidEmail(email) {
-  return (
-    typeof email === "string" &&
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-      email.trim()
-    )
-  );
-}
-
-/* =========================================================
-   EVENTS
-========================================================= */
 
 const VALID_EVENTS = new Set([
   "PAGE_VIEW",
@@ -377,35 +395,36 @@ const isPublicAsset = (pathname) =>
 ========================================================= */
 
 /*
- * PUBLIC
+ * Public routes.
  *
- * These routes never require merchant credentials.
+ * Installation lookup is intentionally public.
+ * It only returns installation metadata and never
+ * returns the merchant API key.
  */
+
 const isPublicRoute = (req) =>
   isPublicAsset(req.path) ||
   req.path === "/api/v1/verify" ||
+  req.path === "/api/v1/installation" ||
   req.path.startsWith("/paystack");
 
 /*
- * INTERNAL
+ * Internal PRETHIM -> REDEN routes.
  *
- * These routes are called by PRETHIM server-side.
+ * These use REDEN_ADMIN_SECRET / ADMIN_SECRET.
  *
  * IMPORTANT:
  *
- * GET  /api/v1/installation
- * POST /api/v1/onboard
- * POST /api/v1/intelligence
- *
- * all belong here.
+ * /api/v1/intelligence does NOT use merchant
+ * x-api-key authentication.
  */
+
 const isAdminRoute = (req) =>
-  req.path === "/api/v1/installation" ||
-  req.path === "/api/v1/onboard" ||
-  req.path === "/api/v1/intelligence";
+  req.path === "/api/v1/intelligence" ||
+  req.path === "/api/v1/onboard";
 
 /* =========================================================
-   STATIC SDK
+   STATIC FILES
 ========================================================= */
 
 app.get(
@@ -437,7 +456,7 @@ app.use(
 );
 
 /* =========================================================
-   AUTHENTICATION
+   INTERNAL AUTHENTICATION
 ========================================================= */
 
 async function authenticate(
@@ -447,9 +466,7 @@ async function authenticate(
 ) {
   try {
     /*
-     * -----------------------------------------------------
      * PUBLIC
-     * -----------------------------------------------------
      */
 
     if (isPublicRoute(req)) {
@@ -457,35 +474,40 @@ async function authenticate(
     }
 
     /*
-     * -----------------------------------------------------
      * INTERNAL PRETHIM -> REDEN
-     * -----------------------------------------------------
-     *
-     * The browser must never send this.
-     *
-     * PRETHIM's server-side API route sends:
-     *
-     * x-admin-secret: <secret>
      */
 
     if (isAdminRoute(req)) {
       const suppliedSecret =
-        getHeader(
-          req,
+        req.headers[
           "x-admin-secret"
-        );
+        ];
 
       if (
-        !ADMIN_SECRET ||
+        typeof suppliedSecret !==
+        "string"
+      ) {
+        console.warn(
+          `[INTERNAL AUTH] Missing x-admin-secret for ${req.method} ${req.path}`
+        );
+
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized_internal_access"
+            )
+          );
+      }
+
+      if (
         !safeCompare(
-          suppliedSecret || "",
+          suppliedSecret,
           ADMIN_SECRET
         )
       ) {
-        console.error(
-          "[REDEN INTERNAL AUTH] Rejected:",
-          req.method,
-          req.path
+        console.warn(
+          `[INTERNAL AUTH] Invalid internal secret for ${req.method} ${req.path}`
         );
 
         return res
@@ -503,23 +525,15 @@ async function authenticate(
     }
 
     /*
-     * -----------------------------------------------------
-     * MERCHANT SDK AUTHENTICATION
-     * -----------------------------------------------------
+     * MERCHANT / SDK AUTHENTICATION
      */
 
     const apiKey =
-      getHeader(
-        req,
-        "x-api-key"
-      ) ||
+      req.headers["x-api-key"] ||
       req.body?.api_key;
 
     const siteId =
-      getHeader(
-        req,
-        "x-site-id"
-      ) ||
+      req.headers["x-site-id"] ||
       req.body?.site_id;
 
     if (
@@ -547,15 +561,13 @@ async function authenticate(
       `site:${normalizedSiteId}:${normalizedApiKey}`;
 
     /*
-     * Redis cache.
+     * REDIS CACHE
      */
 
     if (redis) {
       try {
         const cached =
-          await redis.get(
-            cacheKey
-          );
+          await redis.get(cacheKey);
 
         if (cached) {
           req.site =
@@ -564,15 +576,15 @@ async function authenticate(
           return next();
         }
       } catch (error) {
-        console.error(
-          "[AUTH REDIS ERROR]",
-          error
+        console.warn(
+          "[AUTH REDIS READ ERROR]",
+          error.message
         );
       }
     }
 
     /*
-     * Database verification.
+     * DATABASE VERIFICATION
      */
 
     const result =
@@ -612,7 +624,7 @@ async function authenticate(
       result.rows[0];
 
     /*
-     * Cache for five minutes.
+     * CACHE AUTHENTICATED SITE
      */
 
     if (redis) {
@@ -626,9 +638,9 @@ async function authenticate(
           300
         );
       } catch (error) {
-        console.error(
-          "[AUTH CACHE ERROR]",
-          error
+        console.warn(
+          "[AUTH REDIS WRITE ERROR]",
+          error.message
         );
       }
     }
@@ -658,17 +670,25 @@ app.use(authenticate);
 
 app.use(
   (req, res, next) => {
+    /*
+     * Public route.
+     */
+
     if (isPublicRoute(req)) {
       return next();
     }
 
     /*
-     * Internal routes do not need merchant
-     * x-api-key/x-site-id.
+     * Internal route.
      */
+
     if (isAdminRoute(req)) {
       return next();
     }
+
+    /*
+     * Merchant route.
+     */
 
     if (!req.site?.site_id) {
       return res
@@ -693,7 +713,7 @@ app.use(haltOnTimeout);
 app.get(
   "/",
   (req, res) => {
-    return res.json(
+    res.json(
       success({
         service: "REDEN API",
         status: "operational",
@@ -727,27 +747,24 @@ app.get(
         uptime:
           process.uptime(),
 
-        memory:
-          process.memoryUsage(),
-
         database,
 
-        internalAuth:
-          Boolean(ADMIN_SECRET)
+        redis:
+          Boolean(redis)
       });
 
     if (
-      database ===
+      database !==
       "healthy"
     ) {
-      return res.json(
-        payload
-      );
+      return res
+        .status(503)
+        .json(payload);
     }
 
-    return res
-      .status(503)
-      .json(payload);
+    return res.json(
+      payload
+    );
   }
 );
 
@@ -776,7 +793,8 @@ app.post(
           : "";
 
       const ownerEmail =
-        typeof req.body?.owner_email ===
+        typeof req.body
+          ?.owner_email ===
         "string"
           ? req.body.owner_email
               .trim()
@@ -801,26 +819,6 @@ app.post(
             )
           );
       }
-
-      if (
-        !isValidEmail(
-          ownerEmail
-        )
-      ) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "invalid_owner_email"
-            )
-          );
-      }
-
-      /*
-       * Find existing installation by owner.
-       *
-       * We first try exact store name.
-       */
 
       const existing =
         await db.query(
@@ -891,10 +889,6 @@ app.post(
           );
       }
 
-      /*
-       * New installation.
-       */
-
       const siteId =
         `site_${crypto.randomBytes(8).toString("hex")}`;
 
@@ -931,7 +925,7 @@ app.post(
       );
 
       console.log(
-        `[ONBOARD] New installation: ${siteId}`
+        `[ONBOARD] Created ${siteId} for ${ownerEmail}`
       );
 
       return res
@@ -965,36 +959,28 @@ app.post(
 );
 
 /* =========================================================
-   INTERNAL INSTALLATION LOOKUP
+   INSTALLATION LOOKUP
 ========================================================= */
 
 /*
- * THIS ROUTE WAS MISSING FROM YOUR SERVER.
+ * IMPORTANT:
  *
- * PRETHIM calls:
+ * This remains PUBLIC.
  *
- * GET /api/v1/installation?owner_email=...
+ * The dashboard question flow should NOT depend on
+ * this endpoint for intelligence.
  *
- * It is an internal route and therefore receives
- * x-admin-secret.
+ * It returns installation metadata only.
+ * It never returns api_key.
  */
 
 app.get(
   "/api/v1/installation",
   async (req, res) => {
     try {
-      if (!req.isAdminRoute) {
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
       const ownerEmail =
-        typeof req.query.owner_email ===
+        typeof req.query
+          ?.owner_email ===
         "string"
           ? req.query.owner_email
               .trim()
@@ -1017,7 +1003,6 @@ app.get(
             SELECT
               site_id,
               name,
-              owner_email,
               active,
               plan,
               subscription_status,
@@ -1050,9 +1035,6 @@ app.get(
               site.site_id,
 
             store_name:
-              site.name,
-
-            name:
               site.name,
 
             status:
@@ -1092,7 +1074,7 @@ app.get(
 );
 
 /* =========================================================
-   PUBLIC INSTALLATION VERIFICATION
+   INSTALLATION VERIFICATION
 ========================================================= */
 
 app.get(
@@ -1100,7 +1082,8 @@ app.get(
   async (req, res) => {
     try {
       const siteId =
-        typeof req.query.siteId ===
+        typeof req.query
+          ?.siteId ===
         "string"
           ? req.query.siteId.trim()
           : "";
@@ -1145,24 +1128,28 @@ app.get(
       const site =
         result.rows[0];
 
-      const eventResult =
-        await db.query(
-          `
-            SELECT
-              created_at
-            FROM event_logs
-            WHERE site_id = $1
-            ORDER BY created_at DESC
-            LIMIT 1
-          `,
-          [siteId]
-        );
+      let lastEventAt =
+        null;
 
-      const lastEventAt =
-        eventResult.rowCount
-          ? eventResult.rows[0]
-              .created_at
-          : null;
+      try {
+        const eventResult =
+          await db.query(
+            `
+              SELECT created_at
+              FROM event_logs
+              WHERE site_id = $1
+              ORDER BY created_at DESC
+              LIMIT 1
+            `,
+            [siteId]
+          );
+
+        if (eventResult.rowCount) {
+          lastEventAt =
+            eventResult.rows[0]
+              .created_at;
+        }
+      } catch {}
 
       return res.json(
         success({
@@ -1207,109 +1194,6 @@ app.get(
   }
 );
 
-/* ─────────────────────────────────────────────
-   INSTALLATION LOOKUP
-───────────────────────────────────────────── */
-
-app.get(
-  "/api/v1/installation",
-  async (req, res) => {
-    try {
-      if (!req.isAdminRoute) {
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
-      const ownerEmail =
-        typeof req.query.owner_email === "string"
-          ? req.query.owner_email
-              .trim()
-              .toLowerCase()
-          : "";
-
-      if (!ownerEmail) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "owner_email_required"
-            )
-          );
-      }
-
-      const result =
-        await db.query(
-          `
-            SELECT
-              site_id,
-              name,
-              owner_email,
-              active,
-              plan,
-              subscription_status,
-              created_at
-            FROM sites
-            WHERE LOWER(owner_email) = $1
-              AND active = true
-            ORDER BY created_at DESC
-            LIMIT 1
-          `,
-          [ownerEmail]
-        );
-
-      if (!result.rowCount) {
-        return res
-          .status(404)
-          .json(
-            failure(
-              "installation_not_found"
-            )
-          );
-      }
-
-      const site =
-        result.rows[0];
-
-      return res.json(
-        success({
-          installation: {
-            site_id: site.site_id,
-            store_name: site.name,
-            name: site.name,
-            owner_email: site.owner_email,
-            active: site.active,
-            status: site.active
-              ? "active"
-              : "inactive",
-            plan: site.plan,
-            subscription_status:
-              site.subscription_status,
-            created_at: site.created_at
-          }
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[INSTALLATION LOOKUP ERROR]",
-        error
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "installation_lookup_failed"
-          )
-        );
-    }
-  }
-);
-
 /* =========================================================
    REDEN INTELLIGENCE
 ========================================================= */
@@ -1318,6 +1202,11 @@ app.post(
   "/api/v1/intelligence",
   async (req, res) => {
     try {
+      /*
+       * This route is ONLY accessible through
+       * the internal x-admin-secret authentication.
+       */
+
       if (!req.isAdminRoute) {
         return res
           .status(401)
@@ -1361,7 +1250,8 @@ app.post(
       }
 
       if (
-        question.length > 2000
+        question.length >
+        2000
       ) {
         return res
           .status(400)
@@ -1372,11 +1262,9 @@ app.post(
           );
       }
 
-      /*
-       * -----------------------------------------------------
-       * INSTALLATION
-       * -----------------------------------------------------
-       */
+      /* ===================================================
+         VERIFY INSTALLATION
+      =================================================== */
 
       const siteResult =
         await db.query(
@@ -1418,166 +1306,247 @@ app.post(
           );
       }
 
-      /*
-       * -----------------------------------------------------
-       * TELEMETRY
-       * -----------------------------------------------------
-       */
+      /* ===================================================
+         EVENT TELEMETRY
+      =================================================== */
 
-      const eventsResult =
-        await db.query(
-          `
-            SELECT
-              event,
-              COUNT(*)::int AS count
-            FROM event_logs
-            WHERE site_id = $1
-              AND created_at >= NOW()
-                - INTERVAL '24 hours'
-            GROUP BY event
-            ORDER BY count DESC
-          `,
-          [siteId]
+      let events = [];
+
+      try {
+        const result =
+          await db.query(
+            `
+              SELECT
+                event,
+                COUNT(*)::int AS count
+              FROM event_logs
+              WHERE site_id = $1
+                AND created_at >= NOW()
+                  - INTERVAL '24 hours'
+              GROUP BY event
+              ORDER BY count DESC
+            `,
+            [siteId]
+          );
+
+        events =
+          result.rows.map(
+            (row) => ({
+              event:
+                row.event,
+
+              count:
+                Number(
+                  row.count
+                )
+            })
+          );
+      } catch (error) {
+        console.warn(
+          "[INTELLIGENCE] event telemetry unavailable:",
+          error.message
         );
+      }
 
-      /*
-       * -----------------------------------------------------
-       * DECISIONS
-       * -----------------------------------------------------
-       */
+      /* ===================================================
+         DECISIONS
+      =================================================== */
 
-      const decisionsResult =
-        await db.query(
-          `
-            SELECT
-              COUNT(*)::int AS completed_decisions,
+      let decision = {
+        completed_decisions: 0,
+        conversions: 0,
+        revenue: 0
+      };
 
-              COUNT(*) FILTER (
-                WHERE converted = true
-              )::int AS conversions,
+      try {
+        const result =
+          await db.query(
+            `
+              SELECT
+                COUNT(*)::int AS completed_decisions,
 
-              COALESCE(
-                SUM(revenue) FILTER (
+                COUNT(*) FILTER (
                   WHERE converted = true
-                ),
-                0
-              ) AS revenue
+                )::int AS conversions,
 
-            FROM decisions
+                COALESCE(
+                  SUM(revenue) FILTER (
+                    WHERE converted = true
+                  ),
+                  0
+                ) AS revenue
 
-            WHERE site_id = $1
-              AND state = 'COMPLETED'
-              AND completed_at >= NOW()
-                - INTERVAL '24 hours'
-          `,
-          [siteId]
+              FROM decisions
+
+              WHERE site_id = $1
+                AND state = 'COMPLETED'
+                AND completed_at >= NOW()
+                  - INTERVAL '24 hours'
+            `,
+            [siteId]
+          );
+
+        if (result.rowCount) {
+          decision =
+            result.rows[0];
+        }
+      } catch (error) {
+        console.warn(
+          "[INTELLIGENCE] decision data unavailable:",
+          error.message
         );
+      }
 
-      /*
-       * -----------------------------------------------------
-       * RECOVERY
-       * -----------------------------------------------------
-       */
+      /* ===================================================
+         RECOVERY
+      =================================================== */
 
-      const recoveryResult =
-        await db.query(
-          `
-            SELECT
+      let recovery = {
+        total: 0,
+        pending: 0,
+        processing: 0,
+        sent: 0,
+        completed: 0,
+        failed: 0
+      };
 
-              COUNT(*)::int AS total,
+      try {
+        const result =
+          await db.query(
+            `
+              SELECT
+                COUNT(*)::int AS total,
 
-              COUNT(*) FILTER (
-                WHERE status = 'PENDING'
-              )::int AS pending,
+                COUNT(*) FILTER (
+                  WHERE status = 'PENDING'
+                )::int AS pending,
 
-              COUNT(*) FILTER (
-                WHERE status = 'PROCESSING'
-              )::int AS processing,
+                COUNT(*) FILTER (
+                  WHERE status = 'PROCESSING'
+                )::int AS processing,
 
-              COUNT(*) FILTER (
-                WHERE status = 'SENT'
-              )::int AS sent,
+                COUNT(*) FILTER (
+                  WHERE status = 'SENT'
+                )::int AS sent,
 
-              COUNT(*) FILTER (
-                WHERE status = 'COMPLETED'
-              )::int AS completed,
+                COUNT(*) FILTER (
+                  WHERE status = 'COMPLETED'
+                )::int AS completed,
 
-              COUNT(*) FILTER (
-                WHERE status = 'FAILED'
-              )::int AS failed
+                COUNT(*) FILTER (
+                  WHERE status = 'FAILED'
+                )::int AS failed
 
-            FROM recovery_queue
+              FROM recovery_queue
 
-            WHERE site_id = $1
-              AND created_at >= NOW()
-                - INTERVAL '24 hours'
-          `,
-          [siteId]
-        );
+              WHERE site_id = $1
+                AND created_at >= NOW()
+                  - INTERVAL '24 hours'
+            `,
+            [siteId]
+          );
 
-      /*
-       * -----------------------------------------------------
-       * EMAIL
-       * -----------------------------------------------------
-       */
-
-      const emailResult =
-        await db.query(
-          `
-            SELECT
-              email_type,
-              status,
-              COUNT(*)::int AS count
-
-            FROM email_logs
-
-            WHERE site_id = $1
-              AND created_at >= NOW()
-                - INTERVAL '24 hours'
-
-            GROUP BY
-              email_type,
-              status
-
-            ORDER BY count DESC
-          `,
-          [siteId]
-        );
-
-      const events =
-        eventsResult.rows.map(
-          (row) => ({
-            event:
-              row.event,
-
-            count:
+        if (result.rowCount) {
+          recovery = {
+            total:
               Number(
-                row.count
-              )
-          })
-        );
+                result.rows[0]
+                  .total || 0
+              ),
 
-      const decision =
-        decisionsResult.rows[0] || {};
-
-      const recovery =
-        recoveryResult.rows[0] || {};
-
-      const emails =
-        emailResult.rows.map(
-          (row) => ({
-            type:
-              row.email_type,
-
-            status:
-              row.status,
-
-            count:
+            pending:
               Number(
-                row.count
+                result.rows[0]
+                  .pending || 0
+              ),
+
+            processing:
+              Number(
+                result.rows[0]
+                  .processing || 0
+              ),
+
+            sent:
+              Number(
+                result.rows[0]
+                  .sent || 0
+              ),
+
+            completed:
+              Number(
+                result.rows[0]
+                  .completed || 0
+              ),
+
+            failed:
+              Number(
+                result.rows[0]
+                  .failed || 0
               )
-          })
+          };
+        }
+      } catch (error) {
+        console.warn(
+          "[INTELLIGENCE] recovery data unavailable:",
+          error.message
         );
+      }
+
+      /* ===================================================
+         EMAILS
+      =================================================== */
+
+      let emails = [];
+
+      try {
+        const result =
+          await db.query(
+            `
+              SELECT
+                email_type,
+                status,
+                COUNT(*)::int AS count
+
+              FROM email_logs
+
+              WHERE site_id = $1
+                AND created_at >= NOW()
+                  - INTERVAL '24 hours'
+
+              GROUP BY
+                email_type,
+                status
+
+              ORDER BY count DESC
+            `,
+            [siteId]
+          );
+
+        emails =
+          result.rows.map(
+            (row) => ({
+              type:
+                row.email_type,
+
+              status:
+                row.status,
+
+              count:
+                Number(
+                  row.count
+                )
+            })
+          );
+      } catch (error) {
+        console.warn(
+          "[INTELLIGENCE] email data unavailable:",
+          error.message
+        );
+      }
+
+      /* ===================================================
+         NORMALIZED METRICS
+      =================================================== */
 
       const completedDecisions =
         Number(
@@ -1598,23 +1567,27 @@ app.post(
         );
 
       const conversionRate =
-        completedDecisions > 0
+        completedDecisions >
+        0
           ? Number(
               (
-                (conversions /
-                  completedDecisions) *
+                (
+                  conversions /
+                  completedDecisions
+                ) *
                 100
               ).toFixed(2)
             )
           : 0;
 
-      const eventCount =
-        (eventName) =>
-          events.find(
-            (item) =>
-              item.event ===
-              eventName
-          )?.count || 0;
+      const eventCount = (
+        eventName
+      ) =>
+        events.find(
+          (item) =>
+            item.event ===
+            eventName
+        )?.count || 0;
 
       const pageViews =
         eventCount(
@@ -1641,107 +1614,134 @@ app.post(
           "PURCHASE"
         );
 
-      /*
-       * -----------------------------------------------------
-       * BUSINESS QUESTION CLASSIFICATION
-       * -----------------------------------------------------
-       */
+      /* ===================================================
+         QUESTION UNDERSTANDING
+      =================================================== */
 
       const q =
         question
           .toLowerCase()
-          .replace(/[^\w\s]/g, " ")
-          .replace(/\s+/g, " ")
+          .replace(
+            /[?!.,]/g,
+            " "
+          )
+          .replace(
+            /\s+/g,
+            " "
+          )
           .trim();
 
-      const businessKeywords = [
-        "business",
-        "store",
-        "shop",
-        "sales",
-        "sale",
-        "revenue",
+      /*
+       * REDEN IS A BUSINESS INTELLIGENCE ENGINE.
+       *
+       * It must not answer unrelated/general questions.
+       */
+
+      const businessTerms = [
         "performance",
+        "today",
+        "yesterday",
+        "happening",
+        "overview",
+        "summary",
         "conversion",
         "convert",
-        "customer",
-        "customers",
+        "converting",
+        "revenue",
+        "sales",
+        "money",
+        "earned",
+        "income",
         "traffic",
         "visitor",
         "visitors",
-        "checkout",
-        "cart",
-        "abandon",
-        "abandoned",
-        "recovery",
-        "recover",
-        "purchase",
-        "purchases",
-        "product",
-        "products",
+        "views",
+        "view",
         "page",
         "pages",
+        "product",
+        "products",
+        "cart",
+        "checkout",
+        "abandon",
+        "abandoned",
+        "purchase",
+        "purchases",
+        "customer",
+        "customers",
+        "buyer",
+        "buyers",
+        "recovery",
+        "recover",
         "email",
         "emails",
-        "campaign",
-        "campaigns",
+        "mail",
         "decision",
         "decisions",
+        "discount",
+        "incentive",
         "funnel",
-        "growth",
-        "money",
-        "income",
-        "orders",
+        "store",
+        "shop",
+        "merchant",
+        "business",
         "order",
-        "selling",
-        "buyers",
-        "buyer",
-        "customers",
-        "engagement",
+        "orders",
         "activity",
-        "telemetry",
-        "checkout",
-        "offer",
-        "discount"
+        "analytics",
+        "metric",
+        "metrics",
+        "reden"
       ];
 
-      const isBusinessQuestion =
-        businessKeywords.some(
-          (keyword) =>
-            q.includes(keyword)
+      const hasBusinessIntent =
+        businessTerms.some(
+          (term) =>
+            q.includes(term)
         );
 
-      /*
-       * -----------------------------------------------------
-       * GROUNDED BUSINESS ANSWERS
-       * -----------------------------------------------------
-       */
+      let answer = "";
 
-      let answer;
+      /* ===================================================
+         NON-BUSINESS / ABSTRACT
+      =================================================== */
 
-      if (!isBusinessQuestion) {
+      if (!hasBusinessIntent) {
         answer =
-          `Sorry, I can only help with ${site.name}'s business activity. ` +
-          `Ask me about sales, revenue, conversions, ` +
-          `customer activity, checkout abandonment, ` +
-          `recovery, products, traffic, or email operations.`;
+          "Sorry, I can only answer questions related to your business. " +
+          "Ask me about performance, sales, revenue, conversions, " +
+          "traffic, customers, checkout activity, cart abandonment, " +
+          "recovery, email activity, or REDEN decisions.";
       }
 
+      /* ===================================================
+         PERFORMANCE
+      =================================================== */
+
       else if (
-        q.includes("performance") ||
-        q.includes("today") ||
-        q.includes("happening") ||
-        q.includes("happened") ||
-        q.includes("overview") ||
-        q.includes("summary") ||
-        q.includes("doing")
+        q.includes(
+          "performance"
+        ) ||
+        q.includes(
+          "today"
+        ) ||
+        q.includes(
+          "happening"
+        ) ||
+        q.includes(
+          "overview"
+        ) ||
+        q.includes(
+          "summary"
+        )
       ) {
         answer =
           `For ${site.name}, over the last 24 hours, REDEN recorded ` +
           `${completedDecisions} completed decisions, ` +
           `${conversions} conversions, and ` +
           `${revenue} in attributed revenue. ` +
-          `The decision conversion rate is ${conversionRate}%. ` +
+          `The decision conversion rate is ` +
+          `${conversionRate}%. ` +
           `Storefront activity includes ` +
           `${pageViews} page views, ` +
           `${productViews} product views, ` +
@@ -1750,34 +1750,71 @@ app.post(
           `and ${purchases} purchases.`;
       }
 
-      else if (
-        q.includes("revenue") ||
-        q.includes("money") ||
-        q.includes("income")
-      ) {
-        answer =
-          `${site.name} generated ${revenue} in attributed revenue ` +
-          `from ${conversions} conversions over the last 24 hours. ` +
-          `REDEN recorded ${completedDecisions} completed decisions ` +
-          `during that period.`;
-      }
+      /* ===================================================
+         CONVERSION
+      =================================================== */
 
       else if (
-        q.includes("conversion") ||
-        q.includes("convert")
+        q.includes(
+          "conversion"
+        ) ||
+        q.includes(
+          "convert"
+        ) ||
+        q.includes(
+          "converting"
+        )
       ) {
         answer =
-          `${site.name} recorded ${conversions} conversions ` +
-          `from ${completedDecisions} completed decisions ` +
-          `over the last 24 hours. ` +
-          `The decision conversion rate is ${conversionRate}%. ` +
+          `REDEN recorded ${conversions} conversions from ` +
+          `${completedDecisions} completed decisions in the last 24 hours. ` +
+          `That gives a conversion rate of ` +
+          `${conversionRate}%. ` +
           `Attributed revenue is ${revenue}.`;
       }
 
+      /* ===================================================
+         REVENUE / SALES
+      =================================================== */
+
       else if (
-        q.includes("abandon") ||
-        q.includes("checkout") ||
-        q.includes("cart")
+        q.includes(
+          "revenue"
+        ) ||
+        q.includes(
+          "sales"
+        ) ||
+        q.includes(
+          "money"
+        ) ||
+        q.includes(
+          "earned"
+        ) ||
+        q.includes(
+          "income"
+        )
+      ) {
+        answer =
+          `REDEN currently attributes ${revenue} in revenue ` +
+          `to completed decisions over the last 24 hours. ` +
+          `There were ${conversions} conversions from ` +
+          `${completedDecisions} completed decisions.`;
+      }
+
+      /* ===================================================
+         CHECKOUT / CART / ABANDONMENT
+      =================================================== */
+
+      else if (
+        q.includes(
+          "abandon"
+        ) ||
+        q.includes(
+          "checkout"
+        ) ||
+        q.includes(
+          "cart"
+        )
       ) {
         const checkoutGap =
           Math.max(
@@ -1787,99 +1824,199 @@ app.post(
           );
 
         answer =
-          `${site.name} recorded ${checkoutStarted} checkout starts ` +
-          `and ${purchases} purchases over the last 24 hours. ` +
-          `The observed checkout-to-purchase gap is ${checkoutGap}. ` +
+          `REDEN recorded ${checkoutStarted} checkout starts and ` +
+          `${purchases} purchases in the last 24 hours. ` +
+          `The observed checkout-to-purchase gap is ` +
+          `${checkoutGap}. ` +
           `The recovery queue currently contains ` +
-          `${Number(recovery.pending || 0)} pending, ` +
-          `${Number(recovery.sent || 0)} sent, ` +
-          `${Number(recovery.completed || 0)} completed, ` +
-          `and ${Number(recovery.failed || 0)} failed records.`;
+          `${recovery.pending} pending, ` +
+          `${recovery.processing} processing, ` +
+          `${recovery.sent} sent, ` +
+          `${recovery.completed} completed, and ` +
+          `${recovery.failed} failed records.`;
       }
 
+      /* ===================================================
+         RECOVERY
+      =================================================== */
+
       else if (
-        q.includes("recovery") ||
-        q.includes("recover")
+        q.includes(
+          "recovery"
+        ) ||
+        q.includes(
+          "recover"
+        )
       ) {
         answer =
-          `Recovery activity for ${site.name} over the last 24 hours: ` +
-          `${Number(recovery.pending || 0)} pending, ` +
-          `${Number(recovery.processing || 0)} processing, ` +
-          `${Number(recovery.sent || 0)} sent, ` +
-          `${Number(recovery.completed || 0)} completed, ` +
-          `and ${Number(recovery.failed || 0)} failed.`;
+          `REDEN's recovery activity over the last 24 hours is ` +
+          `${recovery.pending} pending, ` +
+          `${recovery.processing} processing, ` +
+          `${recovery.sent} sent, ` +
+          `${recovery.completed} completed, and ` +
+          `${recovery.failed} failed. ` +
+          `There are ${recovery.total} recovery records in the period.`;
       }
 
-      else if (
-        q.includes("traffic") ||
-        q.includes("visitor") ||
-        q.includes("visitors") ||
-        q.includes("page")
-      ) {
-        answer =
-          `${site.name} recorded ${pageViews} page views ` +
-          `and ${productViews} product views over the last 24 hours. ` +
-          `There were ${addToCart} add-to-cart events, ` +
-          `${checkoutStarted} checkout starts, ` +
-          `and ${purchases} purchases.`;
-      }
+      /* ===================================================
+         EMAIL
+      =================================================== */
 
       else if (
-        q.includes("product") ||
-        q.includes("products")
-      ) {
-        answer =
-          `${site.name} recorded ${productViews} product views ` +
-          `over the last 24 hours. ` +
-          `${addToCart} add-to-cart events, ` +
-          `${checkoutStarted} checkout starts, ` +
-          `and ${purchases} purchases were recorded.`;
-      }
-
-      else if (
-        q.includes("email") ||
-        q.includes("mail")
+        q.includes(
+          "email"
+        ) ||
+        q.includes(
+          "emails"
+        ) ||
+        q.includes(
+          "mail"
+        )
       ) {
         const totalEmails =
           emails.reduce(
             (sum, item) =>
               sum +
               Number(
-                item.count || 0
+                item.count ||
+                  0
               ),
             0
           );
 
         answer =
-          `${site.name} recorded ${totalEmails} email operations ` +
+          `REDEN recorded ${totalEmails} email operations ` +
           `over the last 24 hours.`;
       }
 
+      /* ===================================================
+         TRAFFIC
+      =================================================== */
+
       else if (
-        q.includes("decision") ||
-        q.includes("decisions")
+        q.includes(
+          "traffic"
+        ) ||
+        q.includes(
+          "visitor"
+        ) ||
+        q.includes(
+          "visitors"
+        ) ||
+        q.includes(
+          "views"
+        ) ||
+        q.includes(
+          "view"
+        ) ||
+        q.includes(
+          "page"
+        )
       ) {
         answer =
-          `REDEN completed ${completedDecisions} decisions ` +
-          `for ${site.name} over the last 24 hours. ` +
-          `${conversions} resulted in conversions, ` +
-          `with a ${conversionRate}% conversion rate and ` +
+          `In the last 24 hours, REDEN recorded ` +
+          `${pageViews} page views and ` +
+          `${productViews} product views. ` +
+          `There were also ${addToCart} add-to-cart events, ` +
+          `${checkoutStarted} checkout starts, and ` +
+          `${purchases} purchase events.`;
+      }
+
+      /* ===================================================
+         PURCHASES / ORDERS
+      =================================================== */
+
+      else if (
+        q.includes(
+          "purchase"
+        ) ||
+        q.includes(
+          "purchases"
+        ) ||
+        q.includes(
+          "order"
+        ) ||
+        q.includes(
+          "orders"
+        )
+      ) {
+        answer =
+          `REDEN recorded ${purchases} purchase events in the last ` +
+          `24 hours. There were ${conversions} conversions from ` +
+          `${completedDecisions} completed decisions.`;
+      }
+
+      /* ===================================================
+         DECISIONS
+      =================================================== */
+
+      else if (
+        q.includes(
+          "decision"
+        ) ||
+        q.includes(
+          "decisions"
+        )
+      ) {
+        answer =
+          `REDEN completed ${completedDecisions} decisions over the ` +
+          `last 24 hours. ${conversions} converted, producing a ` +
+          `${conversionRate}% decision conversion rate and ` +
           `${revenue} in attributed revenue.`;
       }
 
-      else {
+      /* ===================================================
+         CUSTOMER / STORE ACTIVITY
+      =================================================== */
+
+      else if (
+        q.includes(
+          "customer"
+        ) ||
+        q.includes(
+          "customers"
+        ) ||
+        q.includes(
+          "buyer"
+        ) ||
+        q.includes(
+          "buyers"
+        ) ||
+        q.includes(
+          "store"
+        ) ||
+        q.includes(
+          "business"
+        )
+      ) {
         answer =
-          `I can analyze ${site.name}'s business activity using REDEN telemetry. ` +
-          `Currently, the available analysis covers sales, revenue, ` +
-          `conversion performance, customer activity, checkout abandonment, ` +
-          `recovery operations, product activity, traffic, and email operations.`;
+          `${site.name} recorded ${pageViews} page views, ` +
+          `${productViews} product views, ${addToCart} add-to-cart events, ` +
+          `${checkoutStarted} checkout starts, and ${purchases} purchases ` +
+          `over the last 24 hours. REDEN recorded ${conversions} conversions ` +
+          `and ${revenue} in attributed revenue.`;
       }
 
-      /*
-       * -----------------------------------------------------
-       * RESPONSE
-       * -----------------------------------------------------
-       */
+      /* ===================================================
+         BUSINESS FALLBACK
+      =================================================== */
+
+      else {
+        answer =
+          `REDEN is monitoring ${site.name}. ` +
+          `Over the last 24 hours there were ` +
+          `${pageViews} page views, ` +
+          `${productViews} product views, ` +
+          `${addToCart} add-to-cart events, ` +
+          `${checkoutStarted} checkout starts, ` +
+          `${purchases} purchases, ` +
+          `${conversions} conversions, and ` +
+          `${revenue} in attributed revenue.`;
+      }
+
+      /* ===================================================
+         RESPONSE
+      =================================================== */
 
       return res.json(
         success({
@@ -1916,43 +2053,7 @@ app.post(
               revenue
             },
 
-            recovery: {
-              total:
-                Number(
-                  recovery.total ||
-                    0
-                ),
-
-              pending:
-                Number(
-                  recovery.pending ||
-                    0
-                ),
-
-              processing:
-                Number(
-                  recovery.processing ||
-                    0
-                ),
-
-              sent:
-                Number(
-                  recovery.sent ||
-                    0
-                ),
-
-              completed:
-                Number(
-                  recovery.completed ||
-                    0
-                ),
-
-              failed:
-                Number(
-                  recovery.failed ||
-                    0
-                )
-            },
+            recovery,
 
             emails
           }
@@ -1976,7 +2077,7 @@ app.post(
 );
 
 /* =========================================================
-   EVENT
+   EVENT TELEMETRY
 ========================================================= */
 
 app.post(
@@ -2032,16 +2133,17 @@ app.post(
 
       const safeCart =
         JSON.stringify(
-          payload?.cart || {}
+          payload?.cart ||
+            {}
         );
 
       if (
         Buffer.byteLength(
-          safeCart
-        ) > 20000 ||
-        Buffer.byteLength(
           safePayload
-        ) > 50000
+        ) > 50000 ||
+        Buffer.byteLength(
+          safeCart
+        ) > 20000
       ) {
         return res
           .status(413)
@@ -2053,10 +2155,9 @@ app.post(
       }
 
       const clientIp =
-        getHeader(
-          req,
+        req.headers[
           "x-forwarded-for"
-        )
+        ]
           ?.split(",")[0]
           ?.trim() ||
         req.ip;
@@ -2089,10 +2190,9 @@ app.post(
           normalizedEvent,
           safePayload,
           clientIp,
-          getHeader(
-            req,
+          req.headers[
             "user-agent"
-          )
+          ]
         ]
       );
 
@@ -2197,13 +2297,15 @@ app.post(
       }
 
       const action =
-        (await pickAction({
-          session_id,
-          cart_value:
-            value,
-          behavior:
-            payload || {}
-        })) ||
+        (
+          await pickAction({
+            session_id,
+            cart_value:
+              value,
+            behavior:
+              payload || {}
+          })
+        ) ||
         "NONE";
 
       const discountMap = {
@@ -2243,12 +2345,14 @@ app.post(
           [
             req.site.site_id,
             session_id,
-            cart_id || null,
+            cart_id ||
+              null,
             action,
             discount,
             Math.max(
               0,
-              value - discount
+              value -
+                discount
             )
           ]
         );
@@ -2256,7 +2360,8 @@ app.post(
       return res.json(
         success({
           decision_id:
-            result.rows[0].id,
+            result.rows[0]
+              .id,
 
           action,
 
@@ -2383,18 +2488,6 @@ app.post(
           revenue
         );
 
-      if (
-        revenueValue === null
-      ) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "invalid_revenue"
-            )
-          );
-      }
-
       const existing =
         await db.query(
           `
@@ -2422,7 +2515,8 @@ app.post(
       }
 
       if (
-        existing.rows[0].state ===
+        existing.rows[0]
+          .state ===
         "COMPLETED"
       ) {
         return res
@@ -2446,16 +2540,21 @@ app.post(
             AND site_id = $4
         `,
         [
-          Boolean(converted),
-          revenueValue,
+          Boolean(
+            converted
+          ),
+          revenueValue || 0,
           decision_id,
           req.site.site_id
         ]
       );
 
       await updateBandit(
-        existing.rows[0].action,
-        Boolean(converted)
+        existing.rows[0]
+          .action,
+        Boolean(
+          converted
+        )
       );
 
       return res.json(
@@ -2492,7 +2591,6 @@ app.get(
         await db.query(
           `
             SELECT
-
               COUNT(*) AS total,
 
               COUNT(*) FILTER (
@@ -2519,17 +2617,20 @@ app.get(
         success({
           total:
             Number(
-              row.total
+              row.total ||
+                0
             ),
 
           conversions:
             Number(
-              row.conversions
+              row.conversions ||
+                0
             ),
 
           revenue:
             Number(
-              row.revenue
+              row.revenue ||
+                0
             )
         })
       );
@@ -2587,21 +2688,17 @@ cron.schedule(
       const batch =
         await client.query(`
           UPDATE recovery_queue
-
           SET status = 'PROCESSING'
 
           WHERE id IN (
             SELECT id
-
             FROM recovery_queue
 
             WHERE status = 'PENDING'
-
               AND created_at >= NOW()
                 - INTERVAL '7 days'
 
             FOR UPDATE SKIP LOCKED
-
             LIMIT 20
           )
 
@@ -2613,7 +2710,8 @@ cron.schedule(
       );
 
       for (
-        const item of batch.rows
+        const item of
+          batch.rows
       ) {
         try {
           const conversionCheck =
@@ -2657,11 +2755,9 @@ cron.schedule(
           await db.query(
             `
               UPDATE recovery_queue
-
               SET
                 status = 'SENT',
                 processed_at = NOW()
-
               WHERE id = $1
             `,
             [item.id]
@@ -2676,7 +2772,6 @@ cron.schedule(
                 subject,
                 status
               )
-
               VALUES (
                 $1,
                 'RECOVERY',
@@ -2699,11 +2794,9 @@ cron.schedule(
           await db.query(
             `
               UPDATE recovery_queue
-
               SET
                 status = 'FAILED',
                 processed_at = NOW()
-
               WHERE id = $1
             `,
             [item.id]
@@ -2711,11 +2804,6 @@ cron.schedule(
         }
       }
     } catch (error) {
-      console.error(
-        "[RECOVERY CRON ERROR]",
-        error
-      );
-
       try {
         if (client) {
           await client.query(
@@ -2723,6 +2811,11 @@ cron.schedule(
           );
         }
       } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
     } finally {
       if (client) {
         client.release();
@@ -2738,30 +2831,30 @@ cron.schedule(
 cron.schedule(
   "0 8 * * *",
   async () => {
-    if (redis) {
-      const date =
-        new Date()
-          .toISOString()
-          .split("T")[0];
-
-      const lockKey =
-        `lock:cron:daily_report:${date}`;
-
-      const acquired =
-        await redis.set(
-          lockKey,
-          "locked",
-          "NX",
-          "PX",
-          3600000
-        );
-
-      if (!acquired) {
-        return;
-      }
-    }
-
     try {
+      if (redis) {
+        const date =
+          new Date()
+            .toISOString()
+            .split("T")[0];
+
+        const lockKey =
+          `lock:cron:daily_report:${date}`;
+
+        const acquired =
+          await redis.set(
+            lockKey,
+            "locked",
+            "NX",
+            "PX",
+            3600000
+          );
+
+        if (!acquired) {
+          return;
+        }
+      }
+
       const merchants =
         await db.query(
           `
@@ -2773,13 +2866,18 @@ cron.schedule(
 
       for (
         const merchant of
-        merchants.rows
+          merchants.rows
       ) {
+        if (
+          !merchant.owner_email
+        ) {
+          continue;
+        }
+
         const stats =
           await db.query(
             `
               SELECT
-
                 COUNT(*) AS total,
 
                 COUNT(*) FILTER (
@@ -2798,7 +2896,9 @@ cron.schedule(
                 AND completed_at >= NOW()
                   - INTERVAL '1 day'
             `,
-            [merchant.site_id]
+            [
+              merchant.site_id
+            ]
           );
 
         const metrics =
@@ -2814,17 +2914,20 @@ cron.schedule(
           metrics: {
             total:
               Number(
-                metrics.total
+                metrics.total ||
+                  0
               ),
 
             conversions:
               Number(
-                metrics.conversions
+                metrics.conversions ||
+                  0
               ),
 
             revenue:
               Number(
-                metrics.revenue
+                metrics.revenue ||
+                  0
               )
           }
         });
@@ -2838,7 +2941,6 @@ cron.schedule(
               subject,
               status
             )
-
             VALUES (
               $1,
               'DAILY_REPORT',
@@ -2855,7 +2957,7 @@ cron.schedule(
       }
     } catch (error) {
       console.error(
-        "[DAILY REPORT ERROR]",
+        "[DAILY REPORT CRON ERROR]",
         error
       );
     }
@@ -2911,10 +3013,6 @@ app.use(
    SERVER
 ========================================================= */
 
-const PORT =
-  process.env.PORT ||
-  3000;
-
 const server =
   app.listen(
     PORT,
@@ -2924,11 +3022,15 @@ const server =
       );
 
       console.log(
-        `[REDEN] Internal intelligence: ${
-          ADMIN_SECRET
-            ? "READY"
-            : "NOT CONFIGURED"
-        }`
+        `[REDEN] Internal intelligence authentication: ENABLED`
+      );
+
+      console.log(
+        `[REDEN] Installation lookup: ENABLED`
+      );
+
+      console.log(
+        `[REDEN] Dashboard intelligence: ENABLED`
       );
     }
   );
@@ -2940,7 +3042,7 @@ const server =
 const shutdownHandler =
   async (signal) => {
     console.log(
-      `[${signal}] Shutting down REDEN...`
+      `[${signal}] REDEN shutting down...`
     );
 
     server.close(
