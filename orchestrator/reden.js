@@ -26,6 +26,7 @@ import {
   sendRecoveryEmail
 } from "../notification/emailEngine.js";
 
+// Paystack routes
 import paystackRoutes from "./routes/paystack.js";
 
 dotenv.config();
@@ -49,7 +50,7 @@ for (const key of requiredEnv) {
 }
 
 /* ─────────────────────────────────────────────
-   INITIALIZATION
+   INITIALIZATION & INDEX OPTIMIZATION
 ───────────────────────────────────────────── */
 
 await initDB();
@@ -99,7 +100,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 /* ─────────────────────────────────────────────
-   SECURITY / CORS
+   SECURITY AND GLOBAL CORS LAYER
 ───────────────────────────────────────────── */
 
 app.disable("x-powered-by");
@@ -230,7 +231,7 @@ const haltOnTimeout = (
 app.use(haltOnTimeout);
 
 /* ─────────────────────────────────────────────
-   RESPONSE HELPERS
+   UTILS
 ───────────────────────────────────────────── */
 
 const success = (data = {}) => ({
@@ -248,10 +249,6 @@ const failure = (
   details,
   timestamp: new Date().toISOString()
 });
-
-/* ─────────────────────────────────────────────
-   SECURITY HELPERS
-───────────────────────────────────────────── */
 
 function validateNumber(value) {
   if (
@@ -301,46 +298,52 @@ const VALID_EVENTS = new Set([
 ]);
 
 const isPublicAsset = (p) =>
-  ["/", "/health", "/sdk.js"].includes(p) ||
-  /\.(png|jpg|jpeg|svg|css|js)$/i.test(p);
+  ["/", "/health", "/sdk.js"].includes(
+    p
+  ) ||
+  /\.(png|jpg|jpeg|svg|css|js)$/i.test(
+    p
+  );
 
 /* ─────────────────────────────────────────────
    ROUTE CLASSIFICATION
 ───────────────────────────────────────────── */
 
 /*
- * These routes do NOT use merchant credentials.
+ * Public routes.
  *
- * /api/v1/onboard
- *    PRETHIM → REDEN installation provisioning
+ * These do NOT require merchant SDK credentials.
  *
  * /api/v1/verify
- *    PRETHIM → REDEN installation verification
+ *    Installation verification
  *
  * /paystack/*
- *    Payment/webhook routes
+ *    Paystack webhook/payment routes
  *
- * Static assets and health checks are also public.
+ * Static assets and health are also public.
  */
 const isPublicRoute = (req) =>
   isPublicAsset(req.path) ||
-  req.path === "/api/v1/onboard" ||
   req.path === "/api/v1/verify" ||
   req.path.startsWith("/paystack");
 
 /*
- * These routes require REDEN ADMIN_SECRET.
+ * Internal PRETHIM → REDEN routes.
  *
- * PRETHIM server-to-server calls use this
- * authentication mechanism.
+ * These use REDEN ADMIN_SECRET.
+ *
+ * /api/v1/onboard
+ *    Create/retrieve a REDEN installation
+ *
+ * /api/v1/intelligence
+ *    Internal intelligence access
  */
 const isAdminRoute = (req) =>
   req.path === "/api/v1/intelligence" ||
-  req.path === "/api/v1/onboard" ||
-  req.path === "/api/v1/verify";
+  req.path === "/api/v1/onboard";
 
 /* ─────────────────────────────────────────────
-   STATIC ASSETS
+   STATIC ASSET HANDLING
 ───────────────────────────────────────────── */
 
 app.get(
@@ -372,7 +375,7 @@ app.use(
 );
 
 /* ─────────────────────────────────────────────
-   AUTHENTICATION
+   AUTH MIDDLEWARE
 ───────────────────────────────────────────── */
 
 async function authenticate(
@@ -382,27 +385,23 @@ async function authenticate(
 ) {
   try {
     /*
-     * ─────────────────────────────────────────
-     * SERVER-TO-SERVER ADMIN ROUTES
-     * ─────────────────────────────────────────
-     *
-     * These routes MUST NEVER fall through into
-     * merchant x-api-key/x-site-id authentication.
-     *
-     * This is the critical fix for:
-     *
-     * missing_credentials
+     * Public routes bypass authentication.
      */
+    if (isPublicRoute(req)) {
+      return next();
+    }
 
+    /*
+     * Internal PRETHIM → REDEN routes.
+     *
+     * These MUST use x-admin-secret.
+     */
     if (isAdminRoute(req)) {
       const adminSecret =
-        typeof req.headers["x-admin-secret"] ===
-        "string"
-          ? req.headers["x-admin-secret"]
-          : "";
+        req.headers["x-admin-secret"];
 
       if (
-        !adminSecret ||
+        typeof adminSecret !== "string" ||
         !safeCompare(
           adminSecret,
           process.env.ADMIN_SECRET
@@ -423,31 +422,27 @@ async function authenticate(
     }
 
     /*
-     * Public routes that do not require credentials.
+     * Merchant SDK authentication.
+     *
+     * These routes require BOTH:
+     *
+     * x-api-key
+     * x-site-id
      */
-    if (isPublicRoute(req)) {
-      return next();
-    }
-
-    /*
-     * ─────────────────────────────────────────
-     * MERCHANT SDK AUTHENTICATION
-     * ─────────────────────────────────────────
-     */
-
     const apiKey =
-      typeof req.headers["x-api-key"] ===
-      "string"
-        ? req.headers["x-api-key"]
-        : req.body?.api_key;
+      req.headers["x-api-key"] ||
+      req.body?.api_key;
 
     const siteId =
-      typeof req.headers["x-site-id"] ===
-      "string"
-        ? req.headers["x-site-id"]
-        : req.body?.site_id;
+      req.headers["x-site-id"] ||
+      req.body?.site_id;
 
-    if (!apiKey || !siteId) {
+    if (
+      typeof apiKey !== "string" ||
+      typeof siteId !== "string" ||
+      !apiKey.trim() ||
+      !siteId.trim()
+    ) {
       return res
         .status(401)
         .json(
@@ -457,9 +452,18 @@ async function authenticate(
         );
     }
 
-    const cacheKey =
-      `site:${siteId}:${apiKey}`;
+    const normalizedApiKey =
+      apiKey.trim();
 
+    const normalizedSiteId =
+      siteId.trim();
+
+    const cacheKey =
+      `site:${normalizedSiteId}:${normalizedApiKey}`;
+
+    /*
+     * Redis authentication cache.
+     */
     if (redis) {
       const cached =
         await redis.get(
@@ -474,6 +478,9 @@ async function authenticate(
       }
     }
 
+    /*
+     * Verify merchant installation.
+     */
     const result =
       await db.query(
         `
@@ -489,8 +496,8 @@ async function authenticate(
           LIMIT 1
         `,
         [
-          apiKey,
-          siteId
+          normalizedApiKey,
+          normalizedSiteId
         ]
       );
 
@@ -507,6 +514,10 @@ async function authenticate(
     req.site =
       result.rows[0];
 
+    /*
+     * Cache verified merchant
+     * authentication for five minutes.
+     */
     if (redis) {
       await redis.set(
         cacheKey,
@@ -518,11 +529,11 @@ async function authenticate(
       );
     }
 
-    next();
-  } catch (e) {
+    return next();
+  } catch (error) {
     console.error(
       "[AUTH ERROR]",
-      e
+      error
     );
 
     return res
@@ -544,14 +555,6 @@ app.use(authenticate);
 app.use(
   (req, res, next) => {
     /*
-     * Admin routes already passed the
-     * x-admin-secret check.
-     */
-    if (req.isAdminRoute) {
-      return next();
-    }
-
-    /*
      * Public routes do not need site context.
      */
     if (isPublicRoute(req)) {
@@ -559,7 +562,16 @@ app.use(
     }
 
     /*
-     * Merchant routes require verified site.
+     * Internal admin routes were authenticated
+     * with ADMIN_SECRET.
+     */
+    if (isAdminRoute(req)) {
+      return next();
+    }
+
+    /*
+     * All remaining routes require a verified
+     * merchant installation.
      */
     if (!req.site?.site_id) {
       return res
@@ -578,7 +590,7 @@ app.use(
 app.use(haltOnTimeout);
 
 /* ─────────────────────────────────────────────
-   ROOT / HEALTH
+   CORE ENGINE ROUTES
 ───────────────────────────────────────────── */
 
 app.get(
@@ -639,9 +651,21 @@ app.post(
   async (req, res) => {
     try {
       /*
-       * authenticate() already verified
-       * x-admin-secret.
+       * authenticate() has already verified
+       * x-admin-secret for this route.
+       *
+       * The browser must NEVER know ADMIN_SECRET.
        */
+
+      if (!req.isAdminRoute) {
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized_internal_access"
+            )
+          );
+      }
 
       const name =
         typeof req.body?.name ===
@@ -650,7 +674,8 @@ app.post(
           : "";
 
       const ownerEmail =
-        typeof req.body?.owner_email ===
+        typeof req.body
+          ?.owner_email ===
         "string"
           ? req.body.owner_email
               .trim()
@@ -676,6 +701,9 @@ app.post(
           );
       }
 
+      /*
+       * Existing installation.
+       */
       const existing =
         await db.query(
           `
@@ -706,6 +734,9 @@ app.post(
         const site =
           existing.rows[0];
 
+        /*
+         * Re-enable disabled installation.
+         */
         if (!site.active) {
           await db.query(
             `
@@ -719,6 +750,9 @@ app.post(
           );
         }
 
+        /*
+         * Clear cached authentication.
+         */
         if (redis) {
           await redis.del(
             `site:${site.site_id}:${site.api_key}`
@@ -748,6 +782,9 @@ app.post(
           );
       }
 
+      /*
+       * New installation.
+       */
       const siteId =
         `site_${crypto.randomBytes(8).toString("hex")}`;
 
@@ -800,10 +837,10 @@ app.post(
               "active"
           })
         );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[ONBOARD ERROR]",
-        e
+        error
       );
 
       return res
@@ -825,26 +862,9 @@ app.get(
   "/api/v1/verify",
   async (req, res) => {
     try {
-      /*
-       * IMPORTANT:
-       *
-       * This endpoint is now an ADMIN ROUTE.
-       *
-       * It has already passed:
-       *
-       * x-admin-secret
-       *
-       * in authenticate().
-       *
-       * It does NOT require:
-       *
-       * x-api-key
-       * x-site-id
-       */
-
       const siteId =
-        typeof req.query.siteId ===
-        "string"
+        typeof req.query
+          .siteId === "string"
           ? req.query.siteId.trim()
           : "";
 
@@ -888,6 +908,10 @@ app.get(
       const site =
         result.rows[0];
 
+      /*
+       * The first storefront event proves
+       * that the SDK is actually connected.
+       */
       const eventResult =
         await db.query(
           `
@@ -902,8 +926,10 @@ app.get(
         );
 
       const lastEventAt =
-        eventResult.rowCount > 0
-          ? eventResult.rows[0].created_at
+        eventResult.rowCount >
+        0
+          ? eventResult.rows[0]
+              .created_at
           : null;
 
       return res.json(
@@ -932,10 +958,10 @@ app.get(
             site.created_at
         })
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[VERIFY ERROR]",
-        e
+        error
       );
 
       return res
@@ -957,6 +983,21 @@ app.post(
   "/api/v1/intelligence",
   async (req, res) => {
     try {
+      /*
+       * authenticate() has already verified
+       * x-admin-secret.
+       */
+
+      if (!req.isAdminRoute) {
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized_internal_access"
+            )
+          );
+      }
+
       const siteId =
         typeof req.body?.siteId ===
         "string"
@@ -989,6 +1030,9 @@ app.post(
           );
       }
 
+      /*
+       * Verify installation.
+       */
       const siteResult =
         await db.query(
           `
@@ -1029,6 +1073,10 @@ app.post(
           );
       }
 
+      /* ─────────────────────────────────────────
+         EVENT TELEMETRY
+      ───────────────────────────────────────── */
+
       const eventsResult =
         await db.query(
           `
@@ -1044,6 +1092,10 @@ app.post(
           `,
           [siteId]
         );
+
+      /* ─────────────────────────────────────────
+         DECISION PERFORMANCE
+      ───────────────────────────────────────── */
 
       const decisionsResult =
         await db.query(
@@ -1069,6 +1121,10 @@ app.post(
           `,
           [siteId]
         );
+
+      /* ─────────────────────────────────────────
+         RECOVERY OPERATIONS
+      ───────────────────────────────────────── */
 
       const recoveryResult =
         await db.query(
@@ -1102,6 +1158,10 @@ app.post(
           `,
           [siteId]
         );
+
+      /* ─────────────────────────────────────────
+         EMAIL OPERATIONS
+      ───────────────────────────────────────── */
 
       const emailResult =
         await db.query(
@@ -1159,12 +1219,14 @@ app.post(
 
       const completedDecisions =
         Number(
-          decision.completed_decisions || 0
+          decision.completed_decisions ||
+            0
         );
 
       const conversions =
         Number(
-          decision.conversions || 0
+          decision.conversions ||
+            0
         );
 
       const conversionRate =
@@ -1178,26 +1240,42 @@ app.post(
             )
           : 0;
 
-      const eventCount = (name) =>
+      const eventCount = (
+        name
+      ) =>
         events.find(
           (item) =>
             item.event === name
         )?.count || 0;
 
       const pageViews =
-        eventCount("PAGE_VIEW");
+        eventCount(
+          "PAGE_VIEW"
+        );
 
       const productViews =
-        eventCount("PRODUCT_VIEW");
+        eventCount(
+          "PRODUCT_VIEW"
+        );
 
       const addToCart =
-        eventCount("ADD_TO_CART");
+        eventCount(
+          "ADD_TO_CART"
+        );
 
       const checkoutStarted =
-        eventCount("CHECKOUT_STARTED");
+        eventCount(
+          "CHECKOUT_STARTED"
+        );
 
       const purchases =
-        eventCount("PURCHASE");
+        eventCount(
+          "PURCHASE"
+        );
+
+      /* ─────────────────────────────────────────
+         GROUNDED RESPONSE ENGINE
+      ───────────────────────────────────────── */
 
       const q =
         question.toLowerCase();
@@ -1350,39 +1428,46 @@ app.post(
 
               revenue:
                 Number(
-                  decision.revenue || 0
+                  decision.revenue ||
+                    0
                 )
             },
 
             recovery: {
               total:
                 Number(
-                  recovery.total || 0
+                  recovery.total ||
+                    0
                 ),
 
               pending:
                 Number(
-                  recovery.pending || 0
+                  recovery.pending ||
+                    0
                 ),
 
               processing:
                 Number(
-                  recovery.processing || 0
+                  recovery.processing ||
+                    0
                 ),
 
               sent:
                 Number(
-                  recovery.sent || 0
+                  recovery.sent ||
+                    0
                 ),
 
               completed:
                 Number(
-                  recovery.completed || 0
+                  recovery.completed ||
+                    0
                 ),
 
               failed:
                 Number(
-                  recovery.failed || 0
+                  recovery.failed ||
+                    0
                 )
             },
 
@@ -1390,10 +1475,10 @@ app.post(
           }
         })
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[INTELLIGENCE ERROR]",
-        e
+        error
       );
 
       return res
@@ -1568,10 +1653,10 @@ app.post(
             safeEventId
         })
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[EVENT ERROR]",
-        e
+        error
       );
 
       res
@@ -1628,8 +1713,10 @@ app.post(
       const action =
         (await pickAction({
           session_id,
-          cart_value: value,
-          behavior: payload || {}
+          cart_value:
+            value,
+          behavior:
+            payload || {}
         })) || "NONE";
 
       const discountMap = {
@@ -1640,7 +1727,8 @@ app.post(
       };
 
       const discount =
-        discountMap[action] || 0;
+        discountMap[action] ||
+        0;
 
       const result =
         await db.query(
@@ -1681,7 +1769,8 @@ app.post(
       res.json(
         success({
           decision_id:
-            result.rows[0].id,
+            result.rows[0]
+              .id,
 
           action,
 
@@ -1689,14 +1778,15 @@ app.post(
 
           propensity_score:
             payload?.scroll_depth
-              ? payload.scroll_depth / 100
+              ? payload.scroll_depth /
+                100
               : 0.5
         })
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[SCORE ERROR]",
-        e
+        error
       );
 
       res
@@ -1761,10 +1851,10 @@ app.post(
           actioned: true
         })
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[ACTION ERROR]",
-        e
+        error
       );
 
       res
@@ -1834,7 +1924,8 @@ app.post(
       }
 
       if (
-        existing.rows[0].state ===
+        existing.rows[0]
+          .state ===
         "COMPLETED"
       ) {
         return res
@@ -1866,7 +1957,8 @@ app.post(
       );
 
       await updateBandit(
-        existing.rows[0].action,
+        existing.rows[0]
+          .action,
         !!converted
       );
 
@@ -1875,10 +1967,10 @@ app.post(
           updated: true
         })
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[OUTCOME ERROR]",
-        e
+        error
       );
 
       res
@@ -1927,19 +2019,25 @@ app.get(
       res.json(
         success({
           total:
-            Number(row.total),
+            Number(
+              row.total
+            ),
 
           conversions:
-            Number(row.conversions),
+            Number(
+              row.conversions
+            ),
 
           revenue:
-            Number(row.revenue)
+            Number(
+              row.revenue
+            )
         })
       );
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[METRICS ERROR]",
-        e
+        error
       );
 
       res
@@ -1954,7 +2052,7 @@ app.get(
 );
 
 /* ─────────────────────────────────────────────
-   PAYSTACK
+   PAYSTACK WEBHOOK
 ───────────────────────────────────────────── */
 
 app.use(
@@ -1963,7 +2061,7 @@ app.use(
 );
 
 /* ─────────────────────────────────────────────
-   RECOVERY CRON
+   CRON SYSTEM ENGINE
 ───────────────────────────────────────────── */
 
 cron.schedule(
@@ -2009,14 +2107,14 @@ cron.schedule(
       await client.query(
         "COMMIT"
       );
-    } catch (e) {
+    } catch (error) {
       await client.query(
         "ROLLBACK"
       );
 
       console.error(
         "[CRON BATCH CLAIM ERROR]",
-        e
+        error
       );
     } finally {
       client.release();
@@ -2039,7 +2137,8 @@ cron.schedule(
           );
 
         if (
-          conversionCheck.rowCount > 0
+          conversionCheck.rowCount >
+          0
         ) {
           await db.query(
             `
@@ -2097,10 +2196,10 @@ cron.schedule(
             item.customer_email
           ]
         );
-      } catch (e) {
+      } catch (error) {
         console.error(
           `[RECOVERY EMAIL SEND ERROR] Target: ${item.customer_email}`,
-          e
+          error
         );
 
         await db.query(
@@ -2117,10 +2216,6 @@ cron.schedule(
     }
   }
 );
-
-/* ─────────────────────────────────────────────
-   DAILY REPORT CRON
-───────────────────────────────────────────── */
 
 cron.schedule(
   "0 8 * * *",
@@ -2232,10 +2327,10 @@ cron.schedule(
           ]
         );
       }
-    } catch (e) {
+    } catch (error) {
       console.error(
         "[DAILY REPORT CRON FAILURE]",
-        e
+        error
       );
     }
   },
@@ -2324,10 +2419,10 @@ const shutdownHandler =
           }
 
           process.exit(0);
-        } catch (e) {
+        } catch (error) {
           console.error(
             "[SHUTDOWN ERROR]",
-            e
+            error
           );
 
           process.exit(1);
