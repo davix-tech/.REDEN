@@ -27,8 +27,6 @@ import {
   sendRecoveryEmail
 } from "../notification/emailEngine.js";
 
-import paystackRoutes from "./routes/paystack.js";
-
 dotenv.config();
 
 /* =========================================================
@@ -43,8 +41,12 @@ const ADMIN_SECRET =
   process.env.REDEN_ADMIN_SECRET ||
   process.env.ADMIN_SECRET;
 
-const PAYSTACK_SECRET_KEY =
-  process.env.PAYSTACK_SECRET_KEY;
+/*
+ * Paystack is intentionally not required here.
+ *
+ * REDEN intelligence, telemetry, decisions and recovery
+ * can operate independently of payment-provider credentials.
+ */
 
 if (!DATABASE_URL) {
   throw new Error(
@@ -55,12 +57,6 @@ if (!DATABASE_URL) {
 if (!ADMIN_SECRET) {
   throw new Error(
     "Missing mandatory environment variable: REDEN_ADMIN_SECRET or ADMIN_SECRET"
-  );
-}
-
-if (!PAYSTACK_SECRET_KEY) {
-  console.warn(
-    "[ENV] PAYSTACK_SECRET_KEY is missing. Paystack functionality may be unavailable."
   );
 }
 
@@ -394,30 +390,10 @@ const isPublicAsset = (pathname) =>
    ROUTE CLASSIFICATION
 ========================================================= */
 
-/*
- * Public routes.
- *
- * Installation lookup is intentionally public.
- * It only returns installation metadata and never
- * returns the merchant API key.
- */
-
 const isPublicRoute = (req) =>
   isPublicAsset(req.path) ||
   req.path === "/api/v1/verify" ||
-  req.path === "/api/v1/installation" ||
-  req.path.startsWith("/paystack");
-
-/*
- * Internal PRETHIM -> REDEN routes.
- *
- * These use REDEN_ADMIN_SECRET / ADMIN_SECRET.
- *
- * IMPORTANT:
- *
- * /api/v1/intelligence does NOT use merchant
- * x-api-key authentication.
- */
+  req.path === "/api/v1/installation";
 
 const isAdminRoute = (req) =>
   req.path === "/api/v1/intelligence" ||
@@ -475,6 +451,9 @@ async function authenticate(
 
     /*
      * INTERNAL PRETHIM -> REDEN
+     *
+     * Intelligence and onboarding use ONLY
+     * x-admin-secret.
      */
 
     if (isAdminRoute(req)) {
@@ -670,25 +649,13 @@ app.use(authenticate);
 
 app.use(
   (req, res, next) => {
-    /*
-     * Public route.
-     */
-
     if (isPublicRoute(req)) {
       return next();
     }
 
-    /*
-     * Internal route.
-     */
-
     if (isAdminRoute(req)) {
       return next();
     }
-
-    /*
-     * Merchant route.
-     */
 
     if (!req.site?.site_id) {
       return res
@@ -962,18 +929,6 @@ app.post(
    INSTALLATION LOOKUP
 ========================================================= */
 
-/*
- * IMPORTANT:
- *
- * This remains PUBLIC.
- *
- * The dashboard question flow should NOT depend on
- * this endpoint for intelligence.
- *
- * It returns installation metadata only.
- * It never returns api_key.
- */
-
 app.get(
   "/api/v1/installation",
   async (req, res) => {
@@ -1203,8 +1158,10 @@ app.post(
   async (req, res) => {
     try {
       /*
-       * This route is ONLY accessible through
-       * the internal x-admin-secret authentication.
+       * DO NOT REMOVE THIS.
+       *
+       * This protects the intelligence endpoint
+       * without using merchant credentials.
        */
 
       if (!req.isAdminRoute) {
@@ -1263,7 +1220,7 @@ app.post(
       }
 
       /* ===================================================
-         VERIFY INSTALLATION
+         SITE
       =================================================== */
 
       const siteResult =
@@ -1334,7 +1291,6 @@ app.post(
             (row) => ({
               event:
                 row.event,
-
               count:
                 Number(
                   row.count
@@ -1567,8 +1523,7 @@ app.post(
         );
 
       const conversionRate =
-        completedDecisions >
-        0
+        completedDecisions > 0
           ? Number(
               (
                 (
@@ -1615,403 +1570,452 @@ app.post(
         );
 
       /* ===================================================
-         QUESTION UNDERSTANDING
+         BRAIN HELPERS
       =================================================== */
 
       const q =
         question
           .toLowerCase()
-          .replace(
-            /[?!.,]/g,
-            " "
-          )
-          .replace(
-            /\s+/g,
-            " "
-          )
+          .replace(/[?!.,;:]+/g, " ")
+          .replace(/\s+/g, " ")
           .trim();
 
-      /*
-       * REDEN IS A BUSINESS INTELLIGENCE ENGINE.
-       *
-       * It must not answer unrelated/general questions.
-       */
-
-      const businessTerms = [
-        "performance",
-        "today",
-        "yesterday",
-        "happening",
-        "overview",
-        "summary",
-        "conversion",
-        "convert",
-        "converting",
-        "revenue",
-        "sales",
-        "money",
-        "earned",
-        "income",
-        "traffic",
-        "visitor",
-        "visitors",
-        "views",
-        "view",
-        "page",
-        "pages",
-        "product",
-        "products",
-        "cart",
-        "checkout",
-        "abandon",
-        "abandoned",
-        "purchase",
-        "purchases",
-        "customer",
-        "customers",
-        "buyer",
-        "buyers",
-        "recovery",
-        "recover",
-        "email",
-        "emails",
-        "mail",
-        "decision",
-        "decisions",
-        "discount",
-        "incentive",
-        "funnel",
-        "store",
-        "shop",
-        "merchant",
-        "business",
-        "order",
-        "orders",
-        "activity",
-        "analytics",
-        "metric",
-        "metrics",
-        "reden"
-      ];
-
-      const hasBusinessIntent =
-        businessTerms.some(
-          (term) =>
-            q.includes(term)
+      const hasAny = (
+        phrases
+      ) =>
+        phrases.some(
+          (phrase) =>
+            q.includes(phrase)
         );
+
+      const money =
+        new Intl.NumberFormat(
+          "en-NG",
+          {
+            maximumFractionDigits: 2
+          }
+        ).format(revenue);
+
+      const formatNumber = (
+        value
+      ) =>
+        new Intl.NumberFormat(
+          "en-NG"
+        ).format(
+          Number(value || 0)
+        );
+
+      const totalVisitors =
+        pageViews;
+
+      const checkoutGap =
+        Math.max(
+          0,
+          checkoutStarted -
+            purchases
+        );
+
+      const totalEmails =
+        emails.reduce(
+          (sum, item) =>
+            sum +
+            Number(
+              item.count || 0
+            ),
+          0
+        );
+
+      /* ===================================================
+         QUESTION UNDERSTANDING
+      =================================================== */
 
       let answer = "";
 
-      /* ===================================================
-         NON-BUSINESS / ABSTRACT
-      =================================================== */
+      /*
+       * IDENTITY / BUSINESS UNDERSTANDING
+       */
 
-      if (!hasBusinessIntent) {
-        answer =
-          "Sorry, I can only answer questions related to your business. " +
-          "Ask me about performance, sales, revenue, conversions, " +
-          "traffic, customers, checkout activity, cart abandonment, " +
-          "recovery, email activity, or REDEN decisions.";
-      }
-
-      /* ===================================================
-         PERFORMANCE
-      =================================================== */
-
-      else if (
-        q.includes(
-          "performance"
-        ) ||
-        q.includes(
-          "today"
-        ) ||
-        q.includes(
-          "happening"
-        ) ||
-        q.includes(
-          "overview"
-        ) ||
-        q.includes(
-          "summary"
-        )
+      if (
+        hasAny([
+          "what do you think i do",
+          "what do i do",
+          "what is my business",
+          "what kind of business",
+          "what business am i in",
+          "what do you know about my business",
+          "what does my business do"
+        ])
       ) {
         answer =
-          `For ${site.name}, over the last 24 hours, REDEN recorded ` +
-          `${completedDecisions} completed decisions, ` +
-          `${conversions} conversions, and ` +
-          `${revenue} in attributed revenue. ` +
-          `The decision conversion rate is ` +
-          `${conversionRate}%. ` +
-          `Storefront activity includes ` +
-          `${pageViews} page views, ` +
-          `${productViews} product views, ` +
-          `${addToCart} add-to-cart events, ` +
-          `${checkoutStarted} checkout starts, ` +
-          `and ${purchases} purchases.`;
+          `Based on the activity REDEN monitors, ` +
+          `${site.name} operates as an online storefront or digital business. ` +
+          `REDEN currently monitors its visitor activity, product interest, ` +
+          `cart activity, checkout behavior, purchases, decisions, ` +
+          `conversions and attributed revenue. ` +
+          `I can use those signals to help you understand how the business is performing.`;
       }
 
-      /* ===================================================
-         CONVERSION
-      =================================================== */
+      /*
+       * REVENUE / MONEY / EARNINGS
+       *
+       * Handles casual language:
+       * "how much did I earn?"
+       * "how much money did I make?"
+       * "what did I make?"
+       */
 
       else if (
-        q.includes(
+        hasAny([
+          "how much did i earn",
+          "how much have i earned",
+          "how much money did i make",
+          "how much money have i made",
+          "how much did i make",
+          "how much have i made",
+          "what did i earn",
+          "what have i earned",
+          "what did i make",
+          "what have i made",
+          "how much revenue",
+          "what is my revenue",
+          "whats my revenue",
+          "revenue",
+          "earnings",
+          "money made",
+          "money earned",
+          "sales revenue",
+          "income",
+          "how much did we earn",
+          "how much did we make",
+          "how much have we made",
+          "how much have we earned"
+        ])
+      ) {
+        answer =
+          `Over the last 24 hours, REDEN attributes ` +
+          `${money} in revenue to completed decisions for ${site.name}. ` +
+          `There were ${formatNumber(conversions)} conversions ` +
+          `from ${formatNumber(completedDecisions)} completed decisions.`;
+      }
+
+      /*
+       * TRAFFIC / VISITORS
+       *
+       * Handles:
+       * "how many people entered my site?"
+       * "how many visitors?"
+       * "how many people visited?"
+       */
+
+      else if (
+        hasAny([
+          "how many people entered",
+          "how many people came",
+          "how many people visited",
+          "how many visitors",
+          "how many users visited",
+          "how many users came",
+          "how many people came to my site",
+          "how many people entered my site",
+          "how many people visited my site",
+          "how many visitors did i get",
+          "how many visitors do i have",
+          "how many visitors came",
+          "how many people viewed my site",
+          "how many people saw my site",
+          "how much traffic",
+          "what is my traffic",
+          "whats my traffic",
+          "site traffic",
+          "visitors",
+          "visitor count",
+          "people on my site",
+          "people visited",
+          "traffic"
+        ])
+      ) {
+        answer =
+          `Over the last 24 hours, REDEN recorded ` +
+          `${formatNumber(totalVisitors)} page views on ${site.name}. ` +
+          `It also recorded ${formatNumber(productViews)} product views, ` +
+          `${formatNumber(addToCart)} add-to-cart events, ` +
+          `${formatNumber(checkoutStarted)} checkout starts, ` +
+          `and ${formatNumber(purchases)} purchases.`;
+      }
+
+      /*
+       * PURCHASES / ORDERS
+       */
+
+      else if (
+        hasAny([
+          "did anyone buy",
+          "did anybody buy",
+          "did someone buy",
+          "did anyone purchase",
+          "did anybody purchase",
+          "how many people bought",
+          "how many people purchased",
+          "how many purchases",
+          "how many orders",
+          "how many sales did i make",
+          "how many sales did we make",
+          "how many customers bought",
+          "how many customers purchased",
+          "did i make any sales",
+          "did we make any sales",
+          "any sales",
+          "any purchases",
+          "any orders",
+          "people bought",
+          "customers bought",
+          "purchases"
+        ])
+      ) {
+        answer =
+          `REDEN recorded ${formatNumber(purchases)} purchase events ` +
+          `over the last 24 hours. ` +
+          `There were ${formatNumber(conversions)} conversions ` +
+          `attributed to completed REDEN decisions.`;
+      }
+
+      /*
+       * CONVERSION
+       */
+
+      else if (
+        hasAny([
+          "conversion rate",
+          "convert",
+          "converted",
+          "conversions",
+          "how many converted",
+          "how many customers converted",
+          "how many people converted",
+          "are people converting",
+          "did people convert",
           "conversion"
-        ) ||
-        q.includes(
-          "convert"
-        ) ||
-        q.includes(
-          "converting"
-        )
+        ])
       ) {
         answer =
-          `REDEN recorded ${conversions} conversions from ` +
-          `${completedDecisions} completed decisions in the last 24 hours. ` +
-          `That gives a conversion rate of ` +
-          `${conversionRate}%. ` +
-          `Attributed revenue is ${revenue}.`;
+          `REDEN recorded ${formatNumber(conversions)} conversions ` +
+          `from ${formatNumber(completedDecisions)} completed decisions ` +
+          `over the last 24 hours. ` +
+          `The decision conversion rate is ${conversionRate}%. ` +
+          `Attributed revenue is ${money}.`;
       }
 
-      /* ===================================================
-         REVENUE / SALES
-      =================================================== */
+      /*
+       * SALES
+       */
 
       else if (
-        q.includes(
-          "revenue"
-        ) ||
-        q.includes(
+        hasAny([
+          "how are sales",
+          "how is sales",
+          "how are my sales",
+          "how is my sales",
+          "sales doing",
+          "how is business",
+          "how's business",
+          "how is the business",
+          "how is my business",
+          "business doing",
+          "are sales good",
+          "sales performance",
           "sales"
-        ) ||
-        q.includes(
-          "money"
-        ) ||
-        q.includes(
-          "earned"
-        ) ||
-        q.includes(
-          "income"
-        )
+        ])
       ) {
         answer =
-          `REDEN currently attributes ${revenue} in revenue ` +
-          `to completed decisions over the last 24 hours. ` +
-          `There were ${conversions} conversions from ` +
-          `${completedDecisions} completed decisions.`;
+          `Over the last 24 hours, ${site.name} recorded ` +
+          `${formatNumber(purchases)} purchases, ` +
+          `${formatNumber(conversions)} REDEN-attributed conversions, ` +
+          `and ${money} in attributed revenue. ` +
+          `The decision conversion rate is ${conversionRate}%.`;
       }
 
-      /* ===================================================
-         CHECKOUT / CART / ABANDONMENT
-      =================================================== */
+      /*
+       * CHECKOUT / CART / ABANDONMENT
+       */
 
       else if (
-        q.includes(
-          "abandon"
-        ) ||
-        q.includes(
-          "checkout"
-        ) ||
-        q.includes(
+        hasAny([
+          "abandon",
+          "abandoned",
+          "abandonment",
+          "left my cart",
+          "left their cart",
+          "left the cart",
+          "lost carts",
+          "lost cart",
+          "cart abandonment",
+          "checkout abandonment",
+          "checkout",
           "cart"
-        )
+        ])
       ) {
-        const checkoutGap =
-          Math.max(
-            0,
-            checkoutStarted -
-              purchases
-          );
-
         answer =
-          `REDEN recorded ${checkoutStarted} checkout starts and ` +
-          `${purchases} purchases in the last 24 hours. ` +
-          `The observed checkout-to-purchase gap is ` +
-          `${checkoutGap}. ` +
+          `REDEN recorded ${formatNumber(checkoutStarted)} checkout starts ` +
+          `and ${formatNumber(purchases)} purchases over the last 24 hours. ` +
+          `The observed checkout-to-purchase gap is ${formatNumber(checkoutGap)}. ` +
           `The recovery queue currently contains ` +
-          `${recovery.pending} pending, ` +
-          `${recovery.processing} processing, ` +
-          `${recovery.sent} sent, ` +
-          `${recovery.completed} completed, and ` +
-          `${recovery.failed} failed records.`;
+          `${formatNumber(recovery.pending)} pending, ` +
+          `${formatNumber(recovery.processing)} processing, ` +
+          `${formatNumber(recovery.sent)} sent, ` +
+          `${formatNumber(recovery.completed)} completed, ` +
+          `and ${formatNumber(recovery.failed)} failed records.`;
       }
 
-      /* ===================================================
-         RECOVERY
-      =================================================== */
+      /*
+       * RECOVERY
+       */
 
       else if (
-        q.includes(
-          "recovery"
-        ) ||
-        q.includes(
-          "recover"
-        )
+        hasAny([
+          "recovery",
+          "recover",
+          "recoveries",
+          "recovered customers",
+          "recover customers",
+          "recovery emails",
+          "recovery email"
+        ])
       ) {
         answer =
           `REDEN's recovery activity over the last 24 hours is ` +
-          `${recovery.pending} pending, ` +
-          `${recovery.processing} processing, ` +
-          `${recovery.sent} sent, ` +
-          `${recovery.completed} completed, and ` +
-          `${recovery.failed} failed. ` +
-          `There are ${recovery.total} recovery records in the period.`;
+          `${formatNumber(recovery.pending)} pending, ` +
+          `${formatNumber(recovery.processing)} processing, ` +
+          `${formatNumber(recovery.sent)} sent, ` +
+          `${formatNumber(recovery.completed)} completed, ` +
+          `and ${formatNumber(recovery.failed)} failed. ` +
+          `There are ${formatNumber(recovery.total)} recovery records in the period.`;
       }
 
-      /* ===================================================
-         EMAIL
-      =================================================== */
+      /*
+       * EMAIL
+       */
 
       else if (
-        q.includes(
-          "email"
-        ) ||
-        q.includes(
-          "emails"
-        ) ||
-        q.includes(
-          "mail"
-        )
+        hasAny([
+          "email",
+          "emails",
+          "mail",
+          "email activity",
+          "email performance"
+        ])
       ) {
-        const totalEmails =
-          emails.reduce(
-            (sum, item) =>
-              sum +
-              Number(
-                item.count ||
-                  0
-              ),
-            0
-          );
-
         answer =
-          `REDEN recorded ${totalEmails} email operations ` +
+          `REDEN recorded ${formatNumber(totalEmails)} email operations ` +
           `over the last 24 hours.`;
       }
 
-      /* ===================================================
-         TRAFFIC
-      =================================================== */
+      /*
+       * PRODUCT INTEREST
+       */
 
       else if (
-        q.includes(
-          "traffic"
-        ) ||
-        q.includes(
-          "visitor"
-        ) ||
-        q.includes(
-          "visitors"
-        ) ||
-        q.includes(
-          "views"
-        ) ||
-        q.includes(
-          "view"
-        ) ||
-        q.includes(
-          "page"
-        )
+        hasAny([
+          "product views",
+          "products viewed",
+          "people viewing products",
+          "people viewed products",
+          "product interest",
+          "interested in products",
+          "product activity"
+        ])
       ) {
         answer =
-          `In the last 24 hours, REDEN recorded ` +
-          `${pageViews} page views and ` +
-          `${productViews} product views. ` +
-          `There were also ${addToCart} add-to-cart events, ` +
-          `${checkoutStarted} checkout starts, and ` +
-          `${purchases} purchase events.`;
+          `REDEN recorded ${formatNumber(productViews)} product views ` +
+          `over the last 24 hours. ` +
+          `There were also ${formatNumber(addToCart)} add-to-cart events ` +
+          `and ${formatNumber(purchases)} purchases.`;
       }
 
-      /* ===================================================
-         PURCHASES / ORDERS
-      =================================================== */
+      /*
+       * PERFORMANCE / OVERVIEW
+       */
 
       else if (
-        q.includes(
-          "purchase"
-        ) ||
-        q.includes(
-          "purchases"
-        ) ||
-        q.includes(
-          "order"
-        ) ||
-        q.includes(
-          "orders"
-        )
+        hasAny([
+          "performance",
+          "how am i doing",
+          "how are we doing",
+          "how is everything",
+          "what is happening",
+          "what happened",
+          "what's happening",
+          "whats happening",
+          "give me an overview",
+          "give me a summary",
+          "summary",
+          "overview",
+          "today",
+          "store doing",
+          "store performance",
+          "business performance"
+        ])
       ) {
         answer =
-          `REDEN recorded ${purchases} purchase events in the last ` +
-          `24 hours. There were ${conversions} conversions from ` +
-          `${completedDecisions} completed decisions.`;
+          `For ${site.name}, over the last 24 hours, REDEN recorded ` +
+          `${formatNumber(completedDecisions)} completed decisions, ` +
+          `${formatNumber(conversions)} conversions, and ` +
+          `${money} in attributed revenue. ` +
+          `The decision conversion rate is ${conversionRate}%. ` +
+          `Storefront activity includes ` +
+          `${formatNumber(pageViews)} page views, ` +
+          `${formatNumber(productViews)} product views, ` +
+          `${formatNumber(addToCart)} add-to-cart events, ` +
+          `${formatNumber(checkoutStarted)} checkout starts, ` +
+          `and ${formatNumber(purchases)} purchases.`;
       }
 
-      /* ===================================================
-         DECISIONS
-      =================================================== */
+      /*
+       * TRAFFIC / FUNNEL
+       */
 
       else if (
-        q.includes(
-          "decision"
-        ) ||
-        q.includes(
-          "decisions"
-        )
+        hasAny([
+          "funnel",
+          "customer journey",
+          "journey",
+          "where are customers dropping",
+          "where are people dropping",
+          "where do people drop",
+          "where do customers drop"
+        ])
       ) {
         answer =
-          `REDEN completed ${completedDecisions} decisions over the ` +
-          `last 24 hours. ${conversions} converted, producing a ` +
-          `${conversionRate}% decision conversion rate and ` +
-          `${revenue} in attributed revenue.`;
+          `The current 24-hour funnel for ${site.name} is ` +
+          `${formatNumber(pageViews)} page views → ` +
+          `${formatNumber(productViews)} product views → ` +
+          `${formatNumber(addToCart)} add-to-cart events → ` +
+          `${formatNumber(checkoutStarted)} checkout starts → ` +
+          `${formatNumber(purchases)} purchases.`;
       }
 
-      /* ===================================================
-         CUSTOMER / STORE ACTIVITY
-      =================================================== */
-
-      else if (
-        q.includes(
-          "customer"
-        ) ||
-        q.includes(
-          "customers"
-        ) ||
-        q.includes(
-          "buyer"
-        ) ||
-        q.includes(
-          "buyers"
-        ) ||
-        q.includes(
-          "store"
-        ) ||
-        q.includes(
-          "business"
-        )
-      ) {
-        answer =
-          `${site.name} recorded ${pageViews} page views, ` +
-          `${productViews} product views, ${addToCart} add-to-cart events, ` +
-          `${checkoutStarted} checkout starts, and ${purchases} purchases ` +
-          `over the last 24 hours. REDEN recorded ${conversions} conversions ` +
-          `and ${revenue} in attributed revenue.`;
-      }
-
-      /* ===================================================
-         BUSINESS FALLBACK
-      =================================================== */
+      /*
+       * FALLBACK
+       *
+       * IMPORTANT:
+       * Unknown questions must NEVER cause an error.
+       *
+       * REDEN answers with the available business context.
+       */
 
       else {
         answer =
           `REDEN is monitoring ${site.name}. ` +
           `Over the last 24 hours there were ` +
-          `${pageViews} page views, ` +
-          `${productViews} product views, ` +
-          `${addToCart} add-to-cart events, ` +
-          `${checkoutStarted} checkout starts, ` +
-          `${purchases} purchases, ` +
-          `${conversions} conversions, and ` +
-          `${revenue} in attributed revenue.`;
+          `${formatNumber(pageViews)} page views, ` +
+          `${formatNumber(productViews)} product views, ` +
+          `${formatNumber(addToCart)} add-to-cart events, ` +
+          `${formatNumber(checkoutStarted)} checkout starts, ` +
+          `${formatNumber(purchases)} purchases, ` +
+          `${formatNumber(conversions)} conversions, ` +
+          `and ${money} in attributed revenue. ` +
+          `You can ask me naturally about your visitors, ` +
+          `sales, revenue, purchases, conversions, carts, ` +
+          `checkout activity, recovery, products, or overall business performance.`;
       }
 
       /* ===================================================
@@ -2060,6 +2064,13 @@ app.post(
         })
       );
     } catch (error) {
+      /*
+       * Intelligence errors are isolated here.
+       *
+       * They cannot affect authentication middleware
+       * or the rest of the REDEN API.
+       */
+
       console.error(
         "[INTELLIGENCE ERROR]",
         error
@@ -2652,15 +2663,6 @@ app.get(
 );
 
 /* =========================================================
-   PAYSTACK
-========================================================= */
-
-app.use(
-  "/paystack",
-  paystackRoutes
-);
-
-/* =========================================================
    RECOVERY CRON
 ========================================================= */
 
@@ -3031,6 +3033,10 @@ const server =
 
       console.log(
         `[REDEN] Dashboard intelligence: ENABLED`
+      );
+
+      console.log(
+        `[REDEN] Paystack dependency: DISABLED`
       );
     }
   );
