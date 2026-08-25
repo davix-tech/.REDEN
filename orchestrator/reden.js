@@ -31,13 +31,15 @@ import paystackRoutes from "./routes/paystack.js";
 
 dotenv.config();
 
-/* =========================================================
-   ENVIRONMENT
-========================================================= */
+/* ─────────────────────────────────────────────
+   ENVIRONMENT VALIDATION
+───────────────────────────────────────────── */
 
-const INTERNAL_ADMIN_SECRET =
+const redenAdminSecret = (
+  process.env.REDEN_ADMIN_SECRET ||
   process.env.ADMIN_SECRET ||
-  process.env.REDEN_ADMIN_SECRET;
+  ""
+).trim();
 
 const requiredEnv = [
   "DATABASE_URL",
@@ -52,15 +54,15 @@ for (const key of requiredEnv) {
   }
 }
 
-if (!INTERNAL_ADMIN_SECRET) {
+if (!redenAdminSecret) {
   throw new Error(
-    "Missing REDEN internal admin secret. Set ADMIN_SECRET."
+    "Missing mandatory environment variable: REDEN_ADMIN_SECRET or ADMIN_SECRET"
   );
 }
 
-/* =========================================================
-   DATABASE INITIALIZATION
-========================================================= */
+/* ─────────────────────────────────────────────
+   INITIALIZATION
+───────────────────────────────────────────── */
 
 await initDB();
 
@@ -94,28 +96,25 @@ try {
   );
 } catch (err) {
   console.error(
-    "[DB INIT ERROR] Failed to verify schema infrastructure:",
+    "[DB INIT ERROR] Failed to auto-create schema infrastructures:",
     err
   );
 }
 
 await initRedis();
 
-/* =========================================================
-   APP
-========================================================= */
-
 const app = express();
 
 app.set("trust proxy", true);
-app.disable("x-powered-by");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    SECURITY
-========================================================= */
+───────────────────────────────────────────── */
+
+app.disable("x-powered-by");
 
 app.use(
   helmet({
@@ -128,9 +127,9 @@ app.use(
 
 app.use(compression());
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    CORS
-========================================================= */
+───────────────────────────────────────────── */
 
 app.use((req, res, next) => {
   const publicOrigins = [
@@ -175,9 +174,9 @@ app.use((req, res, next) => {
   next();
 });
 
-/* =========================================================
-   RATE LIMITING
-========================================================= */
+/* ─────────────────────────────────────────────
+   RATE LIMITERS
+───────────────────────────────────────────── */
 
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -210,9 +209,9 @@ const telemetryLimiter = rateLimit({
 app.use("/event", telemetryLimiter);
 app.use(generalLimiter);
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    BODY PARSING
-========================================================= */
+───────────────────────────────────────────── */
 
 app.use(
   express.json({
@@ -232,7 +231,11 @@ app.use(
 
 app.use(timeout("15s"));
 
-const haltOnTimeout = (req, res, next) => {
+const haltOnTimeout = (
+  req,
+  res,
+  next
+) => {
   if (req.timedout) {
     return;
   }
@@ -242,9 +245,9 @@ const haltOnTimeout = (req, res, next) => {
 
 app.use(haltOnTimeout);
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    RESPONSE HELPERS
-========================================================= */
+───────────────────────────────────────────── */
 
 const success = (data = {}) => ({
   ok: true,
@@ -262,9 +265,9 @@ const failure = (
   timestamp: new Date().toISOString()
 });
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    UTILS
-========================================================= */
+───────────────────────────────────────────── */
 
 function validateNumber(value) {
   if (
@@ -282,20 +285,35 @@ function validateNumber(value) {
     : num;
 }
 
-function safeCompare(input, secret) {
+function safeCompare(
+  input,
+  secret
+) {
   if (
     !input ||
     !secret ||
     typeof input !== "string" ||
-    typeof secret !== "string" ||
-    input.length !== secret.length
+    typeof secret !== "string"
+  ) {
+    return false;
+  }
+
+  const inputBuffer =
+    Buffer.from(input, "utf8");
+
+  const secretBuffer =
+    Buffer.from(secret, "utf8");
+
+  if (
+    inputBuffer.length !==
+    secretBuffer.length
   ) {
     return false;
   }
 
   return crypto.timingSafeEqual(
-    Buffer.from(input, "utf8"),
-    Buffer.from(secret, "utf8")
+    inputBuffer,
+    secretBuffer
   );
 }
 
@@ -311,15 +329,21 @@ const VALID_EVENTS = new Set([
 ]);
 
 const isPublicAsset = (p) =>
-  ["/", "/health", "/sdk.js"].includes(p) ||
+  [
+    "/",
+    "/health",
+    "/sdk.js"
+  ].includes(p) ||
   /\.(png|jpg|jpeg|svg|css|js)$/i.test(p);
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    ROUTE CLASSIFICATION
-========================================================= */
+───────────────────────────────────────────── */
 
 /*
- * These routes do NOT require merchant credentials.
+ * Public routes.
+ *
+ * These do not require merchant credentials.
  */
 const isPublicRoute = (req) =>
   isPublicAsset(req.path) ||
@@ -327,27 +351,28 @@ const isPublicRoute = (req) =>
   req.path.startsWith("/paystack");
 
 /*
- * These routes are internal PRETHIM -> REDEN routes.
+ * Internal PRETHIM → REDEN routes.
  *
- * They use ADMIN_SECRET.
+ * These use the server-side REDEN admin secret.
  *
  * IMPORTANT:
- * They must NEVER fall through to merchant
- * x-api-key authentication.
+ * The browser never calls these directly.
  */
 const isAdminRoute = (req) =>
   req.path === "/api/v1/intelligence" ||
-  req.path === "/api/v1/installation" ||
-  req.path === "/api/v1/onboard";
+  req.path === "/api/v1/onboard" ||
+  req.path === "/api/v1/installation";
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    STATIC ASSETS
-========================================================= */
+───────────────────────────────────────────── */
 
 app.get(
   "/sdk.js",
   (req, res) => {
-    res.type("application/javascript");
+    res.type(
+      "application/javascript"
+    );
 
     res.sendFile(
       path.join(
@@ -370,11 +395,15 @@ app.use(
   )
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    AUTHENTICATION
-========================================================= */
+───────────────────────────────────────────── */
 
-async function authenticate(req, res, next) {
+async function authenticate(
+  req,
+  res,
+  next
+) {
   try {
     /*
      * Public routes bypass authentication.
@@ -384,9 +413,9 @@ async function authenticate(req, res, next) {
     }
 
     /*
-     * INTERNAL PRETHIM -> REDEN
+     * Internal PRETHIM → REDEN routes.
      *
-     * These routes use ADMIN_SECRET.
+     * These MUST use x-admin-secret.
      */
     if (isAdminRoute(req)) {
       const adminSecret =
@@ -395,12 +424,12 @@ async function authenticate(req, res, next) {
       if (
         typeof adminSecret !== "string" ||
         !safeCompare(
-          adminSecret,
-          INTERNAL_ADMIN_SECRET
+          adminSecret.trim(),
+          redenAdminSecret
         )
       ) {
         console.error(
-          `[AUTH] Unauthorized internal access: ${req.method} ${req.path}`
+          `[AUTH] Unauthorized internal request: ${req.method} ${req.path}`
         );
 
         return res
@@ -418,9 +447,12 @@ async function authenticate(req, res, next) {
     }
 
     /*
-     * MERCHANT SDK AUTHENTICATION
+     * Merchant SDK authentication.
      *
-     * Only actual storefront/SDK routes come here.
+     * These routes require:
+     *
+     * x-api-key
+     * x-site-id
      */
     const apiKey =
       req.headers["x-api-key"] ||
@@ -454,18 +486,28 @@ async function authenticate(req, res, next) {
     const cacheKey =
       `site:${normalizedSiteId}:${normalizedApiKey}`;
 
+    /*
+     * Redis authentication cache.
+     */
     if (redis) {
       const cached =
         await redis.get(cacheKey);
 
       if (cached) {
-        req.site =
-          JSON.parse(cached);
+        try {
+          req.site =
+            JSON.parse(cached);
 
-        return next();
+          return next();
+        } catch {
+          await redis.del(cacheKey);
+        }
       }
     }
 
+    /*
+     * Verify merchant installation.
+     */
     const result =
       await db.query(
         `
@@ -499,6 +541,10 @@ async function authenticate(req, res, next) {
     req.site =
       result.rows[0];
 
+    /*
+     * Cache verified merchant
+     * authentication for five minutes.
+     */
     if (redis) {
       await redis.set(
         cacheKey,
@@ -527,41 +573,50 @@ async function authenticate(req, res, next) {
 
 app.use(authenticate);
 
-/* =========================================================
-   SITE CONTEXT
-========================================================= */
+/* ─────────────────────────────────────────────
+   SITE CONTEXT GUARD
+───────────────────────────────────────────── */
 
-app.use((req, res, next) => {
-  if (isPublicRoute(req)) {
-    return next();
+app.use(
+  (req, res, next) => {
+    /*
+     * Public routes do not need site context.
+     */
+    if (isPublicRoute(req)) {
+      return next();
+    }
+
+    /*
+     * Internal admin routes were authenticated
+     * with REDEN_ADMIN_SECRET.
+     */
+    if (isAdminRoute(req)) {
+      return next();
+    }
+
+    /*
+     * All remaining routes require a verified
+     * merchant installation.
+     */
+    if (!req.site?.site_id) {
+      return res
+        .status(401)
+        .json(
+          failure(
+            "invalid_site_context"
+          )
+        );
+    }
+
+    next();
   }
-
-  /*
-   * Internal REDEN routes already have their
-   * own authenticated context.
-   */
-  if (isAdminRoute(req)) {
-    return next();
-  }
-
-  if (!req.site?.site_id) {
-    return res
-      .status(401)
-      .json(
-        failure(
-          "invalid_site_context"
-        )
-      );
-  }
-
-  next();
-});
+);
 
 app.use(haltOnTimeout);
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    ROOT
-========================================================= */
+───────────────────────────────────────────── */
 
 app.get(
   "/",
@@ -576,160 +631,49 @@ app.get(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    HEALTH
-========================================================= */
+───────────────────────────────────────────── */
 
 app.get(
   "/health",
   async (req, res) => {
-    let dbStatus = "healthy";
+    let dbStatus =
+      "healthy";
 
     try {
-      await db.query("SELECT 1");
+      await db.query(
+        "SELECT 1"
+      );
     } catch {
-      dbStatus = "unhealthy";
+      dbStatus =
+        "unhealthy";
     }
 
     const payload =
       success({
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        database: dbStatus
+        uptime:
+          process.uptime(),
+
+        memory:
+          process.memoryUsage(),
+
+        database:
+          dbStatus
       });
 
-    return dbStatus === "healthy"
+    return dbStatus ===
+      "healthy"
       ? res.json(payload)
-      : res.status(503).json(payload);
+      : res
+          .status(503)
+          .json(payload);
   }
 );
 
-/* =========================================================
-   INTERNAL INSTALLATION LOOKUP
-========================================================= */
-
-/*
- * PRETHIM uses this endpoint to resolve the REDEN
- * installation belonging to the authenticated user.
- *
- * This is NOT a merchant SDK endpoint.
- *
- * Therefore:
- *
- *   x-admin-secret
- *        ↓
- *   REDEN installation lookup
- *
- * No x-api-key.
- * No x-site-id.
- */
-app.get(
-  "/api/v1/installation",
-  async (req, res) => {
-    try {
-      if (!req.isAdminRoute) {
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
-      const ownerEmail =
-        typeof req.query.owner_email === "string"
-          ? req.query.owner_email
-              .trim()
-              .toLowerCase()
-          : "";
-
-      if (!ownerEmail) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "owner_email_required"
-            )
-          );
-      }
-
-      /*
-       * Return the active installation.
-       *
-       * Most PRETHIM accounts should have one
-       * installation.
-       */
-      const result =
-        await db.query(
-          `
-            SELECT
-              site_id,
-              name,
-              owner_email,
-              active,
-              plan,
-              subscription_status,
-              created_at
-            FROM sites
-            WHERE LOWER(owner_email) = $1
-              AND active = true
-            ORDER BY created_at DESC
-            LIMIT 1
-          `,
-          [ownerEmail]
-        );
-
-      if (!result.rowCount) {
-        return res
-          .status(404)
-          .json(
-            failure(
-              "reden_installation_not_found"
-            )
-          );
-      }
-
-      const site =
-        result.rows[0];
-
-      return res.json(
-        success({
-          installation: {
-            site_id: site.site_id,
-            store_name: site.name,
-            owner_email: site.owner_email,
-            status:
-              site.active
-                ? "active"
-                : "inactive",
-            plan: site.plan,
-            subscription_status:
-              site.subscription_status,
-            created_at: site.created_at
-          }
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[INSTALLATION LOOKUP ERROR]",
-        error
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "installation_lookup_failed"
-          )
-        );
-    }
-  }
-);
-
-/* =========================================================
+/* ─────────────────────────────────────────────
    ONBOARD
-========================================================= */
+───────────────────────────────────────────── */
 
 app.post(
   "/api/v1/onboard",
@@ -746,18 +690,23 @@ app.post(
       }
 
       const name =
-        typeof req.body?.name === "string"
+        typeof req.body?.name ===
+        "string"
           ? req.body.name.trim()
           : "";
 
       const ownerEmail =
-        typeof req.body?.owner_email === "string"
+        typeof req.body?.owner_email ===
+        "string"
           ? req.body.owner_email
               .trim()
               .toLowerCase()
           : "";
 
-      if (!name || !ownerEmail) {
+      if (
+        !name ||
+        !ownerEmail
+      ) {
         return res
           .status(400)
           .json(
@@ -773,6 +722,9 @@ app.post(
           );
       }
 
+      /*
+       * Existing installation.
+       */
       const existing =
         await db.query(
           `
@@ -796,10 +748,15 @@ app.post(
           ]
         );
 
-      if (existing.rowCount > 0) {
+      if (
+        existing.rowCount > 0
+      ) {
         const site =
           existing.rows[0];
 
+        /*
+         * Re-enable disabled installation.
+         */
         if (!site.active) {
           await db.query(
             `
@@ -813,6 +770,9 @@ app.post(
           );
         }
 
+        /*
+         * Clear cached authentication.
+         */
         if (redis) {
           await redis.del(
             `site:${site.site_id}:${site.api_key}`
@@ -828,15 +788,28 @@ app.post(
           .json(
             success({
               existing: true,
-              siteId: site.site_id,
-              apiKey: site.api_key,
-              name: site.name,
-              plan: site.plan,
-              subscriptionStatus: "active"
+
+              siteId:
+                site.site_id,
+
+              apiKey:
+                site.api_key,
+
+              name:
+                site.name,
+
+              plan:
+                site.plan,
+
+              subscriptionStatus:
+                "active"
             })
           );
       }
 
+      /*
+       * New installation.
+       */
       const siteId =
         `site_${crypto.randomBytes(8).toString("hex")}`;
 
@@ -881,11 +854,18 @@ app.post(
         .json(
           success({
             existing: false,
+
             siteId,
+
             apiKey,
+
             name,
-            plan: "basic",
-            subscriptionStatus: "active"
+
+            plan:
+              "basic",
+
+            subscriptionStatus:
+              "active"
           })
         );
     } catch (error) {
@@ -905,16 +885,148 @@ app.post(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
+   INSTALLATION LOOKUP
+───────────────────────────────────────────── */
+
+/*
+ * Used internally by PRETHIM to resolve
+ * the REDEN installation belonging to the
+ * authenticated PRETHIM account.
+ *
+ * This endpoint does NOT use merchant
+ * x-api-key authentication.
+ *
+ * It uses x-admin-secret.
+ */
+
+app.get(
+  "/api/v1/installation",
+  async (req, res) => {
+    try {
+      if (!req.isAdminRoute) {
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized_internal_access"
+            )
+          );
+      }
+
+      const ownerEmail =
+        typeof req.query.owner_email ===
+        "string"
+          ? req.query.owner_email
+              .trim()
+              .toLowerCase()
+          : "";
+
+      if (!ownerEmail) {
+        return res
+          .status(400)
+          .json(
+            failure(
+              "owner_email_required"
+            )
+          );
+      }
+
+      /*
+       * Find the latest installation belonging
+       * to this PRETHIM account.
+       */
+      const result =
+        await db.query(
+          `
+            SELECT
+              site_id,
+              name,
+              owner_email,
+              active,
+              plan,
+              subscription_status,
+              created_at
+            FROM sites
+            WHERE LOWER(owner_email) = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+          `,
+          [ownerEmail]
+        );
+
+      if (!result.rowCount) {
+        return res
+          .status(404)
+          .json(
+            failure(
+              "installation_not_found"
+            )
+          );
+      }
+
+      const site =
+        result.rows[0];
+
+      return res.json(
+        success({
+          installation: {
+            site_id:
+              site.site_id,
+
+            store_name:
+              site.name,
+
+            name:
+              site.name,
+
+            status:
+              site.active
+                ? "active"
+                : "inactive",
+
+            active:
+              site.active,
+
+            plan:
+              site.plan,
+
+            subscription_status:
+              site.subscription_status,
+
+            created_at:
+              site.created_at
+          }
+        })
+      );
+    } catch (error) {
+      console.error(
+        "[INSTALLATION LOOKUP ERROR]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json(
+          failure(
+            "installation_lookup_failed"
+          )
+        );
+    }
+  }
+);
+
+/* ─────────────────────────────────────────────
    INSTALLATION VERIFICATION
-========================================================= */
+───────────────────────────────────────────── */
 
 app.get(
   "/api/v1/verify",
   async (req, res) => {
     try {
       const siteId =
-        typeof req.query.siteId === "string"
+        typeof req.query.siteId ===
+        "string"
           ? req.query.siteId.trim()
           : "";
 
@@ -973,21 +1085,34 @@ app.get(
 
       const lastEventAt =
         eventResult.rowCount > 0
-          ? eventResult.rows[0].created_at
+          ? eventResult.rows[0]
+              .created_at
           : null;
 
       return res.json(
         success({
-          siteId: site.site_id,
-          name: site.name,
-          active: site.active,
-          plan: site.plan,
+          siteId:
+            site.site_id,
+
+          name:
+            site.name,
+
+          active:
+            site.active,
+
+          plan:
+            site.plan,
+
           subscriptionStatus:
             site.subscription_status,
+
           connected:
             Boolean(lastEventAt),
+
           lastEventAt,
-          createdAt: site.created_at
+
+          createdAt:
+            site.created_at
         })
       );
     } catch (error) {
@@ -1007,14 +1132,18 @@ app.get(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    REDEN INTELLIGENCE
-========================================================= */
+───────────────────────────────────────────── */
 
 app.post(
   "/api/v1/intelligence",
   async (req, res) => {
     try {
+      /*
+       * authenticate() already verified
+       * x-admin-secret.
+       */
       if (!req.isAdminRoute) {
         return res
           .status(401)
@@ -1026,12 +1155,14 @@ app.post(
       }
 
       const siteId =
-        typeof req.body?.siteId === "string"
+        typeof req.body?.siteId ===
+        "string"
           ? req.body.siteId.trim()
           : "";
 
       const question =
-        typeof req.body?.question === "string"
+        typeof req.body?.question ===
+        "string"
           ? req.body.question.trim()
           : "";
 
@@ -1108,9 +1239,9 @@ app.post(
           );
       }
 
-      /* =====================================================
+      /* ─────────────────────────────────────────
          EVENT TELEMETRY
-      ===================================================== */
+      ───────────────────────────────────────── */
 
       const eventsResult =
         await db.query(
@@ -1128,9 +1259,9 @@ app.post(
           [siteId]
         );
 
-      /* =====================================================
+      /* ─────────────────────────────────────────
          DECISION PERFORMANCE
-      ===================================================== */
+      ───────────────────────────────────────── */
 
       const decisionsResult =
         await db.query(
@@ -1148,7 +1279,9 @@ app.post(
                 ),
                 0
               ) AS revenue
+
             FROM decisions
+
             WHERE site_id = $1
               AND state = 'COMPLETED'
               AND completed_at >= NOW()
@@ -1157,9 +1290,9 @@ app.post(
           [siteId]
         );
 
-      /* =====================================================
-         RECOVERY
-      ===================================================== */
+      /* ─────────────────────────────────────────
+         RECOVERY OPERATIONS
+      ───────────────────────────────────────── */
 
       const recoveryResult =
         await db.query(
@@ -1186,7 +1319,9 @@ app.post(
               COUNT(*) FILTER (
                 WHERE status = 'FAILED'
               )::int AS failed
+
             FROM recovery_queue
+
             WHERE site_id = $1
               AND created_at >= NOW()
                 - INTERVAL '24 hours'
@@ -1194,9 +1329,9 @@ app.post(
           [siteId]
         );
 
-      /* =====================================================
-         EMAILS
-      ===================================================== */
+      /* ─────────────────────────────────────────
+         EMAIL OPERATIONS
+      ───────────────────────────────────────── */
 
       const emailResult =
         await db.query(
@@ -1205,13 +1340,17 @@ app.post(
               email_type,
               status,
               COUNT(*)::int AS count
+
             FROM email_logs
+
             WHERE site_id = $1
               AND created_at >= NOW()
                 - INTERVAL '24 hours'
+
             GROUP BY
               email_type,
               status
+
             ORDER BY count DESC
           `,
           [siteId]
@@ -1220,23 +1359,44 @@ app.post(
       const events =
         eventsResult.rows.map(
           (row) => ({
-            event: row.event,
-            count: Number(row.count)
+            event:
+              row.event,
+
+            count:
+              Number(row.count)
           })
         );
 
       const decision =
-        decisionsResult.rows[0] || {};
+        decisionsResult.rows[0] ||
+        {
+          completed_decisions: 0,
+          conversions: 0,
+          revenue: 0
+        };
 
       const recovery =
-        recoveryResult.rows[0] || {};
+        recoveryResult.rows[0] ||
+        {
+          total: 0,
+          pending: 0,
+          processing: 0,
+          sent: 0,
+          completed: 0,
+          failed: 0
+        };
 
       const emails =
         emailResult.rows.map(
           (row) => ({
-            type: row.email_type,
-            status: row.status,
-            count: Number(row.count)
+            type:
+              row.email_type,
+
+            status:
+              row.status,
+
+            count:
+              Number(row.count)
           })
         );
 
@@ -1250,11 +1410,6 @@ app.post(
           decision.conversions || 0
         );
 
-      const revenue =
-        Number(
-          decision.revenue || 0
-        );
-
       const conversionRate =
         completedDecisions > 0
           ? Number(
@@ -1266,7 +1421,9 @@ app.post(
             )
           : 0;
 
-      const eventCount = (name) =>
+      const eventCount = (
+        name
+      ) =>
         events.find(
           (item) =>
             item.event === name
@@ -1287,47 +1444,9 @@ app.post(
       const purchases =
         eventCount("PURCHASE");
 
-      const checkoutGap =
-        Math.max(
-          0,
-          checkoutStarted - purchases
-        );
-
-      const recoveryPending =
-        Number(
-          recovery.pending || 0
-        );
-
-      const recoveryProcessing =
-        Number(
-          recovery.processing || 0
-        );
-
-      const recoverySent =
-        Number(
-          recovery.sent || 0
-        );
-
-      const recoveryCompleted =
-        Number(
-          recovery.completed || 0
-        );
-
-      const recoveryFailed =
-        Number(
-          recovery.failed || 0
-        );
-
-      const totalEmails =
-        emails.reduce(
-          (sum, item) =>
-            sum + item.count,
-          0
-        );
-
-      /* =====================================================
-         GROUNDED ANSWER ENGINE
-      ===================================================== */
+      /* ─────────────────────────────────────────
+         GROUNDED RESPONSE ENGINE
+      ───────────────────────────────────────── */
 
       const q =
         question.toLowerCase();
@@ -1338,18 +1457,19 @@ app.post(
         q.includes("performance") ||
         q.includes("today") ||
         q.includes("happening") ||
-        q.includes("happened") ||
-        q.includes("overview") ||
-        q.includes("summary")
+        q.includes("happened")
       ) {
         answer =
-          `Over the last 24 hours, ${site.name} recorded ` +
+          `In the last 24 hours, REDEN recorded ` +
           `${completedDecisions} completed decisions, ` +
           `${conversions} conversions, and ` +
-          `${revenue} in attributed revenue. ` +
-          `The decision conversion rate was ` +
+          `${Number(
+            decision.revenue || 0
+          )} in attributed revenue. ` +
+          `The completed-decision conversion rate was ` +
           `${conversionRate}%. ` +
-          `Telemetry recorded ${pageViews} page views, ` +
+          `Storefront telemetry recorded ` +
+          `${pageViews} page views, ` +
           `${productViews} product views, ` +
           `${addToCart} add-to-cart events, ` +
           `${checkoutStarted} checkout starts, ` +
@@ -1359,91 +1479,90 @@ app.post(
         q.includes("checkout") ||
         q.includes("cart")
       ) {
+        const gap =
+          Math.max(
+            0,
+            checkoutStarted -
+              purchases
+          );
+
         answer =
-          `REDEN recorded ${checkoutStarted} checkout starts ` +
-          `and ${purchases} purchase events in the last 24 hours. ` +
+          `REDEN recorded ` +
+          `${checkoutStarted} checkout starts ` +
+          `and ${purchases} purchase events ` +
+          `in the last 24 hours. ` +
           `The observed checkout-to-purchase gap is ` +
-          `${checkoutGap}. ` +
-          `The recovery queue currently has ` +
-          `${recoveryPending} pending, ` +
-          `${recoverySent} sent, ` +
-          `${recoveryCompleted} completed, and ` +
-          `${recoveryFailed} failed records.`;
+          `${gap}. ` +
+          `The recovery queue contains ` +
+          `${Number(
+            recovery.pending || 0
+          )} pending, ` +
+          `${Number(
+            recovery.sent || 0
+          )} sent, ` +
+          `${Number(
+            recovery.completed || 0
+          )} completed, and ` +
+          `${Number(
+            recovery.failed || 0
+          )} failed records.`;
       } else if (
         q.includes("recovery") ||
         q.includes("recover")
       ) {
         answer =
           `Recovery activity over the last 24 hours: ` +
-          `${recoveryPending} pending, ` +
-          `${recoveryProcessing} processing, ` +
-          `${recoverySent} sent, ` +
-          `${recoveryCompleted} completed, and ` +
-          `${recoveryFailed} failed.`;
+          `${Number(
+            recovery.pending || 0
+          )} pending, ` +
+          `${Number(
+            recovery.processing || 0
+          )} processing, ` +
+          `${Number(
+            recovery.sent || 0
+          )} sent, ` +
+          `${Number(
+            recovery.completed || 0
+          )} completed, and ` +
+          `${Number(
+            recovery.failed || 0
+          )} failed.`;
       } else if (
         q.includes("conversion") ||
         q.includes("convert")
       ) {
         answer =
-          `${site.name} recorded ${conversions} conversions ` +
-          `from ${completedDecisions} completed decisions ` +
-          `in the last 24 hours. ` +
-          `That produces a ${conversionRate}% conversion rate ` +
-          `and ${revenue} in attributed revenue.`;
-      } else if (
-        q.includes("revenue") ||
-        q.includes("sales") ||
-        q.includes("money") ||
-        q.includes("earned")
-      ) {
-        answer =
-          `REDEN attributed ${revenue} in revenue to ` +
-          `completed decisions during the last 24 hours. ` +
-          `${conversions} conversions were recorded from ` +
-          `${completedDecisions} completed decisions.`;
+          `REDEN recorded ` +
+          `${conversions} conversions from ` +
+          `${completedDecisions} completed decisions ` +
+          `in the last 24 hours, giving a conversion rate of ` +
+          `${conversionRate}%. ` +
+          `Attributed revenue was ` +
+          `${Number(
+            decision.revenue || 0
+          )}.`;
       } else if (
         q.includes("email") ||
         q.includes("mail")
       ) {
+        const totalEmails =
+          emails.reduce(
+            (sum, item) =>
+              sum + item.count,
+            0
+          );
+
         answer =
-          `REDEN recorded ${totalEmails} email operations ` +
-          `during the last 24 hours. ` +
-          `The recovery queue currently has ` +
-          `${recoveryPending} pending, ` +
-          `${recoverySent} sent, ` +
-          `${recoveryCompleted} completed, and ` +
-          `${recoveryFailed} failed records.`;
-      } else if (
-        q.includes("traffic") ||
-        q.includes("visitor") ||
-        q.includes("visitors") ||
-        q.includes("views")
-      ) {
-        answer =
-          `Storefront telemetry recorded ` +
-          `${pageViews} page views and ` +
-          `${productViews} product views during the last 24 hours. ` +
-          `There were ${addToCart} add-to-cart events, ` +
-          `${checkoutStarted} checkout starts, and ` +
-          `${purchases} purchases.`;
-      } else if (
-        q.includes("site") ||
-        q.includes("store") ||
-        q.includes("status") ||
-        q.includes("connected")
-      ) {
-        answer =
-          `${site.name} is currently active on REDEN ` +
-          `under the ${site.plan} plan. ` +
-          `The subscription status is ` +
-          `${site.subscription_status}.`;
+          `REDEN recorded ` +
+          `${totalEmails} email operations ` +
+          `in the last 24 hours.`;
       } else {
         answer =
-          `I can analyze ${site.name}'s REDEN data, including ` +
-          `performance, revenue, conversions, traffic, ` +
-          `checkout abandonment, recovery activity, ` +
-          `and email operations. ` +
-          `Ask me a question about any of those areas.`;
+          `I can analyze ${site.name}'s REDEN telemetry, ` +
+          `decision performance, conversion activity, ` +
+          `recovery queue, and email operations. ` +
+          `Ask me about performance, conversions, ` +
+          `checkout abandonment, recovery, or email activity.`;
       }
 
       return res.json(
@@ -1451,24 +1570,37 @@ app.post(
           answer,
 
           site: {
-            siteId: site.site_id,
-            name: site.name,
-            plan: site.plan,
+            siteId:
+              site.site_id,
+
+            name:
+              site.name,
+
+            plan:
+              site.plan,
+
             subscriptionStatus:
               site.subscription_status
           },
 
           evidence: {
-            period: "last_24_hours",
+            period:
+              "last_24_hours",
 
             events,
 
             decisions: {
               completed:
                 completedDecisions,
+
               conversions,
+
               conversionRate,
-              revenue
+
+              revenue:
+                Number(
+                  decision.revenue || 0
+                )
             },
 
             recovery: {
@@ -1476,16 +1608,31 @@ app.post(
                 Number(
                   recovery.total || 0
                 ),
+
               pending:
-                recoveryPending,
+                Number(
+                  recovery.pending || 0
+                ),
+
               processing:
-                recoveryProcessing,
+                Number(
+                  recovery.processing || 0
+                ),
+
               sent:
-                recoverySent,
+                Number(
+                  recovery.sent || 0
+                ),
+
               completed:
-                recoveryCompleted,
+                Number(
+                  recovery.completed || 0
+                ),
+
               failed:
-                recoveryFailed
+                Number(
+                  recovery.failed || 0
+                )
             },
 
             emails
@@ -1509,9 +1656,9 @@ app.post(
   }
 );
 
-/* =========================================================
-   EVENT
-========================================================= */
+/* ─────────────────────────────────────────────
+   MAB TELEMETRY EVENTS
+───────────────────────────────────────────── */
 
 app.post(
   "/event",
@@ -1524,7 +1671,10 @@ app.post(
         event_id
       } = req.body;
 
-      if (!session_id || !event) {
+      if (
+        !session_id ||
+        !event
+      ) {
         return res
           .status(400)
           .json(
@@ -1618,7 +1768,9 @@ app.post(
           normalizedEvent,
           safePayload,
           clientIp,
-          req.headers["user-agent"]
+          req.headers[
+            "user-agent"
+          ]
         ]
       );
 
@@ -1659,9 +1811,10 @@ app.post(
         );
       }
 
-      return res.json(
+      res.json(
         success({
-          event_id: safeEventId
+          event_id:
+            safeEventId
         })
       );
     } catch (error) {
@@ -1670,7 +1823,7 @@ app.post(
         error
       );
 
-      return res
+      res
         .status(500)
         .json(
           failure(
@@ -1681,9 +1834,9 @@ app.post(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    SCORE
-========================================================= */
+───────────────────────────────────────────── */
 
 app.post(
   "/score",
@@ -1724,7 +1877,8 @@ app.post(
       const action =
         (await pickAction({
           session_id,
-          cart_value: value,
+          cart_value:
+            value,
           behavior:
             payload || {}
         })) || "NONE";
@@ -1775,15 +1929,19 @@ app.post(
           ]
         );
 
-      return res.json(
+      res.json(
         success({
           decision_id:
             result.rows[0].id,
+
           action,
+
           discount,
+
           propensity_score:
             payload?.scroll_depth
-              ? payload.scroll_depth / 100
+              ? payload.scroll_depth /
+                100
               : 0.5
         })
       );
@@ -1793,7 +1951,7 @@ app.post(
         error
       );
 
-      return res
+      res
         .status(500)
         .json(
           failure(
@@ -1804,9 +1962,9 @@ app.post(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    ACTION
-========================================================= */
+───────────────────────────────────────────── */
 
 app.post(
   "/action",
@@ -1850,7 +2008,7 @@ app.post(
           );
       }
 
-      return res.json(
+      res.json(
         success({
           actioned: true
         })
@@ -1861,7 +2019,7 @@ app.post(
         error
       );
 
-      return res
+      res
         .status(500)
         .json(
           failure(
@@ -1872,9 +2030,9 @@ app.post(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    OUTCOME
-========================================================= */
+───────────────────────────────────────────── */
 
 app.post(
   "/outcome",
@@ -1964,7 +2122,7 @@ app.post(
         !!converted
       );
 
-      return res.json(
+      res.json(
         success({
           updated: true
         })
@@ -1975,7 +2133,7 @@ app.post(
         error
       );
 
-      return res
+      res
         .status(500)
         .json(
           failure(
@@ -1986,9 +2144,9 @@ app.post(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    METRICS
-========================================================= */
+───────────────────────────────────────────── */
 
 app.get(
   "/metrics",
@@ -2020,12 +2178,14 @@ app.get(
       const row =
         r.rows[0];
 
-      return res.json(
+      res.json(
         success({
           total:
             Number(row.total),
+
           conversions:
             Number(row.conversions),
+
           revenue:
             Number(row.revenue)
         })
@@ -2036,7 +2196,7 @@ app.get(
         error
       );
 
-      return res
+      res
         .status(500)
         .json(
           failure(
@@ -2047,25 +2207,26 @@ app.get(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    PAYSTACK
-========================================================= */
+───────────────────────────────────────────── */
 
 app.use(
   "/paystack",
   paystackRoutes
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    RECOVERY CRON
-========================================================= */
+───────────────────────────────────────────── */
 
 cron.schedule(
   "*/15 * * * *",
   async () => {
     if (
       !db ||
-      typeof db.connect !== "function"
+      typeof db.connect !==
+        "function"
     ) {
       return;
     }
@@ -2083,16 +2244,21 @@ cron.schedule(
       const batch =
         await client.query(`
           UPDATE recovery_queue
+
           SET status = 'PROCESSING'
+
           WHERE id IN (
             SELECT id
             FROM recovery_queue
+
             WHERE status = 'PENDING'
               AND created_at >= NOW()
                 - INTERVAL '7 days'
+
             FOR UPDATE SKIP LOCKED
             LIMIT 20
           )
+
           RETURNING *
         `);
 
@@ -2115,7 +2281,9 @@ cron.schedule(
       client.release();
     }
 
-    for (const item of claimed) {
+    for (
+      const item of claimed
+    ) {
       try {
         const conversionCheck =
           await db.query(
@@ -2130,7 +2298,8 @@ cron.schedule(
           );
 
         if (
-          conversionCheck.rowCount > 0
+          conversionCheck.rowCount >
+          0
         ) {
           await db.query(
             `
@@ -2147,8 +2316,10 @@ cron.schedule(
         await sendRecoveryEmail({
           to:
             item.customer_email,
+
           incentive:
             item.incentive,
+
           cart:
             item.cart_data
         });
@@ -2156,9 +2327,11 @@ cron.schedule(
         await db.query(
           `
             UPDATE recovery_queue
+
             SET
               status = 'SENT',
               processed_at = NOW()
+
             WHERE id = $1
           `,
           [item.id]
@@ -2195,9 +2368,11 @@ cron.schedule(
         await db.query(
           `
             UPDATE recovery_queue
+
             SET
               status = 'FAILED',
               processed_at = NOW()
+
             WHERE id = $1
           `,
           [item.id]
@@ -2207,9 +2382,9 @@ cron.schedule(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    DAILY REPORT CRON
-========================================================= */
+───────────────────────────────────────────── */
 
 cron.schedule(
   "0 8 * * *",
@@ -2244,7 +2419,9 @@ cron.schedule(
           `
         );
 
-      for (const m of merchants.rows) {
+      for (
+        const m of merchants.rows
+      ) {
         const stats =
           await db.query(
             `
@@ -2333,9 +2510,9 @@ cron.schedule(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    404
-========================================================= */
+───────────────────────────────────────────── */
 
 app.use(
   (req, res) =>
@@ -2348,9 +2525,9 @@ app.use(
       )
 );
 
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
+/* ─────────────────────────────────────────────
+   GLOBAL ERROR HANDLER
+───────────────────────────────────────────── */
 
 app.use(
   (
@@ -2378,26 +2555,26 @@ app.use(
   }
 );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    SERVER
-========================================================= */
+───────────────────────────────────────────── */
 
 const PORT =
-  process.env.PORT || 3000;
+  process.env.PORT ||
+  3000;
 
 const server =
   app.listen(
     PORT,
-    () => {
+    () =>
       console.log(
         `REDEN API fully hardened instance up on port ${PORT}`
-      );
-    }
+      )
   );
 
-/* =========================================================
+/* ─────────────────────────────────────────────
    GRACEFUL SHUTDOWN
-========================================================= */
+───────────────────────────────────────────── */
 
 const shutdownHandler =
   async (signal) => {
@@ -2410,7 +2587,8 @@ const shutdownHandler =
         try {
           if (
             db &&
-            typeof db.end === "function"
+            typeof db.end ===
+              "function"
           ) {
             await db.end();
           }
@@ -2435,11 +2613,15 @@ const shutdownHandler =
 process.on(
   "SIGINT",
   () =>
-    shutdownHandler("SIGINT")
+    shutdownHandler(
+      "SIGINT"
+    )
 );
 
 process.on(
   "SIGTERM",
   () =>
-    shutdownHandler("SIGTERM")
+    shutdownHandler(
+      "SIGTERM"
+    )
 );
