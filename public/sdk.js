@@ -141,6 +141,18 @@
 
   /* ─────────────────────────────────────────────
      TRACKING
+
+     `event` MUST be one of the event names REDEN
+     recognizes server-side:
+
+       PAGE_VIEW, PRODUCT_VIEW, ADD_TO_CART,
+       CHECKOUT_STARTED, PURCHASE, SESSION_START,
+       SESSION_END, BEHAVIOR
+
+     Anything else is rejected with 400 invalid_event.
+     Internal auto-tracking below only ever sends one
+     of these; storefront integration code calling
+     Reden.track(...) directly must do the same.
   ───────────────────────────────────────────── */
 
   async function track(event, payload = {}, options = {}) {
@@ -345,9 +357,23 @@
 
       const tag = (el.tagName || "").toLowerCase();
 
+      /*
+       * Generic clicks are a behavioral signal, not one of
+       * REDEN's funnel-specific event types. They MUST be
+       * sent as "BEHAVIOR" -- the server rejects any event
+       * name outside its fixed VALID_EVENTS set with a 400.
+       *
+       * Sending the raw DOM event name ("click") here was
+       * the original bug: it gets uppercased to "CLICK" by
+       * the server, which isn't a recognized event, so every
+       * click anywhere on the page -- including checkout
+       * buttons -- was rejected.
+       */
+
       // Skip capturing text content from form fields — may contain PII
       if (["input", "textarea", "select"].includes(tag)) {
-        track("click", {
+        track("BEHAVIOR", {
+          type: "click",
           tag: el.tagName || null,
           id: el.id || null,
           class: el.className || null,
@@ -355,7 +381,8 @@
         return;
       }
 
-      track("click", {
+      track("BEHAVIOR", {
+        type: "click",
         tag: el.tagName || null,
         id: el.id || null,
         class: el.className || null,
@@ -367,7 +394,7 @@
   function setupUnloadTracking() {
     const handleSessionEnd = () => {
       track(
-        "session_end",
+        "SESSION_END",
         { duration: now() - state.pageStart },
         { keepalive: true } // Crucial for reliable exit tracking
       );
