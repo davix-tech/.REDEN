@@ -35,6 +35,30 @@ import {
 dotenv.config();
 
 /* =========================================================
+   PROCESS-LEVEL SAFETY NETS
+
+   These must be registered before anything else runs.
+   Without them, an unexpected synchronous throw or a
+   rejected promise with no attached .catch() anywhere in
+   the app can crash the process with no log line at all,
+   or leave it in a zombie state that never recovers.
+
+   We log with full context and exit deliberately so the
+   platform's process manager (Render) restarts a clean
+   instance, rather than limping along in a broken state.
+========================================================= */
+
+process.on("uncaughtException", (error) => {
+  console.error("[FATAL] Uncaught exception:", error);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] Unhandled promise rejection:", reason);
+  process.exit(1);
+});
+
+/* =========================================================
    ENVIRONMENT
 ========================================================= */
 
@@ -393,6 +417,14 @@ app.use(
 
 /* =========================================================
    RATE LIMITING
+
+   IMPORTANT: telemetryLimiter (1000/min, keyed per site+ip)
+   is intended to be the ONLY limiter that governs /event
+   traffic. generalLimiter (120/min) is deliberately skipped
+   for /event below -- otherwise both limiters apply in
+   sequence to every /event request, and the effective limit
+   silently collapses to whichever is stricter (120/min),
+   defeating the higher telemetry allowance entirely.
 ========================================================= */
 
 const generalLimiter =
@@ -404,6 +436,8 @@ const generalLimiter =
     standardHeaders: true,
 
     legacyHeaders: false,
+
+    skip: (req) => req.path === "/event",
 
     message: {
       ok: false,
@@ -2852,12 +2886,24 @@ app.post(
         ) ||
         `evt_${crypto.randomUUID()}`;
 
+      /*
+       * IMPORTANT: the sanitized JSON string is named
+       * `safePayloadJson` here, deliberately NOT
+       * `safePayload`. `safePayload` is the module-level
+       * sanitizer function declared above (see UTILITIES).
+       * Naming a local const `safePayload` in this same
+       * block would shadow that function for the entire
+       * block (including the line above that calls it),
+       * throwing "Cannot access 'safePayload' before
+       * initialization" on every single request.
+       */
+
       const safePayloadObject =
         safePayload(
           payload
         );
 
-      const safePayload =
+      const safePayloadJson =
         safeJson(
           safePayloadObject
         );
@@ -2873,7 +2919,7 @@ app.post(
 
       if (
         Buffer.byteLength(
-          safePayload,
+          safePayloadJson,
           "utf8"
         ) > 50000 ||
         Buffer.byteLength(
@@ -2925,7 +2971,7 @@ app.post(
             req.site.site_id,
             sessionId,
             normalizedEvent,
-            safePayload,
+            safePayloadJson,
             clientIp,
             req.headers[
               "user-agent"
@@ -2963,7 +3009,14 @@ app.post(
            */
           console.warn(
             "[EVENT CONTEXT ERROR]",
-            error.message
+            {
+              siteId:
+                req.site.site_id,
+              event:
+                normalizedEvent,
+              message:
+                error.message,
+            }
           );
         }
       }
@@ -3029,6 +3082,10 @@ app.post(
         {
           requestId:
             req.requestId,
+          siteId:
+            req.site?.site_id,
+          event:
+            req.body?.event,
           error,
         }
       );
