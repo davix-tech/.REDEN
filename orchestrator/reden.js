@@ -18,6 +18,10 @@ import {
 } from "../optimization/banditEngine.js";
 
 import {
+  updateSessionContext
+} from "../optimization/contextEngine.js";
+
+import {
   initRedis,
   redis
 } from "../infrastructure/redis.js";
@@ -35,18 +39,12 @@ dotenv.config();
 
 const PORT = process.env.PORT || 3000;
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL =
+  process.env.DATABASE_URL;
 
 const ADMIN_SECRET =
   process.env.REDEN_ADMIN_SECRET ||
   process.env.ADMIN_SECRET;
-
-/*
- * Paystack is intentionally not required here.
- *
- * REDEN intelligence, telemetry, decisions and recovery
- * can operate independently of payment-provider credentials.
- */
 
 if (!DATABASE_URL) {
   throw new Error(
@@ -103,6 +101,25 @@ try {
     );
   }
 
+  /*
+   * Best-effort event deduplication index.
+   *
+   * If old duplicate data prevents creation, REDEN continues
+   * operating and logs the reason.
+   */
+  try {
+    await db.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS
+      idx_event_logs_site_event_id
+      ON event_logs(site_id, event_id);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] event_id uniqueness index skipped:",
+      error.message
+    );
+  }
+
   try {
     await db.query(`
       CREATE INDEX IF NOT EXISTS idx_decisions_site_completed
@@ -127,6 +144,18 @@ try {
     );
   }
 
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_recovery_site_status
+      ON recovery_queue(site_id, status, created_at DESC);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] recovery index skipped:",
+      error.message
+    );
+  }
+
   console.log(
     "[DB INIT] REDEN database infrastructure verified."
   );
@@ -143,10 +172,22 @@ await initRedis();
 
 const app = express();
 
-app.set("trust proxy", true);
+/*
+ * REDEN is normally deployed behind one trusted reverse proxy
+ * such as Render's proxy.
+ */
+app.set(
+  "trust proxy",
+  Number(
+    process.env.TRUST_PROXY_HOPS || 1
+  )
+);
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename =
+  fileURLToPath(import.meta.url);
+
+const __dirname =
+  path.dirname(__filename);
 
 /* =========================================================
    SECURITY
@@ -157,6 +198,7 @@ app.disable("x-powered-by");
 app.use(
   helmet({
     contentSecurityPolicy: false,
+
     crossOriginResourcePolicy: {
       policy: "cross-origin"
     }
@@ -169,89 +211,122 @@ app.use(compression());
    CORS
 ========================================================= */
 
-app.use((req, res, next) => {
-  const publicOrigins = [
-    "/event",
-    "/score",
-    "/action",
-    "/outcome",
-    "/sdk.js"
-  ];
+app.use(
+  (req, res, next) => {
+    const publicCorsRoutes = [
+      "/event",
+      "/score",
+      "/action",
+      "/outcome",
+      "/sdk.js",
+      "/api/v1/verify"
+    ];
 
-  const isPublicCorsRoute =
-    publicOrigins.some((route) =>
-      req.path.startsWith(route)
-    );
+    const isPublicCorsRoute =
+      publicCorsRoutes.some(
+        (route) =>
+          req.path === route ||
+          req.path.startsWith(`${route}/`)
+      );
 
-  if (isPublicCorsRoute) {
-    res.setHeader(
-      "Access-Control-Allow-Origin",
-      "*"
-    );
+    if (isPublicCorsRoute) {
+      res.setHeader(
+        "Access-Control-Allow-Origin",
+        "*"
+      );
 
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "GET, POST, OPTIONS"
-    );
+      res.setHeader(
+        "Access-Control-Allow-Methods",
+        "GET, POST, OPTIONS"
+      );
 
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      [
-        "Content-Type",
-        "X-Api-Key",
-        "X-Site-Id",
-        "X-Request-Id",
-        "X-SDK-Version"
-      ].join(", ")
-    );
-  } else {
-    res.setHeader(
-      "Access-Control-Allow-Origin",
-      "null"
-    );
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        [
+          "Content-Type",
+          "X-Api-Key",
+          "X-Site-Id",
+          "X-Request-Id",
+          "X-SDK-Version"
+        ].join(", ")
+      );
+
+      res.setHeader(
+        "Access-Control-Max-Age",
+        "600"
+      );
+    }
+
+    if (req.method === "OPTIONS") {
+      if (isPublicCorsRoute) {
+        return res.sendStatus(204);
+      }
+
+      return res.sendStatus(403);
+    }
+
+    next();
   }
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-
-  next();
-});
+);
 
 /* =========================================================
    RATE LIMITING
 ========================================================= */
 
-const generalLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 120,
-  standardHeaders: true,
-  legacyHeaders: false
-});
+const generalLimiter =
+  rateLimit({
+    windowMs: 60 * 1000,
 
-const telemetryLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 1000,
+    max: 120,
 
-  keyGenerator: (req) => {
-    const siteId =
-      req.headers["x-site-id"] ||
-      "anonymous";
+    standardHeaders: true,
 
-    return `${siteId}:${req.ip}`;
-  },
+    legacyHeaders: false,
 
-  standardHeaders: true,
-  legacyHeaders: false,
+    message: {
+      ok: false,
+      error: "rate_limit_exceeded"
+    }
+  });
 
-  message: {
-    ok: false,
-    error: "tenant_rate_limit_exceeded"
-  }
-});
+const telemetryLimiter =
+  rateLimit({
+    windowMs: 60 * 1000,
 
-app.use("/event", telemetryLimiter);
-app.use(generalLimiter);
+    max: 1000,
+
+    keyGenerator: (req) => {
+      const siteId =
+        typeof req.headers[
+          "x-site-id"
+        ] === "string"
+          ? req.headers[
+              "x-site-id"
+            ].trim()
+          : "anonymous";
+
+      return `${siteId}:${req.ip}`;
+    },
+
+    standardHeaders: true,
+
+    legacyHeaders: false,
+
+    message: {
+      ok: false,
+      error:
+        "tenant_rate_limit_exceeded"
+    }
+  });
+
+app.use(
+  "/event",
+  telemetryLimiter
+);
+
+app.use(
+  generalLimiter
+);
 
 /* =========================================================
    BODY PARSING
@@ -259,69 +334,88 @@ app.use(generalLimiter);
 
 app.use(
   express.json({
-    limit: "1mb",
-
-    verify: (req, res, buffer) => {
-      req.rawBody = buffer.toString();
-    }
+    limit: "100kb"
   })
 );
 
 app.use(
   express.urlencoded({
-    extended: true
+    extended: true,
+    limit: "100kb"
   })
 );
 
-app.use(timeout("15s"));
+app.use(
+  timeout("15s")
+);
 
-const haltOnTimeout = (
-  req,
-  res,
-  next
-) => {
-  if (req.timedout) {
-    return;
-  }
+const haltOnTimeout =
+  (req, res, next) => {
+    if (req.timedout) {
+      return;
+    }
 
-  next();
-};
+    next();
+  };
 
-app.use(haltOnTimeout);
+app.use(
+  haltOnTimeout
+);
 
 /* =========================================================
    RESPONSE HELPERS
 ========================================================= */
 
-const success = (data = {}) => ({
-  ok: true,
-  timestamp: new Date().toISOString(),
-  ...data
-});
+const success =
+  (data = {}) => ({
+    ok: true,
 
-const failure = (
-  error,
-  details = null
-) => ({
-  ok: false,
-  error,
-  details,
-  timestamp: new Date().toISOString()
-});
+    timestamp:
+      new Date().toISOString(),
+
+    ...data
+  });
+
+const failure =
+  (
+    error,
+    details = null
+  ) => ({
+    ok: false,
+
+    error,
+
+    details,
+
+    timestamp:
+      new Date().toISOString()
+  });
 
 /* =========================================================
    UTILITIES
 ========================================================= */
 
-function validateNumber(value) {
+function validateNumber(
+  value,
+  {
+    defaultValue = 0,
+    allowNull = false
+  } = {}
+) {
   if (
     value === undefined ||
-    value === null
+    value === null ||
+    value === ""
   ) {
-    return 0;
+    if (allowNull) {
+      return null;
+    }
+
+    return defaultValue;
   }
 
-  const number = Number(value);
+  const number =
+    Number(value);
 
   if (
     Number.isNaN(number) ||
@@ -330,7 +424,25 @@ function validateNumber(value) {
     return null;
   }
 
+  if (number < 0) {
+    return null;
+  }
+
   return number;
+}
+
+function normalizeBoolean(
+  value
+) {
+  return (
+    value === true ||
+    value === 1 ||
+    value === "1" ||
+    (
+      typeof value === "string" &&
+      value.toLowerCase() === "true"
+    )
+  );
 }
 
 function safeCompare(
@@ -347,10 +459,16 @@ function safeCompare(
   }
 
   const inputBuffer =
-    Buffer.from(input, "utf8");
+    Buffer.from(
+      input,
+      "utf8"
+    );
 
   const secretBuffer =
-    Buffer.from(secret, "utf8");
+    Buffer.from(
+      secret,
+      "utf8"
+    );
 
   if (
     inputBuffer.length !==
@@ -365,39 +483,139 @@ function safeCompare(
   );
 }
 
-const VALID_EVENTS = new Set([
-  "PAGE_VIEW",
-  "PRODUCT_VIEW",
-  "ADD_TO_CART",
-  "CHECKOUT_STARTED",
-  "PURCHASE",
-  "SESSION_START",
-  "SESSION_END",
-  "BEHAVIOR"
-]);
+function normalizeString(
+  value,
+  maxLength
+) {
+  if (
+    typeof value !==
+    "string"
+  ) {
+    return "";
+  }
 
-const isPublicAsset = (pathname) =>
-  [
-    "/",
-    "/health",
-    "/sdk.js"
-  ].includes(pathname) ||
-  /\.(png|jpg|jpeg|svg|css|js)$/i.test(
-    pathname
-  );
+  const normalized =
+    value.trim();
+
+  if (
+    normalized.length >
+    maxLength
+  ) {
+    return "";
+  }
+
+  return normalized;
+}
+
+function normalizeEmail(
+  value
+) {
+  if (
+    typeof value !==
+    "string"
+  ) {
+    return "";
+  }
+
+  const email =
+    value
+      .trim()
+      .toLowerCase();
+
+  if (
+    email.length < 3 ||
+    email.length > 255
+  ) {
+    return "";
+  }
+
+  /*
+   * Deliberately simple validation.
+   * Final delivery validation belongs to the email provider.
+   */
+  if (
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+      email
+    )
+  ) {
+    return "";
+  }
+
+  return email;
+}
+
+function hashAuthKey(
+  siteId,
+  apiKey
+) {
+  return crypto
+    .createHash("sha256")
+    .update(
+      `${siteId}:${apiKey}`,
+      "utf8"
+    )
+    .digest("hex");
+}
+
+const VALID_EVENTS =
+  new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR"
+  ]);
+
+const isPublicAsset =
+  (pathname) => {
+    if (
+      pathname === "/" ||
+      pathname === "/health" ||
+      pathname === "/sdk.js"
+    ) {
+      return true;
+    }
+
+    /*
+     * Static assets are public, but API routes are never
+     * classified as public merely because they end in .js/.css/etc.
+     */
+    if (
+      pathname.startsWith("/api/")
+    ) {
+      return false;
+    }
+
+    return (
+      /\.(png|jpg|jpeg|svg|css|js|ico|webp|woff|woff2|ttf)$/i.test(
+        pathname
+      )
+    );
+  };
 
 /* =========================================================
    ROUTE CLASSIFICATION
 ========================================================= */
 
-const isPublicRoute = (req) =>
-  isPublicAsset(req.path) ||
-  req.path === "/api/v1/verify" ||
-  req.path === "/api/v1/installation";
+const isPublicRoute =
+  (req) =>
+    isPublicAsset(
+      req.path
+    ) ||
+    req.path ===
+      "/api/v1/verify";
 
-const isAdminRoute = (req) =>
-  req.path === "/api/v1/intelligence" ||
-  req.path === "/api/v1/onboard";
+const isAdminRoute =
+  (req) =>
+    req.path ===
+      "/api/v1/intelligence" ||
+    req.path ===
+      "/api/v1/onboard" ||
+    req.path ===
+      "/api/v1/installation";
 
 /* =========================================================
    STATIC FILES
@@ -410,7 +628,7 @@ app.get(
       "application/javascript"
     );
 
-    res.sendFile(
+    return res.sendFile(
       path.join(
         __dirname,
         "..",
@@ -442,21 +660,24 @@ async function authenticate(
 ) {
   try {
     /*
-     * PUBLIC
+     * PUBLIC ROUTES
      */
 
-    if (isPublicRoute(req)) {
+    if (
+      isPublicRoute(req)
+    ) {
       return next();
     }
 
     /*
      * INTERNAL PRETHIM -> REDEN
      *
-     * Intelligence and onboarding use ONLY
-     * x-admin-secret.
+     * Intelligence, onboarding and installation lookup
+     * require the REDEN admin secret.
      */
-
-    if (isAdminRoute(req)) {
+    if (
+      isAdminRoute(req)
+    ) {
       const suppliedSecret =
         req.headers[
           "x-admin-secret"
@@ -498,7 +719,8 @@ async function authenticate(
           );
       }
 
-      req.isAdminRoute = true;
+      req.isAdminRoute =
+        true;
 
       return next();
     }
@@ -508,18 +730,28 @@ async function authenticate(
      */
 
     const apiKey =
-      req.headers["x-api-key"] ||
-      req.body?.api_key;
+      typeof req.headers[
+        "x-api-key"
+      ] === "string"
+        ? req.headers[
+            "x-api-key"
+          ]
+        : req.body?.api_key;
 
     const siteId =
-      req.headers["x-site-id"] ||
-      req.body?.site_id;
+      typeof req.headers[
+        "x-site-id"
+      ] === "string"
+        ? req.headers[
+            "x-site-id"
+          ]
+        : req.body?.site_id;
 
     if (
-      typeof apiKey !== "string" ||
-      typeof siteId !== "string" ||
-      !apiKey.trim() ||
-      !siteId.trim()
+      typeof apiKey !==
+        "string" ||
+      typeof siteId !==
+        "string"
     ) {
       return res
         .status(401)
@@ -536,23 +768,54 @@ async function authenticate(
     const normalizedSiteId =
       siteId.trim();
 
+    if (
+      !normalizedApiKey ||
+      !normalizedSiteId ||
+      normalizedApiKey.length >
+        150 ||
+      normalizedSiteId.length >
+        100
+    ) {
+      return res
+        .status(401)
+        .json(
+          failure(
+            "invalid_credentials"
+          )
+        );
+    }
+
     const cacheKey =
-      `site:${normalizedSiteId}:${normalizedApiKey}`;
+      `site_auth:${hashAuthKey(
+        normalizedSiteId,
+        normalizedApiKey
+      )}`;
 
     /*
      * REDIS CACHE
+     *
+     * Short TTL prevents a recently-deactivated site from
+     * remaining authorized for several minutes.
      */
-
     if (redis) {
       try {
         const cached =
-          await redis.get(cacheKey);
+          await redis.get(
+            cacheKey
+          );
 
         if (cached) {
           req.site =
-            JSON.parse(cached);
+            JSON.parse(
+              cached
+            );
 
-          return next();
+          if (
+            req.site?.active ===
+            true
+          ) {
+            return next();
+          }
         }
       } catch (error) {
         console.warn(
@@ -589,7 +852,9 @@ async function authenticate(
         ]
       );
 
-    if (!result.rowCount) {
+    if (
+      !result.rowCount
+    ) {
       return res
         .status(403)
         .json(
@@ -603,9 +868,10 @@ async function authenticate(
       result.rows[0];
 
     /*
-     * CACHE AUTHENTICATED SITE
+     * Cache authenticated site context.
+     *
+     * 60 seconds instead of 300 seconds.
      */
-
     if (redis) {
       try {
         await redis.set(
@@ -614,7 +880,7 @@ async function authenticate(
             req.site
           ),
           "EX",
-          300
+          60
         );
       } catch (error) {
         console.warn(
@@ -641,7 +907,9 @@ async function authenticate(
   }
 }
 
-app.use(authenticate);
+app.use(
+  authenticate
+);
 
 /* =========================================================
    SITE CONTEXT
@@ -649,15 +917,21 @@ app.use(authenticate);
 
 app.use(
   (req, res, next) => {
-    if (isPublicRoute(req)) {
+    if (
+      isPublicRoute(req)
+    ) {
       return next();
     }
 
-    if (isAdminRoute(req)) {
+    if (
+      isAdminRoute(req)
+    ) {
       return next();
     }
 
-    if (!req.site?.site_id) {
+    if (
+      !req.site?.site_id
+    ) {
       return res
         .status(401)
         .json(
@@ -671,7 +945,9 @@ app.use(
   }
 );
 
-app.use(haltOnTimeout);
+app.use(
+  haltOnTimeout
+);
 
 /* =========================================================
    ROOT
@@ -680,11 +956,16 @@ app.use(haltOnTimeout);
 app.get(
   "/",
   (req, res) => {
-    res.json(
+    return res.json(
       success({
-        service: "REDEN API",
-        status: "operational",
-        redis: Boolean(redis)
+        service:
+          "REDEN API",
+
+        status:
+          "operational",
+
+        redis:
+          Boolean(redis)
       })
     );
   }
@@ -742,8 +1023,12 @@ app.get(
 app.post(
   "/api/v1/onboard",
   async (req, res) => {
+    let client;
+
     try {
-      if (!req.isAdminRoute) {
+      if (
+        !req.isAdminRoute
+      ) {
         return res
           .status(401)
           .json(
@@ -754,19 +1039,15 @@ app.post(
       }
 
       const name =
-        typeof req.body?.name ===
-        "string"
-          ? req.body.name.trim()
-          : "";
+        normalizeString(
+          req.body?.name,
+          255
+        );
 
       const ownerEmail =
-        typeof req.body
-          ?.owner_email ===
-        "string"
-          ? req.body.owner_email
-              .trim()
-              .toLowerCase()
-          : "";
+        normalizeEmail(
+          req.body?.owner_email
+        );
 
       if (
         !name ||
@@ -776,7 +1057,7 @@ app.post(
           .status(400)
           .json(
             failure(
-              "missing_fields",
+              "missing_or_invalid_fields",
               {
                 required: [
                   "name",
@@ -787,8 +1068,31 @@ app.post(
           );
       }
 
+      client =
+        await db.connect();
+
+      await client.query(
+        "BEGIN"
+      );
+
+      /*
+       * Prevent two simultaneous onboarding requests for the
+       * same merchant/store from creating two sites.
+       */
+      await client.query(
+        `
+          SELECT
+            pg_advisory_xact_lock(
+              hashtext($1)
+            )
+        `,
+        [
+          `reden:onboard:${ownerEmail}:${name.toLowerCase()}`
+        ]
+      );
+
       const existing =
-        await db.query(
+        await client.query(
           `
             SELECT
               site_id,
@@ -816,53 +1120,57 @@ app.post(
         const site =
           existing.rows[0];
 
-        if (!site.active) {
-          await db.query(
-            `
-              UPDATE sites
-              SET
-                active = true,
-                subscription_status = 'active'
-              WHERE site_id = $1
-            `,
-            [site.site_id]
-          );
-        }
+        /*
+         * Do NOT silently reactivate an inactive site.
+         *
+         * Inactive subscription/account state must be changed
+         * through the appropriate billing/account flow.
+         */
+        await client.query(
+          "COMMIT"
+        );
 
-        if (redis) {
-          try {
-            await redis.del(
-              `site:${site.site_id}:${site.api_key}`
-            );
-          } catch {}
-        }
+        client.release();
+        client = null;
 
         return res
           .status(200)
           .json(
             success({
               existing: true,
+
               siteId:
                 site.site_id,
+
               apiKey:
                 site.api_key,
+
               name:
                 site.name,
+
               plan:
                 site.plan,
+
               subscriptionStatus:
-                "active"
+                site.subscription_status,
+
+              active:
+                site.active
             })
           );
       }
 
       const siteId =
-        `site_${crypto.randomBytes(8).toString("hex")}`;
+        `site_${crypto
+          .randomBytes(8)
+          .toString("hex")}`;
 
       const apiKey =
-        `rd_${crypto.randomBytes(24).toString("hex")}`;
+        `rd_${crypto
+          .randomBytes(24)
+          .toString("hex")}`;
 
-      await db.query(
+      await client.query(
         `
           INSERT INTO sites (
             site_id,
@@ -891,6 +1199,13 @@ app.post(
         ]
       );
 
+      await client.query(
+        "COMMIT"
+      );
+
+      client.release();
+      client = null;
+
       console.log(
         `[ONBOARD] Created ${siteId} for ${ownerEmail}`
       );
@@ -900,15 +1215,29 @@ app.post(
         .json(
           success({
             existing: false,
+
             siteId,
+
             apiKey,
+
             name,
-            plan: "basic",
+
+            plan:
+              "basic",
+
             subscriptionStatus:
               "active"
           })
         );
     } catch (error) {
+      try {
+        if (client) {
+          await client.query(
+            "ROLLBACK"
+          );
+        }
+      } catch {}
+
       console.error(
         "[ONBOARD ERROR]",
         error
@@ -921,6 +1250,10 @@ app.post(
             "onboard_failed"
           )
         );
+    } finally {
+      if (client) {
+        client.release();
+      }
     }
   }
 );
@@ -933,14 +1266,22 @@ app.get(
   "/api/v1/installation",
   async (req, res) => {
     try {
+      if (
+        !req.isAdminRoute
+      ) {
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized_internal_access"
+            )
+          );
+      }
+
       const ownerEmail =
-        typeof req.query
-          ?.owner_email ===
-        "string"
-          ? req.query.owner_email
-              .trim()
-              .toLowerCase()
-          : "";
+        normalizeEmail(
+          req.query?.owner_email
+        );
 
       if (!ownerEmail) {
         return res
@@ -967,10 +1308,14 @@ app.get(
             ORDER BY created_at DESC
             LIMIT 1
           `,
-          [ownerEmail]
+          [
+            ownerEmail
+          ]
         );
 
-      if (!result.rowCount) {
+      if (
+        !result.rowCount
+      ) {
         return res
           .status(404)
           .json(
@@ -1037,11 +1382,10 @@ app.get(
   async (req, res) => {
     try {
       const siteId =
-        typeof req.query
-          ?.siteId ===
-        "string"
-          ? req.query.siteId.trim()
-          : "";
+        normalizeString(
+          req.query?.siteId,
+          100
+        );
 
       if (!siteId) {
         return res
@@ -1067,10 +1411,14 @@ app.get(
             WHERE site_id = $1
             LIMIT 1
           `,
-          [siteId]
+          [
+            siteId
+          ]
         );
 
-      if (!result.rowCount) {
+      if (
+        !result.rowCount
+      ) {
         return res
           .status(404)
           .json(
@@ -1096,15 +1444,24 @@ app.get(
               ORDER BY created_at DESC
               LIMIT 1
             `,
-            [siteId]
+            [
+              siteId
+            ]
           );
 
-        if (eventResult.rowCount) {
+        if (
+          eventResult.rowCount
+        ) {
           lastEventAt =
             eventResult.rows[0]
               .created_at;
         }
-      } catch {}
+      } catch (error) {
+        console.warn(
+          "[VERIFY] Could not read last event:",
+          error.message
+        );
+      }
 
       return res.json(
         success({
@@ -1157,14 +1514,9 @@ app.post(
   "/api/v1/intelligence",
   async (req, res) => {
     try {
-      /*
-       * DO NOT REMOVE THIS.
-       *
-       * This protects the intelligence endpoint
-       * without using merchant credentials.
-       */
-
-      if (!req.isAdminRoute) {
+      if (
+        !req.isAdminRoute
+      ) {
         return res
           .status(401)
           .json(
@@ -1175,16 +1527,16 @@ app.post(
       }
 
       const siteId =
-        typeof req.body?.siteId ===
-        "string"
-          ? req.body.siteId.trim()
-          : "";
+        normalizeString(
+          req.body?.siteId,
+          100
+        );
 
       const question =
-        typeof req.body?.question ===
-        "string"
-          ? req.body.question.trim()
-          : "";
+        normalizeString(
+          req.body?.question,
+          2000
+        );
 
       if (!siteId) {
         return res
@@ -1202,19 +1554,6 @@ app.post(
           .json(
             failure(
               "question_required"
-            )
-          );
-      }
-
-      if (
-        question.length >
-        2000
-      ) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "question_too_long"
             )
           );
       }
@@ -1237,10 +1576,14 @@ app.post(
             WHERE site_id = $1
             LIMIT 1
           `,
-          [siteId]
+          [
+            siteId
+          ]
         );
 
-      if (!siteResult.rowCount) {
+      if (
+        !siteResult.rowCount
+      ) {
         return res
           .status(404)
           .json(
@@ -1283,7 +1626,9 @@ app.post(
               GROUP BY event
               ORDER BY count DESC
             `,
-            [siteId]
+            [
+              siteId
+            ]
           );
 
         events =
@@ -1291,6 +1636,7 @@ app.post(
             (row) => ({
               event:
                 row.event,
+
               count:
                 Number(
                   row.count
@@ -1300,6 +1646,46 @@ app.post(
       } catch (error) {
         console.warn(
           "[INTELLIGENCE] event telemetry unavailable:",
+          error.message
+        );
+      }
+
+      /* ===================================================
+         UNIQUE VISITORS / SESSIONS
+      =================================================== */
+
+      let uniqueVisitors = 0;
+
+      try {
+        const result =
+          await db.query(
+            `
+              SELECT
+                COUNT(
+                  DISTINCT session_id
+                )::int AS visitors
+              FROM event_logs
+              WHERE site_id = $1
+                AND created_at >= NOW()
+                  - INTERVAL '24 hours'
+            `,
+            [
+              siteId
+            ]
+          );
+
+        if (
+          result.rowCount
+        ) {
+          uniqueVisitors =
+            Number(
+              result.rows[0]
+                .visitors || 0
+            );
+        }
+      } catch (error) {
+        console.warn(
+          "[INTELLIGENCE] visitor count unavailable:",
           error.message
         );
       }
@@ -1339,10 +1725,14 @@ app.post(
                 AND completed_at >= NOW()
                   - INTERVAL '24 hours'
             `,
-            [siteId]
+            [
+              siteId
+            ]
           );
 
-        if (result.rowCount) {
+        if (
+          result.rowCount
+        ) {
           decision =
             result.rows[0];
         }
@@ -1399,10 +1789,14 @@ app.post(
                 AND created_at >= NOW()
                   - INTERVAL '24 hours'
             `,
-            [siteId]
+            [
+              siteId
+            ]
           );
 
-        if (result.rowCount) {
+        if (
+          result.rowCount
+        ) {
           recovery = {
             total:
               Number(
@@ -1475,7 +1869,9 @@ app.post(
 
               ORDER BY count DESC
             `,
-            [siteId]
+            [
+              siteId
+            ]
           );
 
         emails =
@@ -1535,14 +1931,13 @@ app.post(
             )
           : 0;
 
-      const eventCount = (
-        eventName
-      ) =>
-        events.find(
-          (item) =>
-            item.event ===
-            eventName
-        )?.count || 0;
+      const eventCount =
+        (eventName) =>
+          events.find(
+            (item) =>
+              item.event ===
+              eventName
+          )?.count || 0;
 
       const pageViews =
         eventCount(
@@ -1576,17 +1971,24 @@ app.post(
       const q =
         question
           .toLowerCase()
-          .replace(/[?!.,;:]+/g, " ")
-          .replace(/\s+/g, " ")
+          .replace(
+            /[?!.,;:]+/g,
+            " "
+          )
+          .replace(
+            /\s+/g,
+            " "
+          )
           .trim();
 
-      const hasAny = (
-        phrases
-      ) =>
-        phrases.some(
-          (phrase) =>
-            q.includes(phrase)
-        );
+      const hasAny =
+        (phrases) =>
+          phrases.some(
+            (phrase) =>
+              q.includes(
+                phrase
+              )
+          );
 
       const money =
         new Intl.NumberFormat(
@@ -1594,19 +1996,19 @@ app.post(
           {
             maximumFractionDigits: 2
           }
-        ).format(revenue);
-
-      const formatNumber = (
-        value
-      ) =>
-        new Intl.NumberFormat(
-          "en-NG"
         ).format(
-          Number(value || 0)
+          revenue
         );
 
-      const totalVisitors =
-        pageViews;
+      const formatNumber =
+        (value) =>
+          new Intl.NumberFormat(
+            "en-NG"
+          ).format(
+            Number(
+              value || 0
+            )
+          );
 
       const checkoutGap =
         Math.max(
@@ -1656,12 +2058,7 @@ app.post(
       }
 
       /*
-       * REVENUE / MONEY / EARNINGS
-       *
-       * Handles casual language:
-       * "how much did I earn?"
-       * "how much money did I make?"
-       * "what did I make?"
+       * REVENUE
        */
 
       else if (
@@ -1700,11 +2097,6 @@ app.post(
 
       /*
        * TRAFFIC / VISITORS
-       *
-       * Handles:
-       * "how many people entered my site?"
-       * "how many visitors?"
-       * "how many people visited?"
        */
 
       else if (
@@ -1735,12 +2127,13 @@ app.post(
         ])
       ) {
         answer =
-          `Over the last 24 hours, REDEN recorded ` +
-          `${formatNumber(totalVisitors)} page views on ${site.name}. ` +
-          `It also recorded ${formatNumber(productViews)} product views, ` +
+          `Over the last 24 hours, REDEN recorded approximately ` +
+          `${formatNumber(uniqueVisitors)} unique sessions on ${site.name}. ` +
+          `There were ${formatNumber(pageViews)} page views, ` +
+          `${formatNumber(productViews)} product views, ` +
           `${formatNumber(addToCart)} add-to-cart events, ` +
           `${formatNumber(checkoutStarted)} checkout starts, ` +
-          `and ${formatNumber(purchases)} purchases.`;
+          `and ${formatNumber(purchases)} purchase events.`;
       }
 
       /*
@@ -1835,7 +2228,7 @@ app.post(
       }
 
       /*
-       * CHECKOUT / CART / ABANDONMENT
+       * CHECKOUT / CART
        */
 
       else if (
@@ -1856,8 +2249,8 @@ app.post(
       ) {
         answer =
           `REDEN recorded ${formatNumber(checkoutStarted)} checkout starts ` +
-          `and ${formatNumber(purchases)} purchases over the last 24 hours. ` +
-          `The observed checkout-to-purchase gap is ${formatNumber(checkoutGap)}. ` +
+          `and ${formatNumber(purchases)} purchase events over the last 24 hours. ` +
+          `The observed checkout-to-purchase event gap is ${formatNumber(checkoutGap)}. ` +
           `The recovery queue currently contains ` +
           `${formatNumber(recovery.pending)} pending, ` +
           `${formatNumber(recovery.processing)} processing, ` +
@@ -1928,7 +2321,7 @@ app.post(
           `REDEN recorded ${formatNumber(productViews)} product views ` +
           `over the last 24 hours. ` +
           `There were also ${formatNumber(addToCart)} add-to-cart events ` +
-          `and ${formatNumber(purchases)} purchases.`;
+          `and ${formatNumber(purchases)} purchase events.`;
       }
 
       /*
@@ -1962,15 +2355,16 @@ app.post(
           `${money} in attributed revenue. ` +
           `The decision conversion rate is ${conversionRate}%. ` +
           `Storefront activity includes ` +
+          `${formatNumber(uniqueVisitors)} unique sessions, ` +
           `${formatNumber(pageViews)} page views, ` +
           `${formatNumber(productViews)} product views, ` +
           `${formatNumber(addToCart)} add-to-cart events, ` +
           `${formatNumber(checkoutStarted)} checkout starts, ` +
-          `and ${formatNumber(purchases)} purchases.`;
+          `and ${formatNumber(purchases)} purchase events.`;
       }
 
       /*
-       * TRAFFIC / FUNNEL
+       * FUNNEL
        */
 
       else if (
@@ -1985,32 +2379,28 @@ app.post(
         ])
       ) {
         answer =
-          `The current 24-hour funnel for ${site.name} is ` +
+          `The current 24-hour event funnel for ${site.name} is ` +
           `${formatNumber(pageViews)} page views → ` +
           `${formatNumber(productViews)} product views → ` +
           `${formatNumber(addToCart)} add-to-cart events → ` +
           `${formatNumber(checkoutStarted)} checkout starts → ` +
-          `${formatNumber(purchases)} purchases.`;
+          `${formatNumber(purchases)} purchase events.`;
       }
 
       /*
        * FALLBACK
-       *
-       * IMPORTANT:
-       * Unknown questions must NEVER cause an error.
-       *
-       * REDEN answers with the available business context.
        */
 
       else {
         answer =
           `REDEN is monitoring ${site.name}. ` +
           `Over the last 24 hours there were ` +
+          `${formatNumber(uniqueVisitors)} unique sessions, ` +
           `${formatNumber(pageViews)} page views, ` +
           `${formatNumber(productViews)} product views, ` +
           `${formatNumber(addToCart)} add-to-cart events, ` +
           `${formatNumber(checkoutStarted)} checkout starts, ` +
-          `${formatNumber(purchases)} purchases, ` +
+          `${formatNumber(purchases)} purchase events, ` +
           `${formatNumber(conversions)} conversions, ` +
           `and ${money} in attributed revenue. ` +
           `You can ask me naturally about your visitors, ` +
@@ -2044,6 +2434,9 @@ app.post(
             period:
               "last_24_hours",
 
+            visitors:
+              uniqueVisitors,
+
             events,
 
             decisions: {
@@ -2064,13 +2457,6 @@ app.post(
         })
       );
     } catch (error) {
-      /*
-       * Intelligence errors are isolated here.
-       *
-       * They cannot affect authentication middleware
-       * or the rest of the REDEN API.
-       */
-
       console.error(
         "[INTELLIGENCE ERROR]",
         error
@@ -2102,22 +2488,29 @@ app.post(
         event_id
       } = req.body;
 
-      if (
-        !session_id ||
-        !event
-      ) {
+      const sessionId =
+        normalizeString(
+          session_id,
+          200
+        );
+
+      if (!sessionId) {
         return res
           .status(400)
           .json(
             failure(
-              "missing_fields"
+              "missing_session_id"
             )
           );
       }
 
       const normalizedEvent =
-        String(event)
-          .toUpperCase();
+        typeof event ===
+        "string"
+          ? event
+              .trim()
+              .toUpperCase()
+          : "";
 
       if (
         !VALID_EVENTS.has(
@@ -2134,26 +2527,41 @@ app.post(
       }
 
       const safeEventId =
-        event_id ||
+        normalizeString(
+          event_id,
+          200
+        ) ||
         `evt_${crypto.randomUUID()}`;
+
+      const safePayloadObject =
+        payload &&
+        typeof payload ===
+          "object"
+          ? payload
+          : {};
 
       const safePayload =
         JSON.stringify(
-          payload || {}
+          safePayloadObject
         );
 
       const safeCart =
         JSON.stringify(
-          payload?.cart ||
-            {}
+          safePayloadObject.cart &&
+          typeof safePayloadObject.cart ===
+            "object"
+            ? safePayloadObject.cart
+            : {}
         );
 
       if (
         Buffer.byteLength(
-          safePayload
+          safePayload,
+          "utf8"
         ) > 50000 ||
         Buffer.byteLength(
-          safeCart
+          safeCart,
+          "utf8"
         ) > 20000
       ) {
         return res
@@ -2166,51 +2574,95 @@ app.post(
       }
 
       const clientIp =
-        req.headers[
-          "x-forwarded-for"
-        ]
-          ?.split(",")[0]
-          ?.trim() ||
-        req.ip;
+        req.ip || null;
 
-      await db.query(
-        `
-          INSERT INTO event_logs (
-            event_id,
-            site_id,
-            session_id,
-            event,
-            payload,
-            ip_address,
-            user_agent
-          )
-          VALUES (
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            $6,
-            $7
-          )
-        `,
-        [
-          safeEventId,
-          req.site.site_id,
-          session_id,
-          normalizedEvent,
-          safePayload,
-          clientIp,
-          req.headers[
-            "user-agent"
+      /*
+       * Idempotent event insert.
+       *
+       * Requires the unique site_id/event_id index where possible.
+       */
+      const insertResult =
+        await db.query(
+          `
+            INSERT INTO event_logs (
+              event_id,
+              site_id,
+              session_id,
+              event,
+              payload,
+              ip_address,
+              user_agent
+            )
+            VALUES (
+              $1,
+              $2,
+              $3,
+              $4,
+              $5,
+              $6,
+              $7
+            )
+            ON CONFLICT DO NOTHING
+          `,
+          [
+            safeEventId,
+            req.site.site_id,
+            sessionId,
+            normalizedEvent,
+            safePayload,
+            clientIp,
+            req.headers[
+              "user-agent"
+            ]
           ]
-        ]
-      );
+        );
+
+      /*
+       * Only update session context when this was a newly
+       * inserted event. This prevents duplicate event IDs
+       * from inflating session statistics.
+       */
+      if (
+        insertResult.rowCount
+      ) {
+        try {
+          await updateSessionContext({
+            siteId:
+              req.site.site_id,
+
+            sessionId,
+
+            event:
+              normalizedEvent,
+
+            payload:
+              safePayloadObject
+          });
+        } catch (error) {
+          /*
+           * Context must never break telemetry.
+           */
+          console.warn(
+            "[EVENT CONTEXT ERROR]",
+            error.message
+          );
+        }
+      }
+
+      /*
+       * CHECKOUT RECOVERY
+       */
+
+      const customerEmail =
+        normalizeEmail(
+          safePayloadObject.email
+        );
 
       if (
+        insertResult.rowCount &&
         normalizedEvent ===
           "CHECKOUT_STARTED" &&
-        payload?.email
+        customerEmail
       ) {
         await db.query(
           `
@@ -2236,8 +2688,8 @@ app.post(
           `,
           [
             req.site.site_id,
-            session_id,
-            payload.email,
+            sessionId,
+            customerEmail,
             safeCart,
             "10% OFF"
           ]
@@ -2247,7 +2699,12 @@ app.post(
       return res.json(
         success({
           event_id:
-            safeEventId
+            safeEventId,
+
+          recorded:
+            Boolean(
+              insertResult.rowCount
+            )
         })
       );
     } catch (error) {
@@ -2282,7 +2739,13 @@ app.post(
         payload
       } = req.body;
 
-      if (!session_id) {
+      const sessionId =
+        normalizeString(
+          session_id,
+          200
+        );
+
+      if (!sessionId) {
         return res
           .status(400)
           .json(
@@ -2297,7 +2760,9 @@ app.post(
           cart_value
         );
 
-      if (value === null) {
+      if (
+        value === null
+      ) {
         return res
           .status(400)
           .json(
@@ -2307,28 +2772,77 @@ app.post(
           );
       }
 
+      const cartId =
+        normalizeString(
+          cart_id,
+          200
+        ) || null;
+
+      const behavior =
+        payload &&
+        typeof payload ===
+          "object"
+          ? payload
+          : {};
+
+      /*
+       * IMPORTANT:
+       * site_id was previously missing here.
+       *
+       * The bandit is tenant-specific, so the site ID must
+       * always be passed.
+       */
       const action =
         (
           await pickAction({
-            session_id,
+            site_id:
+              req.site.site_id,
+
+            session_id:
+              sessionId,
+
             cart_value:
               value,
-            behavior:
-              payload || {}
+
+            behavior
           })
         ) ||
         "NONE";
 
       const discountMap = {
         NONE: 0,
+
         INCENTIVE_LOW: 5,
+
         INCENTIVE_MED: 10,
+
         INCENTIVE_HIGH: 20
       };
 
       const discount =
-        discountMap[action] ||
+        discountMap[action] ??
         0;
+
+      /*
+       * discount is a percentage.
+       *
+       * Example:
+       * ₦1,000 cart + 10% discount
+       * = ₦100 discount
+       * = ₦900 expected value
+       */
+      const discountAmount =
+        value *
+        (
+          discount / 100
+        );
+
+      const expectedValue =
+        Math.max(
+          0,
+          value -
+            discountAmount
+        );
 
       const result =
         await db.query(
@@ -2355,16 +2869,11 @@ app.post(
           `,
           [
             req.site.site_id,
-            session_id,
-            cart_id ||
-              null,
+            sessionId,
+            cartId,
             action,
             discount,
-            Math.max(
-              0,
-              value -
-                discount
-            )
+            expectedValue
           ]
         );
 
@@ -2378,11 +2887,11 @@ app.post(
 
           discount,
 
-          propensity_score:
-            payload?.scroll_depth
-              ? payload.scroll_depth /
-                100
-              : 0.5
+          discount_amount:
+            discountAmount,
+
+          expected_value:
+            expectedValue
         })
       );
     } catch (error) {
@@ -2410,11 +2919,16 @@ app.post(
   "/action",
   async (req, res) => {
     try {
-      const {
-        decision_id
-      } = req.body;
+      const decisionId =
+        normalizeString(
+          String(
+            req.body?.decision_id ??
+              ""
+          ),
+          100
+        );
 
-      if (!decision_id) {
+      if (!decisionId) {
         return res
           .status(400)
           .json(
@@ -2424,26 +2938,37 @@ app.post(
           );
       }
 
+      /*
+       * Strict state transition:
+       *
+       * SCORED -> ACTIONED
+       *
+       * A completed decision can no longer be rewritten.
+       */
       const result =
         await db.query(
           `
             UPDATE decisions
-            SET state = 'ACTIONED'
+            SET
+              state = 'ACTIONED'
             WHERE id = $1
               AND site_id = $2
+              AND state = 'SCORED'
           `,
           [
-            decision_id,
+            decisionId,
             req.site.site_id
           ]
         );
 
-      if (!result.rowCount) {
+      if (
+        !result.rowCount
+      ) {
         return res
-          .status(404)
+          .status(409)
           .json(
             failure(
-              "not_found"
+              "invalid_decision_state"
             )
           );
       }
@@ -2478,13 +3003,16 @@ app.post(
   "/outcome",
   async (req, res) => {
     try {
-      const {
-        decision_id,
-        converted,
-        revenue
-      } = req.body;
+      const decisionId =
+        normalizeString(
+          String(
+            req.body?.decision_id ??
+              ""
+          ),
+          100
+        );
 
-      if (!decision_id) {
+      if (!decisionId) {
         return res
           .status(400)
           .json(
@@ -2494,78 +3022,120 @@ app.post(
           );
       }
 
-      const revenueValue =
-        validateNumber(
-          revenue
+      const converted =
+        normalizeBoolean(
+          req.body?.converted
         );
 
-      const existing =
+      const revenueValue =
+        validateNumber(
+          req.body?.revenue
+        );
+
+      if (
+        revenueValue === null
+      ) {
+        return res
+          .status(400)
+          .json(
+            failure(
+              "invalid_revenue"
+            )
+          );
+      }
+
+      /*
+       * Atomic state transition.
+       *
+       * This prevents two simultaneous outcome requests from
+       * both completing the same decision and both rewarding
+       * the bandit.
+       */
+      const result =
         await db.query(
           `
-            SELECT
-              action,
-              state
-            FROM decisions
-            WHERE id = $1
-              AND site_id = $2
+            UPDATE decisions
+            SET
+              state = 'COMPLETED',
+              converted = $1,
+              revenue = $2,
+              completed_at = NOW()
+            WHERE id = $3
+              AND site_id = $4
+              AND state = 'ACTIONED'
+            RETURNING
+              id,
+              action
           `,
           [
-            decision_id,
+            converted,
+            revenueValue,
+            decisionId,
             req.site.site_id
           ]
         );
 
-      if (!existing.rowCount) {
-        return res
-          .status(404)
-          .json(
-            failure(
-              "not_found"
-            )
-          );
-      }
-
       if (
-        existing.rows[0]
-          .state ===
-        "COMPLETED"
+        !result.rowCount
       ) {
+        /*
+         * Determine whether the decision exists so the API can
+         * distinguish "not found" from "already completed/invalid state".
+         */
+        const existing =
+          await db.query(
+            `
+              SELECT
+                id,
+                state
+              FROM decisions
+              WHERE id = $1
+                AND site_id = $2
+              LIMIT 1
+            `,
+            [
+              decisionId,
+              req.site.site_id
+            ]
+          );
+
+        if (
+          !existing.rowCount
+        ) {
+          return res
+            .status(404)
+            .json(
+              failure(
+                "not_found"
+              )
+            );
+        }
+
         return res
           .status(409)
           .json(
             failure(
-              "already_done"
+              "invalid_decision_state"
             )
           );
       }
 
-      await db.query(
-        `
-          UPDATE decisions
-          SET
-            state = 'COMPLETED',
-            converted = $1,
-            revenue = $2,
-            completed_at = NOW()
-          WHERE id = $3
-            AND site_id = $4
-        `,
-        [
-          Boolean(
-            converted
-          ),
-          revenueValue || 0,
-          decision_id,
-          req.site.site_id
-        ]
-      );
+      const action =
+        result.rows[0]
+          .action;
 
+      /*
+       * IMPORTANT:
+       * updateBandit signature is:
+       *
+       * updateBandit(site_id, action, converted)
+       *
+       * The old server passed the arguments incorrectly.
+       */
       await updateBandit(
-        existing.rows[0]
-          .action,
-        Boolean(
-          converted
-        )
+        req.site.site_id,
+        action,
+        converted
       );
 
       return res.json(
@@ -2618,7 +3188,9 @@ app.get(
             WHERE site_id = $1
               AND state = 'COMPLETED'
           `,
-          [req.site.site_id]
+          [
+            req.site.site_id
+          ]
         );
 
       const row =
@@ -2628,8 +3200,7 @@ app.get(
         success({
           total:
             Number(
-              row.total ||
-                0
+              row.total || 0
             ),
 
           conversions:
@@ -2640,8 +3211,7 @@ app.get(
 
           revenue:
             Number(
-              row.revenue ||
-                0
+              row.revenue || 0
             )
         })
       );
@@ -2680,6 +3250,24 @@ cron.schedule(
     let client;
 
     try {
+      /*
+       * Recover jobs that were marked PROCESSING but whose
+       * worker died before completing them.
+       *
+       * This is deliberately conservative: only jobs that have
+       * been processing for at least 30 minutes are reset.
+       */
+      await db.query(
+        `
+          UPDATE recovery_queue
+          SET
+            status = 'PENDING'
+          WHERE status = 'PROCESSING'
+            AND created_at <
+              NOW() - INTERVAL '30 minutes'
+        `
+      );
+
       client =
         await db.connect();
 
@@ -2688,24 +3276,24 @@ cron.schedule(
       );
 
       const batch =
-        await client.query(`
-          UPDATE recovery_queue
-          SET status = 'PROCESSING'
-
-          WHERE id IN (
-            SELECT id
-            FROM recovery_queue
-
-            WHERE status = 'PENDING'
-              AND created_at >= NOW()
-                - INTERVAL '7 days'
-
-            FOR UPDATE SKIP LOCKED
-            LIMIT 20
-          )
-
-          RETURNING *
-        `);
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING'
+            WHERE id IN (
+              SELECT id
+              FROM recovery_queue
+              WHERE status = 'PENDING'
+                AND created_at >= NOW()
+                  - INTERVAL '7 days'
+              ORDER BY created_at ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 20
+            )
+            RETURNING *
+          `
+        );
 
       await client.query(
         "COMMIT"
@@ -2716,16 +3304,24 @@ cron.schedule(
           batch.rows
       ) {
         try {
+          /*
+           * IMPORTANT:
+           * Recovery conversion checks must be tenant-scoped.
+           */
           const conversionCheck =
             await db.query(
               `
                 SELECT id
                 FROM decisions
-                WHERE session_id = $1
+                WHERE site_id = $1
+                  AND session_id = $2
                   AND converted = true
                 LIMIT 1
               `,
-              [item.session_id]
+              [
+                item.site_id,
+                item.session_id
+              ]
             );
 
           if (
@@ -2734,10 +3330,14 @@ cron.schedule(
             await db.query(
               `
                 UPDATE recovery_queue
-                SET status = 'COMPLETED'
+                SET
+                  status = 'COMPLETED',
+                  processed_at = NOW()
                 WHERE id = $1
               `,
-              [item.id]
+              [
+                item.id
+              ]
             );
 
             continue;
@@ -2761,8 +3361,11 @@ cron.schedule(
                 status = 'SENT',
                 processed_at = NOW()
               WHERE id = $1
+                AND status = 'PROCESSING'
             `,
-            [item.id]
+            [
+              item.id
+            ]
           );
 
           await db.query(
@@ -2793,16 +3396,27 @@ cron.schedule(
             error
           );
 
-          await db.query(
-            `
-              UPDATE recovery_queue
-              SET
-                status = 'FAILED',
-                processed_at = NOW()
-              WHERE id = $1
-            `,
-            [item.id]
-          );
+          try {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  processed_at = NOW()
+                WHERE id = $1
+              `,
+              [
+                item.id
+              ]
+            );
+          } catch (
+            updateError
+          ) {
+            console.error(
+              "[RECOVERY STATUS UPDATE ERROR]",
+              updateError
+            );
+          }
         }
       }
     } catch (error) {
@@ -2833,34 +3447,49 @@ cron.schedule(
 cron.schedule(
   "0 8 * * *",
   async () => {
+    let lockClient;
+
     try {
-      if (redis) {
-        const date =
-          new Date()
-            .toISOString()
-            .split("T")[0];
+      /*
+       * PostgreSQL advisory lock protects the daily report
+       * when REDEN is running on multiple server instances.
+       */
+      lockClient =
+        await db.connect();
 
-        const lockKey =
-          `lock:cron:daily_report:${date}`;
+      const lockResult =
+        await lockClient.query(
+          `
+            SELECT
+              pg_try_advisory_lock(
+                hashtext(
+                  'reden:cron:daily_report'
+                )
+              ) AS acquired
+          `
+        );
 
-        const acquired =
-          await redis.set(
-            lockKey,
-            "locked",
-            "NX",
-            "PX",
-            3600000
-          );
+      const acquired =
+        Boolean(
+          lockResult.rows[0]
+            ?.acquired
+        );
 
-        if (!acquired) {
-          return;
-        }
+      if (!acquired) {
+        lockClient.release();
+        lockClient = null;
+
+        return;
       }
 
       const merchants =
-        await db.query(
+        await lockClient.query(
           `
-            SELECT *
+            SELECT
+              site_id,
+              name,
+              owner_email,
+              active
             FROM sites
             WHERE active = true
           `
@@ -2876,96 +3505,125 @@ cron.schedule(
           continue;
         }
 
-        const stats =
-          await db.query(
+        try {
+          const stats =
+            await lockClient.query(
+              `
+                SELECT
+                  COUNT(*) AS total,
+
+                  COUNT(*) FILTER (
+                    WHERE converted = true
+                  ) AS conversions,
+
+                  COALESCE(
+                    SUM(revenue),
+                    0
+                  ) AS revenue
+
+                FROM decisions
+
+                WHERE site_id = $1
+                  AND state = 'COMPLETED'
+                  AND completed_at >= NOW()
+                    - INTERVAL '1 day'
+              `,
+              [
+                merchant.site_id
+              ]
+            );
+
+          const metrics =
+            stats.rows[0];
+
+          await sendDailyReport({
+            to:
+              merchant.owner_email,
+
+            merchantName:
+              merchant.name,
+
+            metrics: {
+              total:
+                Number(
+                  metrics.total ||
+                    0
+                ),
+
+              conversions:
+                Number(
+                  metrics.conversions ||
+                    0
+                ),
+
+              revenue:
+                Number(
+                  metrics.revenue ||
+                    0
+                )
+            }
+          });
+
+          await lockClient.query(
             `
-              SELECT
-                COUNT(*) AS total,
-
-                COUNT(*) FILTER (
-                  WHERE converted = true
-                ) AS conversions,
-
-                COALESCE(
-                  SUM(revenue),
-                  0
-                ) AS revenue
-
-              FROM decisions
-
-              WHERE site_id = $1
-                AND state = 'COMPLETED'
-                AND completed_at >= NOW()
-                  - INTERVAL '1 day'
+              INSERT INTO email_logs (
+                site_id,
+                email_type,
+                recipient,
+                subject,
+                status
+              )
+              VALUES (
+                $1,
+                'DAILY_REPORT',
+                $2,
+                'Daily REDEN API Performance Report',
+                'SENT'
+              )
             `,
             [
-              merchant.site_id
+              merchant.site_id,
+              merchant.owner_email
             ]
           );
-
-        const metrics =
-          stats.rows[0];
-
-        await sendDailyReport({
-          to:
-            merchant.owner_email,
-
-          merchantName:
-            merchant.name,
-
-          metrics: {
-            total:
-              Number(
-                metrics.total ||
-                  0
-              ),
-
-            conversions:
-              Number(
-                metrics.conversions ||
-                  0
-              ),
-
-            revenue:
-              Number(
-                metrics.revenue ||
-                  0
-              )
-          }
-        });
-
-        await db.query(
-          `
-            INSERT INTO email_logs (
-              site_id,
-              email_type,
-              recipient,
-              subject,
-              status
-            )
-            VALUES (
-              $1,
-              'DAILY_REPORT',
-              $2,
-              'Daily REDEN API Performance Report',
-              'SENT'
-            )
-          `,
-          [
-            merchant.site_id,
-            merchant.owner_email
-          ]
-        );
+        } catch (merchantError) {
+          /*
+           * One merchant's email failure must not stop the
+           * daily reports for every other merchant.
+           */
+          console.error(
+            `[DAILY REPORT] Failed for site ${merchant.site_id}:`,
+            merchantError
+          );
+        }
       }
+
+      try {
+        await lockClient.query(
+          `
+            SELECT
+              pg_advisory_unlock(
+                hashtext(
+                  'reden:cron:daily_report'
+                )
+              )
+          `
+        );
+      } catch {}
     } catch (error) {
       console.error(
         "[DAILY REPORT CRON ERROR]",
         error
       );
+    } finally {
+      if (lockClient) {
+        lockClient.release();
+      }
     }
   },
   {
-    timezone: "UTC"
+    timezone:
+      "UTC"
   }
 );
 
@@ -3001,6 +3659,12 @@ app.use(
       error
     );
 
+    if (
+      res.headersSent
+    ) {
+      return next(error);
+    }
+
     return res
       .status(500)
       .json(
@@ -3028,11 +3692,19 @@ const server =
       );
 
       console.log(
-        `[REDEN] Installation lookup: ENABLED`
+        `[REDEN] Installation lookup: INTERNAL`
+      );
+
+      console.log(
+        `[REDEN] Installation verification: PUBLIC`
       );
 
       console.log(
         `[REDEN] Dashboard intelligence: ENABLED`
+      );
+
+      console.log(
+        `[REDEN] Session context integration: ENABLED`
       );
 
       console.log(
@@ -3045,8 +3717,16 @@ const server =
    GRACEFUL SHUTDOWN
 ========================================================= */
 
+let shuttingDown = false;
+
 const shutdownHandler =
   async (signal) => {
+    if (shuttingDown) {
+      return;
+    }
+
+    shuttingDown = true;
+
     console.log(
       `[${signal}] REDEN shutting down...`
     );
