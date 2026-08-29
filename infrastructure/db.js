@@ -54,7 +54,7 @@ export async function initDB() {
 }
 
 /* =========================================================
-   SCHEMA
+   SCHEMA + MIGRATIONS
 ========================================================= */
 
 async function initializeDatabase() {
@@ -131,8 +131,7 @@ async function initializeDatabase() {
 
     /* =====================================================
        BANDIT STATE
-       IMPORTANT:
-       Bandit state is tenant-specific.
+       Tenant-specific adaptive learning.
     ===================================================== */
 
     await client.query(`
@@ -470,6 +469,170 @@ async function initializeDatabase() {
     `);
 
     /* =====================================================
+       SAFE MIGRATIONS
+       These handle databases created by older REDEN builds.
+    ===================================================== */
+
+    /* =====================================================
+       RECOVERY QUEUE MIGRATIONS
+    ===================================================== */
+
+    await client.query(`
+      ALTER TABLE recovery_queue
+      ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
+    `);
+
+    await client.query(`
+      ALTER TABLE recovery_queue
+      ADD COLUMN IF NOT EXISTS last_error TEXT
+    `);
+
+    await client.query(`
+      ALTER TABLE recovery_queue
+      ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ
+    `);
+
+    /* =====================================================
+       EMAIL LOG MIGRATIONS
+    ===================================================== */
+
+    await client.query(`
+      ALTER TABLE email_logs
+      ADD COLUMN IF NOT EXISTS provider_message_id TEXT
+    `);
+
+    await client.query(`
+      ALTER TABLE email_logs
+      ADD COLUMN IF NOT EXISTS error_message TEXT
+    `);
+
+    /* =====================================================
+       SESSION SUMMARY MIGRATIONS
+    ===================================================== */
+
+    await client.query(`
+      ALTER TABLE session_summaries
+      ADD COLUMN IF NOT EXISTS intent_score NUMERIC(8,4) NOT NULL DEFAULT 0
+    `);
+
+    /* =====================================================
+       BANDIT SCHEMA MIGRATION
+       
+       Older REDEN:
+         action PRIMARY KEY
+
+       Current REDEN:
+         site_id + action PRIMARY KEY
+    ===================================================== */
+
+    const banditColumns = await client.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'bandit_state'
+    `);
+
+    const hasBanditSiteId = banditColumns.rows.some(
+      (row) => row.column_name === "site_id"
+    );
+
+    if (!hasBanditSiteId) {
+      console.log(
+        "[DB MIGRATION] Migrating legacy bandit_state..."
+      );
+
+      await client.query(`
+        ALTER TABLE bandit_state
+        RENAME TO bandit_state_legacy
+      `);
+
+      await client.query(`
+        CREATE TABLE bandit_state (
+          site_id VARCHAR(100) NOT NULL,
+
+          action TEXT NOT NULL,
+
+          pulls INTEGER NOT NULL DEFAULT 0
+            CHECK (pulls >= 0),
+
+          rewards NUMERIC(12,4) NOT NULL DEFAULT 0
+            CHECK (rewards >= 0),
+
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+          PRIMARY KEY (site_id, action)
+        )
+      `);
+
+      /*
+        Legacy learning was global.
+
+        Preserve it by copying the existing
+        learning state into every current site.
+      */
+
+      await client.query(`
+        INSERT INTO bandit_state (
+          site_id,
+          action,
+          pulls,
+          rewards
+        )
+        SELECT
+          sites.site_id,
+          legacy.action,
+          legacy.pulls,
+          legacy.rewards
+        FROM sites
+        CROSS JOIN bandit_state_legacy AS legacy
+        ON CONFLICT (site_id, action)
+        DO NOTHING
+      `);
+
+      await client.query(`
+        DROP TABLE bandit_state_legacy
+      `);
+
+      console.log(
+        "[DB MIGRATION] Legacy bandit_state migrated."
+      );
+    }
+
+    /* =====================================================
+       BANDIT ACTION BACKFILL
+       
+       Every site must have every available action.
+    ===================================================== */
+
+    await client.query(`
+      INSERT INTO bandit_state (
+        site_id,
+        action,
+        pulls,
+        rewards
+      )
+      SELECT
+        sites.site_id,
+        actions.action,
+        0,
+        0
+      FROM sites
+      CROSS JOIN (
+        VALUES
+          ('NONE'),
+          ('INCENTIVE_LOW'),
+          ('INCENTIVE_MED'),
+          ('INCENTIVE_HIGH')
+      ) AS actions(action)
+
+      ON CONFLICT (
+        site_id,
+        action
+      )
+      DO NOTHING
+    `);
+
+    /* =====================================================
        INDEXES
     ===================================================== */
 
@@ -490,27 +653,44 @@ async function initializeDatabase() {
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_event_logs_session
-      ON event_logs(site_id, session_id, created_at DESC)
+      ON event_logs(
+        site_id,
+        session_id,
+        created_at DESC
+      )
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_event_logs_event
-      ON event_logs(site_id, event, created_at DESC)
+      ON event_logs(
+        site_id,
+        event,
+        created_at DESC
+      )
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_decisions_site_created
-      ON decisions(site_id, created_at DESC)
+      ON decisions(
+        site_id,
+        created_at DESC
+      )
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_decisions_site_state
-      ON decisions(site_id, state)
+      ON decisions(
+        site_id,
+        state
+      )
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_decisions_completed
-      ON decisions(site_id, completed_at DESC)
+      ON decisions(
+        site_id,
+        completed_at DESC
+      )
     `);
 
     await client.query(`
@@ -520,11 +700,15 @@ async function initializeDatabase() {
         next_attempt_at,
         created_at
       )
+      WHERE status IN ('PENDING', 'PROCESSING')
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_recovery_queue_site
-      ON recovery_queue(site_id, status)
+      ON recovery_queue(
+        site_id,
+        status
+      )
     `);
 
     await client.query(`
@@ -567,37 +751,36 @@ async function initializeDatabase() {
       ON session_summaries(site_id)
     `);
 
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_bandit_state_site
+      ON bandit_state(site_id)
+    `);
+
     /* =====================================================
-       SEED BANDIT ACTIONS FOR EXISTING SITES
+       INSTALLATION ACTIVITY INDEXES
     ===================================================== */
 
     await client.query(`
-      INSERT INTO bandit_state (
-        site_id,
-        action,
-        pulls,
-        rewards
-      )
-      SELECT
-        site_id,
-        action,
-        0,
-        0
-      FROM sites
-      CROSS JOIN (
-        VALUES
-          ('NONE'),
-          ('INCENTIVE_LOW'),
-          ('INCENTIVE_MED'),
-          ('INCENTIVE_HIGH')
-      ) AS actions(action)
-
-      ON CONFLICT (
-        site_id,
-        action
-      )
-      DO NOTHING
+      CREATE INDEX IF NOT EXISTS idx_reden_installations_owner_email
+      ON reden_installations(owner_email)
     `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_reden_installations_status
+      ON reden_installations(status)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_reden_installations_activity
+      ON reden_installations(
+        status,
+        last_event_at DESC
+      )
+    `);
+
+    /* =====================================================
+       COMMIT
+    ===================================================== */
 
     await client.query("COMMIT");
 
