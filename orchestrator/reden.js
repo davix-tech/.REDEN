@@ -14,21 +14,22 @@ import { db, initDB } from "../infrastructure/db.js";
 
 import {
   pickAction,
-  updateBandit
+  updateBandit,
 } from "../optimization/banditEngine.js";
 
 import {
-  updateSessionContext
-} from "../optimization/contextEngine.js";
+  updateSessionContext,
+  getSessionContext,
+} from "../optimization/adaptiveContextEngine.js";
 
 import {
   initRedis,
-  redis
+  redis,
 } from "../infrastructure/redis.js";
 
 import {
   sendDailyReport,
-  sendRecoveryEmail
+  sendRecoveryEmail,
 } from "../notification/emailEngine.js";
 
 dotenv.config();
@@ -37,7 +38,7 @@ dotenv.config();
    ENVIRONMENT
 ========================================================= */
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 const DATABASE_URL =
   process.env.DATABASE_URL;
@@ -65,6 +66,10 @@ if (!ADMIN_SECRET) {
 await initDB();
 
 try {
+  /* -------------------------------------------------------
+     SITES
+  ------------------------------------------------------- */
+
   await db.query(`
     CREATE TABLE IF NOT EXISTS sites (
       id SERIAL PRIMARY KEY,
@@ -89,6 +94,10 @@ try {
     ON sites(owner_email, name);
   `);
 
+  /* -------------------------------------------------------
+     EVENT LOGS
+  ------------------------------------------------------- */
+
   try {
     await db.query(`
       CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
@@ -101,12 +110,6 @@ try {
     );
   }
 
-  /*
-   * Best-effort event deduplication index.
-   *
-   * If old duplicate data prevents creation, REDEN continues
-   * operating and logs the reason.
-   */
   try {
     await db.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS
@@ -119,6 +122,10 @@ try {
       error.message
     );
   }
+
+  /* -------------------------------------------------------
+     DECISIONS
+  ------------------------------------------------------- */
 
   try {
     await db.query(`
@@ -134,6 +141,62 @@ try {
 
   try {
     await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_decisions_site_session
+      ON decisions(site_id, session_id);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] decision session index skipped:",
+      error.message
+    );
+  }
+
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_decisions_site_state
+      ON decisions(site_id, state);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] decision state index skipped:",
+      error.message
+    );
+  }
+
+  /* -------------------------------------------------------
+     SESSION SUMMARIES
+  ------------------------------------------------------- */
+
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_updated
+      ON session_summaries(site_id, updated_at DESC);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] session_summaries index skipped:",
+      error.message
+    );
+  }
+
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_session
+      ON session_summaries(site_id, session_id);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] session_summaries session index skipped:",
+      error.message
+    );
+  }
+
+  /* -------------------------------------------------------
+     EMAIL LOGS
+  ------------------------------------------------------- */
+
+  try {
+    await db.query(`
       CREATE INDEX IF NOT EXISTS idx_email_logs_lookup
       ON email_logs(email_type, recipient, subject);
     `);
@@ -146,12 +209,44 @@ try {
 
   try {
     await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_email_logs_site_created
+      ON email_logs(site_id, created_at DESC);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] email_logs site index skipped:",
+      error.message
+    );
+  }
+
+  /* -------------------------------------------------------
+     RECOVERY
+  ------------------------------------------------------- */
+
+  try {
+    await db.query(`
       CREATE INDEX IF NOT EXISTS idx_recovery_site_status
       ON recovery_queue(site_id, status, created_at DESC);
     `);
   } catch (error) {
     console.warn(
       "[DB INDEX] recovery index skipped:",
+      error.message
+    );
+  }
+
+  /* -------------------------------------------------------
+     BANDIT
+  ------------------------------------------------------- */
+
+  try {
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_bandit_state_site
+      ON bandit_state(site_id);
+    `);
+  } catch (error) {
+    console.warn(
+      "[DB INDEX] bandit_state index skipped:",
       error.message
     );
   }
@@ -172,10 +267,6 @@ await initRedis();
 
 const app = express();
 
-/*
- * REDEN is normally deployed behind one trusted reverse proxy
- * such as Render's proxy.
- */
 app.set(
   "trust proxy",
   Number(
@@ -200,12 +291,41 @@ app.use(
     contentSecurityPolicy: false,
 
     crossOriginResourcePolicy: {
-      policy: "cross-origin"
-    }
+      policy: "cross-origin",
+    },
   })
 );
 
 app.use(compression());
+
+/* =========================================================
+   REQUEST ID
+========================================================= */
+
+app.use(
+  (req, res, next) => {
+    const supplied =
+      typeof req.headers["x-request-id"] === "string"
+        ? req.headers["x-request-id"].trim()
+        : "";
+
+    const requestId =
+      supplied &&
+      supplied.length <= 100
+        ? supplied
+        : crypto.randomUUID();
+
+    req.requestId =
+      requestId;
+
+    res.setHeader(
+      "X-Request-Id",
+      requestId
+    );
+
+    next();
+  }
+);
 
 /* =========================================================
    CORS
@@ -219,14 +339,16 @@ app.use(
       "/action",
       "/outcome",
       "/sdk.js",
-      "/api/v1/verify"
+      "/api/v1/verify",
     ];
 
     const isPublicCorsRoute =
       publicCorsRoutes.some(
         (route) =>
           req.path === route ||
-          req.path.startsWith(`${route}/`)
+          req.path.startsWith(
+            `${route}/`
+          )
       );
 
     if (isPublicCorsRoute) {
@@ -247,7 +369,7 @@ app.use(
           "X-Api-Key",
           "X-Site-Id",
           "X-Request-Id",
-          "X-SDK-Version"
+          "X-SDK-Version",
         ].join(", ")
       );
 
@@ -285,8 +407,8 @@ const generalLimiter =
 
     message: {
       ok: false,
-      error: "rate_limit_exceeded"
-    }
+      error: "rate_limit_exceeded",
+    },
   });
 
 const telemetryLimiter =
@@ -315,8 +437,8 @@ const telemetryLimiter =
     message: {
       ok: false,
       error:
-        "tenant_rate_limit_exceeded"
-    }
+        "tenant_rate_limit_exceeded",
+    },
   });
 
 app.use(
@@ -334,16 +456,21 @@ app.use(
 
 app.use(
   express.json({
-    limit: "100kb"
+    limit: "100kb",
+    strict: true,
   })
 );
 
 app.use(
   express.urlencoded({
     extended: true,
-    limit: "100kb"
+    limit: "100kb",
   })
 );
+
+/* =========================================================
+   TIMEOUT
+========================================================= */
 
 app.use(
   timeout("15s")
@@ -373,7 +500,7 @@ const success =
     timestamp:
       new Date().toISOString(),
 
-    ...data
+    ...data,
   });
 
 const failure =
@@ -388,7 +515,7 @@ const failure =
     details,
 
     timestamp:
-      new Date().toISOString()
+      new Date().toISOString(),
   });
 
 /* =========================================================
@@ -399,7 +526,7 @@ function validateNumber(
   value,
   {
     defaultValue = 0,
-    allowNull = false
+    allowNull = false,
   } = {}
 ) {
   if (
@@ -440,7 +567,8 @@ function normalizeBoolean(
     value === "1" ||
     (
       typeof value === "string" &&
-      value.toLowerCase() === "true"
+      value.toLowerCase() ===
+        "true"
     )
   );
 }
@@ -529,10 +657,6 @@ function normalizeEmail(
     return "";
   }
 
-  /*
-   * Deliberately simple validation.
-   * Final delivery validation belongs to the email provider.
-   */
   if (
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
       email
@@ -557,6 +681,37 @@ function hashAuthKey(
     .digest("hex");
 }
 
+function safePayload(
+  payload
+) {
+  return (
+    payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload)
+      ? payload
+      : {}
+  );
+}
+
+function safeJson(
+  value,
+  fallback = {}
+) {
+  try {
+    return JSON.stringify(
+      value
+    );
+  } catch {
+    return JSON.stringify(
+      fallback
+    );
+  }
+}
+
+/* =========================================================
+   EVENT DEFINITIONS
+========================================================= */
+
 const VALID_EVENTS =
   new Set([
     "PAGE_VIEW",
@@ -566,8 +721,12 @@ const VALID_EVENTS =
     "PURCHASE",
     "SESSION_START",
     "SESSION_END",
-    "BEHAVIOR"
+    "BEHAVIOR",
   ]);
+
+/* =========================================================
+   PUBLIC ROUTES
+========================================================= */
 
 const isPublicAsset =
   (pathname) => {
@@ -579,12 +738,10 @@ const isPublicAsset =
       return true;
     }
 
-    /*
-     * Static assets are public, but API routes are never
-     * classified as public merely because they end in .js/.css/etc.
-     */
     if (
-      pathname.startsWith("/api/")
+      pathname.startsWith(
+        "/api/"
+      )
     ) {
       return false;
     }
@@ -596,10 +753,6 @@ const isPublicAsset =
     );
   };
 
-/* =========================================================
-   ROUTE CLASSIFICATION
-========================================================= */
-
 const isPublicRoute =
   (req) =>
     isPublicAsset(
@@ -607,6 +760,10 @@ const isPublicRoute =
     ) ||
     req.path ===
       "/api/v1/verify";
+
+/* =========================================================
+   ADMIN ROUTES
+========================================================= */
 
 const isAdminRoute =
   (req) =>
@@ -650,7 +807,7 @@ app.use(
 );
 
 /* =========================================================
-   INTERNAL AUTHENTICATION
+   INTERNAL + MERCHANT AUTH
 ========================================================= */
 
 async function authenticate(
@@ -659,9 +816,9 @@ async function authenticate(
   next
 ) {
   try {
-    /*
-     * PUBLIC ROUTES
-     */
+    /* -----------------------------------------------------
+       PUBLIC
+    ----------------------------------------------------- */
 
     if (
       isPublicRoute(req)
@@ -669,12 +826,10 @@ async function authenticate(
       return next();
     }
 
-    /*
-     * INTERNAL PRETHIM -> REDEN
-     *
-     * Intelligence, onboarding and installation lookup
-     * require the REDEN admin secret.
-     */
+    /* -----------------------------------------------------
+       INTERNAL PRETHIM -> REDEN
+    ----------------------------------------------------- */
+
     if (
       isAdminRoute(req)
     ) {
@@ -688,7 +843,7 @@ async function authenticate(
         "string"
       ) {
         console.warn(
-          `[INTERNAL AUTH] Missing x-admin-secret for ${req.method} ${req.path}`
+          `[INTERNAL AUTH] Missing x-admin-secret ${req.method} ${req.path} request=${req.requestId}`
         );
 
         return res
@@ -707,7 +862,7 @@ async function authenticate(
         )
       ) {
         console.warn(
-          `[INTERNAL AUTH] Invalid internal secret for ${req.method} ${req.path}`
+          `[INTERNAL AUTH] Invalid x-admin-secret ${req.method} ${req.path} request=${req.requestId}`
         );
 
         return res
@@ -725,9 +880,9 @@ async function authenticate(
       return next();
     }
 
-    /*
-     * MERCHANT / SDK AUTHENTICATION
-     */
+    /* -----------------------------------------------------
+       MERCHANT / SDK
+    ----------------------------------------------------- */
 
     const apiKey =
       typeof req.headers[
@@ -791,12 +946,10 @@ async function authenticate(
         normalizedApiKey
       )}`;
 
-    /*
-     * REDIS CACHE
-     *
-     * Short TTL prevents a recently-deactivated site from
-     * remaining authorized for several minutes.
-     */
+    /* -----------------------------------------------------
+       REDIS AUTH CACHE
+    ----------------------------------------------------- */
+
     if (redis) {
       try {
         const cached =
@@ -805,15 +958,20 @@ async function authenticate(
           );
 
         if (cached) {
-          req.site =
+          const cachedSite =
             JSON.parse(
               cached
             );
 
           if (
-            req.site?.active ===
-            true
+            cachedSite?.active ===
+            true &&
+            cachedSite?.site_id ===
+              normalizedSiteId
           ) {
+            req.site =
+              cachedSite;
+
             return next();
           }
         }
@@ -825,9 +983,9 @@ async function authenticate(
       }
     }
 
-    /*
-     * DATABASE VERIFICATION
-     */
+    /* -----------------------------------------------------
+       DATABASE AUTH
+    ----------------------------------------------------- */
 
     const result =
       await db.query(
@@ -848,7 +1006,7 @@ async function authenticate(
         `,
         [
           normalizedApiKey,
-          normalizedSiteId
+          normalizedSiteId,
         ]
       );
 
@@ -867,11 +1025,10 @@ async function authenticate(
     req.site =
       result.rows[0];
 
-    /*
-     * Cache authenticated site context.
-     *
-     * 60 seconds instead of 300 seconds.
-     */
+    /* -----------------------------------------------------
+       CACHE AUTH RESULT
+    ----------------------------------------------------- */
+
     if (redis) {
       try {
         await redis.set(
@@ -894,7 +1051,11 @@ async function authenticate(
   } catch (error) {
     console.error(
       "[AUTH ERROR]",
-      error
+      {
+        requestId:
+          req.requestId,
+        error,
+      }
     );
 
     return res
@@ -965,7 +1126,7 @@ app.get(
           "operational",
 
         redis:
-          Boolean(redis)
+          Boolean(redis),
       })
     );
   }
@@ -998,7 +1159,7 @@ app.get(
         database,
 
         redis:
-          Boolean(redis)
+          Boolean(redis),
       });
 
     if (
@@ -1061,8 +1222,8 @@ app.post(
               {
                 required: [
                   "name",
-                  "owner_email"
-                ]
+                  "owner_email",
+                ],
               }
             )
           );
@@ -1075,10 +1236,6 @@ app.post(
         "BEGIN"
       );
 
-      /*
-       * Prevent two simultaneous onboarding requests for the
-       * same merchant/store from creating two sites.
-       */
       await client.query(
         `
           SELECT
@@ -1087,7 +1244,7 @@ app.post(
             )
         `,
         [
-          `reden:onboard:${ownerEmail}:${name.toLowerCase()}`
+          `reden:onboard:${ownerEmail}:${name.toLowerCase()}`,
         ]
       );
 
@@ -1110,7 +1267,7 @@ app.post(
           `,
           [
             ownerEmail,
-            name.toLowerCase()
+            name.toLowerCase(),
           ]
         );
 
@@ -1120,12 +1277,6 @@ app.post(
         const site =
           existing.rows[0];
 
-        /*
-         * Do NOT silently reactivate an inactive site.
-         *
-         * Inactive subscription/account state must be changed
-         * through the appropriate billing/account flow.
-         */
         await client.query(
           "COMMIT"
         );
@@ -1137,7 +1288,8 @@ app.post(
           .status(200)
           .json(
             success({
-              existing: true,
+              existing:
+                true,
 
               siteId:
                 site.site_id,
@@ -1155,7 +1307,7 @@ app.post(
                 site.subscription_status,
 
               active:
-                site.active
+                site.active,
             })
           );
       }
@@ -1195,7 +1347,7 @@ app.post(
           siteId,
           apiKey,
           name,
-          ownerEmail
+          ownerEmail,
         ]
       );
 
@@ -1214,7 +1366,8 @@ app.post(
         .status(201)
         .json(
           success({
-            existing: false,
+            existing:
+              false,
 
             siteId,
 
@@ -1226,7 +1379,7 @@ app.post(
               "basic",
 
             subscriptionStatus:
-              "active"
+              "active",
           })
         );
     } catch (error) {
@@ -1309,7 +1462,7 @@ app.get(
             LIMIT 1
           `,
           [
-            ownerEmail
+            ownerEmail,
           ]
         );
 
@@ -1352,8 +1505,8 @@ app.get(
               site.subscription_status,
 
             created_at:
-              site.created_at
-          }
+              site.created_at,
+          },
         })
       );
     } catch (error) {
@@ -1412,7 +1565,7 @@ app.get(
             LIMIT 1
           `,
           [
-            siteId
+            siteId,
           ]
         );
 
@@ -1438,14 +1591,15 @@ app.get(
         const eventResult =
           await db.query(
             `
-              SELECT created_at
+              SELECT
+                created_at
               FROM event_logs
               WHERE site_id = $1
               ORDER BY created_at DESC
               LIMIT 1
             `,
             [
-              siteId
+              siteId,
             ]
           );
 
@@ -1481,12 +1635,14 @@ app.get(
             site.subscription_status,
 
           connected:
-            Boolean(lastEventAt),
+            Boolean(
+              lastEventAt
+            ),
 
           lastEventAt,
 
           createdAt:
-            site.created_at
+            site.created_at,
         })
       );
     } catch (error) {
@@ -1558,9 +1714,9 @@ app.post(
           );
       }
 
-      /* ===================================================
+      /* -----------------------------------------------------
          SITE
-      =================================================== */
+      ----------------------------------------------------- */
 
       const siteResult =
         await db.query(
@@ -1577,7 +1733,7 @@ app.post(
             LIMIT 1
           `,
           [
-            siteId
+            siteId,
           ]
         );
 
@@ -1606,9 +1762,9 @@ app.post(
           );
       }
 
-      /* ===================================================
+      /* -----------------------------------------------------
          EVENT TELEMETRY
-      =================================================== */
+      ----------------------------------------------------- */
 
       let events = [];
 
@@ -1627,7 +1783,7 @@ app.post(
               ORDER BY count DESC
             `,
             [
-              siteId
+              siteId,
             ]
           );
 
@@ -1640,7 +1796,7 @@ app.post(
               count:
                 Number(
                   row.count
-                )
+                ),
             })
           );
       } catch (error) {
@@ -1650,9 +1806,9 @@ app.post(
         );
       }
 
-      /* ===================================================
-         UNIQUE VISITORS / SESSIONS
-      =================================================== */
+      /* -----------------------------------------------------
+         UNIQUE SESSIONS
+      ----------------------------------------------------- */
 
       let uniqueVisitors = 0;
 
@@ -1670,7 +1826,7 @@ app.post(
                   - INTERVAL '24 hours'
             `,
             [
-              siteId
+              siteId,
             ]
           );
 
@@ -1690,14 +1846,14 @@ app.post(
         );
       }
 
-      /* ===================================================
+      /* -----------------------------------------------------
          DECISIONS
-      =================================================== */
+      ----------------------------------------------------- */
 
       let decision = {
         completed_decisions: 0,
         conversions: 0,
-        revenue: 0
+        revenue: 0,
       };
 
       try {
@@ -1726,7 +1882,7 @@ app.post(
                   - INTERVAL '24 hours'
             `,
             [
-              siteId
+              siteId,
             ]
           );
 
@@ -1743,9 +1899,9 @@ app.post(
         );
       }
 
-      /* ===================================================
+      /* -----------------------------------------------------
          RECOVERY
-      =================================================== */
+      ----------------------------------------------------- */
 
       let recovery = {
         total: 0,
@@ -1753,7 +1909,7 @@ app.post(
         processing: 0,
         sent: 0,
         completed: 0,
-        failed: 0
+        failed: 0,
       };
 
       try {
@@ -1790,49 +1946,46 @@ app.post(
                   - INTERVAL '24 hours'
             `,
             [
-              siteId
+              siteId,
             ]
           );
 
         if (
           result.rowCount
         ) {
+          const row =
+            result.rows[0];
+
           recovery = {
             total:
               Number(
-                result.rows[0]
-                  .total || 0
+                row.total || 0
               ),
 
             pending:
               Number(
-                result.rows[0]
-                  .pending || 0
+                row.pending || 0
               ),
 
             processing:
               Number(
-                result.rows[0]
-                  .processing || 0
+                row.processing || 0
               ),
 
             sent:
               Number(
-                result.rows[0]
-                  .sent || 0
+                row.sent || 0
               ),
 
             completed:
               Number(
-                result.rows[0]
-                  .completed || 0
+                row.completed || 0
               ),
 
             failed:
               Number(
-                result.rows[0]
-                  .failed || 0
-              )
+                row.failed || 0
+              ),
           };
         }
       } catch (error) {
@@ -1842,9 +1995,9 @@ app.post(
         );
       }
 
-      /* ===================================================
+      /* -----------------------------------------------------
          EMAILS
-      =================================================== */
+      ----------------------------------------------------- */
 
       let emails = [];
 
@@ -1870,7 +2023,7 @@ app.post(
               ORDER BY count DESC
             `,
             [
-              siteId
+              siteId,
             ]
           );
 
@@ -1886,7 +2039,7 @@ app.post(
               count:
                 Number(
                   row.count
-                )
+                ),
             })
           );
       } catch (error) {
@@ -1896,9 +2049,84 @@ app.post(
         );
       }
 
-      /* ===================================================
+      /* -----------------------------------------------------
+         BANDIT STATE
+      ----------------------------------------------------- */
+
+      let bandit = [];
+
+      try {
+        const result =
+          await db.query(
+            `
+              SELECT
+                action,
+                pulls,
+                rewards,
+
+                CASE
+                  WHEN pulls > 0
+                  THEN ROUND(
+                    (
+                      rewards::numeric /
+                      pulls::numeric
+                    ) * 100,
+                    2
+                  )
+                  ELSE 0
+                END AS conversion_rate,
+
+                updated_at
+
+              FROM bandit_state
+
+              WHERE site_id = $1
+
+              ORDER BY
+                conversion_rate DESC,
+                pulls DESC
+            `,
+            [
+              siteId,
+            ]
+          );
+
+        bandit =
+          result.rows.map(
+            (row) => ({
+              action:
+                row.action,
+
+              pulls:
+                Number(
+                  row.pulls || 0
+                ),
+
+              rewards:
+                Number(
+                  row.rewards || 0
+                ),
+
+              conversionRate:
+                Number(
+                  row.conversion_rate ||
+                    0
+                ),
+
+              updatedAt:
+                row.updated_at,
+            })
+          );
+      } catch (error) {
+        console.warn(
+          "[INTELLIGENCE] bandit data unavailable:",
+          error.message
+        );
+      }
+
+      /* -----------------------------------------------------
          NORMALIZED METRICS
-      =================================================== */
+      ----------------------------------------------------- */
 
       const completedDecisions =
         Number(
@@ -1964,9 +2192,47 @@ app.post(
           "PURCHASE"
         );
 
-      /* ===================================================
-         BRAIN HELPERS
-      =================================================== */
+      const checkoutGap =
+        Math.max(
+          0,
+          checkoutStarted -
+            purchases
+        );
+
+      const totalEmails =
+        emails.reduce(
+          (sum, item) =>
+            sum +
+            Number(
+              item.count || 0
+            ),
+          0
+        );
+
+      const money =
+        new Intl.NumberFormat(
+          "en-NG",
+          {
+            maximumFractionDigits:
+              2,
+          }
+        ).format(
+          revenue
+        );
+
+      const formatNumber =
+        (value) =>
+          new Intl.NumberFormat(
+            "en-NG"
+          ).format(
+            Number(
+              value || 0
+            )
+          );
+
+      /* -----------------------------------------------------
+         QUESTION
+      ----------------------------------------------------- */
 
       const q =
         question
@@ -1990,52 +2256,11 @@ app.post(
               )
           );
 
-      const money =
-        new Intl.NumberFormat(
-          "en-NG",
-          {
-            maximumFractionDigits: 2
-          }
-        ).format(
-          revenue
-        );
-
-      const formatNumber =
-        (value) =>
-          new Intl.NumberFormat(
-            "en-NG"
-          ).format(
-            Number(
-              value || 0
-            )
-          );
-
-      const checkoutGap =
-        Math.max(
-          0,
-          checkoutStarted -
-            purchases
-        );
-
-      const totalEmails =
-        emails.reduce(
-          (sum, item) =>
-            sum +
-            Number(
-              item.count || 0
-            ),
-          0
-        );
-
-      /* ===================================================
-         QUESTION UNDERSTANDING
-      =================================================== */
-
       let answer = "";
 
-      /*
-       * IDENTITY / BUSINESS UNDERSTANDING
-       */
+      /* -----------------------------------------------------
+         IDENTITY
+      ----------------------------------------------------- */
 
       if (
         hasAny([
@@ -2045,21 +2270,20 @@ app.post(
           "what kind of business",
           "what business am i in",
           "what do you know about my business",
-          "what does my business do"
+          "what does my business do",
         ])
       ) {
         answer =
           `Based on the activity REDEN monitors, ` +
           `${site.name} operates as an online storefront or digital business. ` +
-          `REDEN currently monitors its visitor activity, product interest, ` +
+          `REDEN is currently observing visitor activity, product interest, ` +
           `cart activity, checkout behavior, purchases, decisions, ` +
-          `conversions and attributed revenue. ` +
-          `I can use those signals to help you understand how the business is performing.`;
+          `conversions and attributed revenue.`;
       }
 
-      /*
-       * REVENUE
-       */
+      /* -----------------------------------------------------
+         REVENUE
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2085,19 +2309,22 @@ app.post(
           "how much did we earn",
           "how much did we make",
           "how much have we made",
-          "how much have we earned"
+          "how much have we earned",
         ])
       ) {
         answer =
           `Over the last 24 hours, REDEN attributes ` +
           `${money} in revenue to completed decisions for ${site.name}. ` +
-          `There were ${formatNumber(conversions)} conversions ` +
-          `from ${formatNumber(completedDecisions)} completed decisions.`;
+          `There were ${formatNumber(
+            conversions
+          )} conversions from ${formatNumber(
+            completedDecisions
+          )} completed decisions.`;
       }
 
-      /*
-       * TRAFFIC / VISITORS
-       */
+      /* -----------------------------------------------------
+         TRAFFIC
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2123,22 +2350,30 @@ app.post(
           "visitor count",
           "people on my site",
           "people visited",
-          "traffic"
+          "traffic",
         ])
       ) {
         answer =
           `Over the last 24 hours, REDEN recorded approximately ` +
-          `${formatNumber(uniqueVisitors)} unique sessions on ${site.name}. ` +
-          `There were ${formatNumber(pageViews)} page views, ` +
-          `${formatNumber(productViews)} product views, ` +
-          `${formatNumber(addToCart)} add-to-cart events, ` +
-          `${formatNumber(checkoutStarted)} checkout starts, ` +
-          `and ${formatNumber(purchases)} purchase events.`;
+          `${formatNumber(
+            uniqueVisitors
+          )} unique sessions on ${site.name}. ` +
+          `There were ${formatNumber(
+            pageViews
+          )} page views, ${formatNumber(
+            productViews
+          )} product views, ${formatNumber(
+            addToCart
+          )} add-to-cart events, ${formatNumber(
+            checkoutStarted
+          )} checkout starts, and ${formatNumber(
+            purchases
+          )} purchase events.`;
       }
 
-      /*
-       * PURCHASES / ORDERS
-       */
+      /* -----------------------------------------------------
+         PURCHASES
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2162,19 +2397,21 @@ app.post(
           "any orders",
           "people bought",
           "customers bought",
-          "purchases"
+          "purchases",
         ])
       ) {
         answer =
-          `REDEN recorded ${formatNumber(purchases)} purchase events ` +
-          `over the last 24 hours. ` +
-          `There were ${formatNumber(conversions)} conversions ` +
-          `attributed to completed REDEN decisions.`;
+          `REDEN recorded ${formatNumber(
+            purchases
+          )} purchase events over the last 24 hours. ` +
+          `There were ${formatNumber(
+            conversions
+          )} conversions attributed to completed REDEN decisions.`;
       }
 
-      /*
-       * CONVERSION
-       */
+      /* -----------------------------------------------------
+         CONVERSION
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2187,20 +2424,22 @@ app.post(
           "how many people converted",
           "are people converting",
           "did people convert",
-          "conversion"
+          "conversion",
         ])
       ) {
         answer =
-          `REDEN recorded ${formatNumber(conversions)} conversions ` +
-          `from ${formatNumber(completedDecisions)} completed decisions ` +
-          `over the last 24 hours. ` +
+          `REDEN recorded ${formatNumber(
+            conversions
+          )} conversions from ${formatNumber(
+            completedDecisions
+          )} completed decisions over the last 24 hours. ` +
           `The decision conversion rate is ${conversionRate}%. ` +
           `Attributed revenue is ${money}.`;
       }
 
-      /*
-       * SALES
-       */
+      /* -----------------------------------------------------
+         SALES
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2216,20 +2455,23 @@ app.post(
           "business doing",
           "are sales good",
           "sales performance",
-          "sales"
+          "sales",
         ])
       ) {
         answer =
           `Over the last 24 hours, ${site.name} recorded ` +
-          `${formatNumber(purchases)} purchases, ` +
-          `${formatNumber(conversions)} REDEN-attributed conversions, ` +
-          `and ${money} in attributed revenue. ` +
+          `${formatNumber(
+            purchases
+          )} purchases, ${formatNumber(
+            conversions
+          )} REDEN-attributed conversions, and ` +
+          `${money} in attributed revenue. ` +
           `The decision conversion rate is ${conversionRate}%.`;
       }
 
-      /*
-       * CHECKOUT / CART
-       */
+      /* -----------------------------------------------------
+         CART / CHECKOUT
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2244,24 +2486,34 @@ app.post(
           "cart abandonment",
           "checkout abandonment",
           "checkout",
-          "cart"
+          "cart",
         ])
       ) {
         answer =
-          `REDEN recorded ${formatNumber(checkoutStarted)} checkout starts ` +
-          `and ${formatNumber(purchases)} purchase events over the last 24 hours. ` +
-          `The observed checkout-to-purchase event gap is ${formatNumber(checkoutGap)}. ` +
-          `The recovery queue currently contains ` +
-          `${formatNumber(recovery.pending)} pending, ` +
-          `${formatNumber(recovery.processing)} processing, ` +
-          `${formatNumber(recovery.sent)} sent, ` +
-          `${formatNumber(recovery.completed)} completed, ` +
-          `and ${formatNumber(recovery.failed)} failed records.`;
+          `REDEN recorded ${formatNumber(
+            checkoutStarted
+          )} checkout starts and ${formatNumber(
+            purchases
+          )} purchase events over the last 24 hours. ` +
+          `The observed checkout-to-purchase event gap is ${formatNumber(
+            checkoutGap
+          )}. ` +
+          `The recovery queue currently contains ${formatNumber(
+            recovery.pending
+          )} pending, ${formatNumber(
+            recovery.processing
+          )} processing, ${formatNumber(
+            recovery.sent
+          )} sent, ${formatNumber(
+            recovery.completed
+          )} completed, and ${formatNumber(
+            recovery.failed
+          )} failed records.`;
       }
 
-      /*
-       * RECOVERY
-       */
+      /* -----------------------------------------------------
+         RECOVERY
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2271,22 +2523,30 @@ app.post(
           "recovered customers",
           "recover customers",
           "recovery emails",
-          "recovery email"
+          "recovery email",
         ])
       ) {
         answer =
           `REDEN's recovery activity over the last 24 hours is ` +
-          `${formatNumber(recovery.pending)} pending, ` +
-          `${formatNumber(recovery.processing)} processing, ` +
-          `${formatNumber(recovery.sent)} sent, ` +
-          `${formatNumber(recovery.completed)} completed, ` +
-          `and ${formatNumber(recovery.failed)} failed. ` +
-          `There are ${formatNumber(recovery.total)} recovery records in the period.`;
+          `${formatNumber(
+            recovery.pending
+          )} pending, ${formatNumber(
+            recovery.processing
+          )} processing, ${formatNumber(
+            recovery.sent
+          )} sent, ${formatNumber(
+            recovery.completed
+          )} completed, and ${formatNumber(
+            recovery.failed
+          )} failed. ` +
+          `There are ${formatNumber(
+            recovery.total
+          )} recovery records in the period.`;
       }
 
-      /*
-       * EMAIL
-       */
+      /* -----------------------------------------------------
+         EMAIL
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2294,17 +2554,18 @@ app.post(
           "emails",
           "mail",
           "email activity",
-          "email performance"
+          "email performance",
         ])
       ) {
         answer =
-          `REDEN recorded ${formatNumber(totalEmails)} email operations ` +
-          `over the last 24 hours.`;
+          `REDEN recorded ${formatNumber(
+            totalEmails
+          )} email operations over the last 24 hours.`;
       }
 
-      /*
-       * PRODUCT INTEREST
-       */
+      /* -----------------------------------------------------
+         PRODUCT INTEREST
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2314,19 +2575,58 @@ app.post(
           "people viewed products",
           "product interest",
           "interested in products",
-          "product activity"
+          "product activity",
         ])
       ) {
         answer =
-          `REDEN recorded ${formatNumber(productViews)} product views ` +
-          `over the last 24 hours. ` +
-          `There were also ${formatNumber(addToCart)} add-to-cart events ` +
-          `and ${formatNumber(purchases)} purchase events.`;
+          `REDEN recorded ${formatNumber(
+            productViews
+          )} product views over the last 24 hours. ` +
+          `There were also ${formatNumber(
+            addToCart
+          )} add-to-cart events and ${formatNumber(
+            purchases
+          )} purchase events.`;
       }
 
-      /*
-       * PERFORMANCE / OVERVIEW
-       */
+      /* -----------------------------------------------------
+         BANDIT / DECISION PERFORMANCE
+      ----------------------------------------------------- */
+
+      else if (
+        hasAny([
+          "which incentive works",
+          "which discount works",
+          "best incentive",
+          "best discount",
+          "best action",
+          "which action works",
+          "optimization",
+          "optimizer",
+          "bandit",
+          "decision performance",
+        ])
+      ) {
+        if (!bandit.length) {
+          answer =
+            `REDEN does not have enough decision-learning data for ${site.name} yet.`;
+        } else {
+          const best =
+            bandit[0];
+
+          answer =
+            `REDEN's current leading action for ${site.name} is ` +
+            `${best.action}, with a ${best.conversionRate}% observed conversion rate ` +
+            `across ${formatNumber(
+              best.pulls
+            )} recorded outcomes. ` +
+            `REDEN continues testing the other actions so the decision policy can adapt from real outcomes.`;
+        }
+      }
+
+      /* -----------------------------------------------------
+         OVERVIEW
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2345,27 +2645,35 @@ app.post(
           "today",
           "store doing",
           "store performance",
-          "business performance"
+          "business performance",
         ])
       ) {
         answer =
           `For ${site.name}, over the last 24 hours, REDEN recorded ` +
-          `${formatNumber(completedDecisions)} completed decisions, ` +
-          `${formatNumber(conversions)} conversions, and ` +
-          `${money} in attributed revenue. ` +
+          `${formatNumber(
+            completedDecisions
+          )} completed decisions, ${formatNumber(
+            conversions
+          )} conversions, and ${money} in attributed revenue. ` +
           `The decision conversion rate is ${conversionRate}%. ` +
-          `Storefront activity includes ` +
-          `${formatNumber(uniqueVisitors)} unique sessions, ` +
-          `${formatNumber(pageViews)} page views, ` +
-          `${formatNumber(productViews)} product views, ` +
-          `${formatNumber(addToCart)} add-to-cart events, ` +
-          `${formatNumber(checkoutStarted)} checkout starts, ` +
-          `and ${formatNumber(purchases)} purchase events.`;
+          `Storefront activity includes ${formatNumber(
+            uniqueVisitors
+          )} unique sessions, ${formatNumber(
+            pageViews
+          )} page views, ${formatNumber(
+            productViews
+          )} product views, ${formatNumber(
+            addToCart
+          )} add-to-cart events, ${formatNumber(
+            checkoutStarted
+          )} checkout starts, and ${formatNumber(
+            purchases
+          )} purchase events.`;
       }
 
-      /*
-       * FUNNEL
-       */
+      /* -----------------------------------------------------
+         FUNNEL
+      ----------------------------------------------------- */
 
       else if (
         hasAny([
@@ -2375,42 +2683,47 @@ app.post(
           "where are customers dropping",
           "where are people dropping",
           "where do people drop",
-          "where do customers drop"
+          "where do customers drop",
         ])
       ) {
         answer =
           `The current 24-hour event funnel for ${site.name} is ` +
-          `${formatNumber(pageViews)} page views → ` +
-          `${formatNumber(productViews)} product views → ` +
-          `${formatNumber(addToCart)} add-to-cart events → ` +
-          `${formatNumber(checkoutStarted)} checkout starts → ` +
-          `${formatNumber(purchases)} purchase events.`;
+          `${formatNumber(
+            pageViews
+          )} page views → ${formatNumber(
+            productViews
+          )} product views → ${formatNumber(
+            addToCart
+          )} add-to-cart events → ${formatNumber(
+            checkoutStarted
+          )} checkout starts → ${formatNumber(
+            purchases
+          )} purchase events.`;
       }
 
-      /*
-       * FALLBACK
-       */
+      /* -----------------------------------------------------
+         FALLBACK
+      ----------------------------------------------------- */
 
       else {
         answer =
           `REDEN is monitoring ${site.name}. ` +
-          `Over the last 24 hours there were ` +
-          `${formatNumber(uniqueVisitors)} unique sessions, ` +
-          `${formatNumber(pageViews)} page views, ` +
-          `${formatNumber(productViews)} product views, ` +
-          `${formatNumber(addToCart)} add-to-cart events, ` +
-          `${formatNumber(checkoutStarted)} checkout starts, ` +
-          `${formatNumber(purchases)} purchase events, ` +
-          `${formatNumber(conversions)} conversions, ` +
-          `and ${money} in attributed revenue. ` +
-          `You can ask me naturally about your visitors, ` +
-          `sales, revenue, purchases, conversions, carts, ` +
-          `checkout activity, recovery, products, or overall business performance.`;
+          `Over the last 24 hours there were ${formatNumber(
+            uniqueVisitors
+          )} unique sessions, ${formatNumber(
+            pageViews
+          )} page views, ${formatNumber(
+            productViews
+          )} product views, ${formatNumber(
+            addToCart
+          )} add-to-cart events, ${formatNumber(
+            checkoutStarted
+          )} checkout starts, ${formatNumber(
+            purchases
+          )} purchase events, ${formatNumber(
+            conversions
+          )} conversions, and ${money} in attributed revenue.`;
       }
-
-      /* ===================================================
-         RESPONSE
-      =================================================== */
 
       return res.json(
         success({
@@ -2427,7 +2740,7 @@ app.post(
               site.plan,
 
             subscriptionStatus:
-              site.subscription_status
+              site.subscription_status,
           },
 
           evidence: {
@@ -2447,19 +2760,25 @@ app.post(
 
               conversionRate,
 
-              revenue
+              revenue,
             },
 
             recovery,
 
-            emails
-          }
+            emails,
+
+            bandit,
+          },
         })
       );
     } catch (error) {
       console.error(
         "[INTELLIGENCE ERROR]",
-        error
+        {
+          requestId:
+            req.requestId,
+          error,
+        }
       );
 
       return res
@@ -2485,7 +2804,7 @@ app.post(
         session_id,
         event,
         payload,
-        event_id
+        event_id,
       } = req.body;
 
       const sessionId =
@@ -2534,19 +2853,17 @@ app.post(
         `evt_${crypto.randomUUID()}`;
 
       const safePayloadObject =
-        payload &&
-        typeof payload ===
-          "object"
-          ? payload
-          : {};
+        safePayload(
+          payload
+        );
 
       const safePayload =
-        JSON.stringify(
+        safeJson(
           safePayloadObject
         );
 
       const safeCart =
-        JSON.stringify(
+        safeJson(
           safePayloadObject.cart &&
           typeof safePayloadObject.cart ===
             "object"
@@ -2576,11 +2893,10 @@ app.post(
       const clientIp =
         req.ip || null;
 
-      /*
-       * Idempotent event insert.
-       *
-       * Requires the unique site_id/event_id index where possible.
-       */
+      /* -----------------------------------------------------
+         EVENT INSERT
+      ----------------------------------------------------- */
+
       const insertResult =
         await db.query(
           `
@@ -2613,18 +2929,20 @@ app.post(
             clientIp,
             req.headers[
               "user-agent"
-            ]
+            ],
           ]
         );
 
-      /*
-       * Only update session context when this was a newly
-       * inserted event. This prevents duplicate event IDs
-       * from inflating session statistics.
-       */
-      if (
-        insertResult.rowCount
-      ) {
+      const recorded =
+        Boolean(
+          insertResult.rowCount
+        );
+
+      /* -----------------------------------------------------
+         ADAPTIVE CONTEXT
+      ----------------------------------------------------- */
+
+      if (recorded) {
         try {
           await updateSessionContext({
             siteId:
@@ -2636,11 +2954,12 @@ app.post(
               normalizedEvent,
 
             payload:
-              safePayloadObject
+              safePayloadObject,
           });
         } catch (error) {
           /*
-           * Context must never break telemetry.
+           * Context intelligence must never
+           * break telemetry.
            */
           console.warn(
             "[EVENT CONTEXT ERROR]",
@@ -2649,9 +2968,9 @@ app.post(
         }
       }
 
-      /*
-       * CHECKOUT RECOVERY
-       */
+      /* -----------------------------------------------------
+         CHECKOUT RECOVERY
+      ----------------------------------------------------- */
 
       const customerEmail =
         normalizeEmail(
@@ -2659,7 +2978,7 @@ app.post(
         );
 
       if (
-        insertResult.rowCount &&
+        recorded &&
         normalizedEvent ===
           "CHECKOUT_STARTED" &&
         customerEmail
@@ -2691,7 +3010,7 @@ app.post(
             sessionId,
             customerEmail,
             safeCart,
-            "10% OFF"
+            "10% OFF",
           ]
         );
       }
@@ -2701,16 +3020,17 @@ app.post(
           event_id:
             safeEventId,
 
-          recorded:
-            Boolean(
-              insertResult.rowCount
-            )
+          recorded,
         })
       );
     } catch (error) {
       console.error(
         "[EVENT ERROR]",
-        error
+        {
+          requestId:
+            req.requestId,
+          error,
+        }
       );
 
       return res
@@ -2736,7 +3056,7 @@ app.post(
         session_id,
         cart_id,
         cart_value,
-        payload
+        payload,
       } = req.body;
 
       const sessionId =
@@ -2778,20 +3098,49 @@ app.post(
           200
         ) || null;
 
-      const behavior =
-        payload &&
-        typeof payload ===
-          "object"
-          ? payload
-          : {};
+      const suppliedBehavior =
+        safePayload(
+          payload
+        );
+
+      /* -----------------------------------------------------
+         READ ADAPTIVE SESSION CONTEXT
+      ----------------------------------------------------- */
+
+      let sessionContext =
+        null;
+
+      try {
+        sessionContext =
+          await getSessionContext(
+            req.site.site_id,
+            sessionId
+          );
+      } catch (error) {
+        console.warn(
+          "[SCORE CONTEXT READ ERROR]",
+          error.message
+        );
+      }
 
       /*
-       * IMPORTANT:
-       * site_id was previously missing here.
+       * The context engine is now part of the
+       * decision pipeline.
        *
-       * The bandit is tenant-specific, so the site ID must
-       * always be passed.
+       * We preserve merchant-provided behavior while
+       * exposing the actual observed session state.
        */
+      const behavior = {
+        ...suppliedBehavior,
+
+        session_context:
+          sessionContext || null,
+      };
+
+      /* -----------------------------------------------------
+         BANDIT DECISION
+      ----------------------------------------------------- */
+
       const action =
         (
           await pickAction({
@@ -2804,7 +3153,7 @@ app.post(
             cart_value:
               value,
 
-            behavior
+            behavior,
           })
         ) ||
         "NONE";
@@ -2816,21 +3165,13 @@ app.post(
 
         INCENTIVE_MED: 10,
 
-        INCENTIVE_HIGH: 20
+        INCENTIVE_HIGH: 20,
       };
 
       const discount =
         discountMap[action] ??
         0;
 
-      /*
-       * discount is a percentage.
-       *
-       * Example:
-       * ₦1,000 cart + 10% discount
-       * = ₦100 discount
-       * = ₦900 expected value
-       */
       const discountAmount =
         value *
         (
@@ -2843,6 +3184,10 @@ app.post(
           value -
             discountAmount
         );
+
+      /* -----------------------------------------------------
+         DECISION PERSISTENCE
+      ----------------------------------------------------- */
 
       const result =
         await db.query(
@@ -2865,7 +3210,14 @@ app.post(
               $6,
               'SCORED'
             )
-            RETURNING id
+            RETURNING
+              id,
+              site_id,
+              session_id,
+              action,
+              discount,
+              expected_value,
+              state
           `,
           [
             req.site.site_id,
@@ -2873,31 +3225,50 @@ app.post(
             cartId,
             action,
             discount,
-            expectedValue
+            expectedValue,
           ]
         );
+
+      const decision =
+        result.rows[0];
 
       return res.json(
         success({
           decision_id:
-            result.rows[0]
-              .id,
+            decision.id,
 
-          action,
+          action:
 
-          discount,
+            decision.action,
+
+          discount:
+            Number(
+              decision.discount
+            ),
 
           discount_amount:
             discountAmount,
 
           expected_value:
-            expectedValue
+            Number(
+              decision.expected_value
+            ),
+
+          state:
+            decision.state,
+
+          context:
+            sessionContext,
         })
       );
     } catch (error) {
       console.error(
         "[SCORE ERROR]",
-        error
+        {
+          requestId:
+            req.requestId,
+          error,
+        }
       );
 
       return res
@@ -2938,13 +3309,6 @@ app.post(
           );
       }
 
-      /*
-       * Strict state transition:
-       *
-       * SCORED -> ACTIONED
-       *
-       * A completed decision can no longer be rewritten.
-       */
       const result =
         await db.query(
           `
@@ -2957,7 +3321,7 @@ app.post(
           `,
           [
             decisionId,
-            req.site.site_id
+            req.site.site_id,
           ]
         );
 
@@ -2975,13 +3339,18 @@ app.post(
 
       return res.json(
         success({
-          actioned: true
+          actioned:
+            true,
         })
       );
     } catch (error) {
       console.error(
         "[ACTION ERROR]",
-        error
+        {
+          requestId:
+            req.requestId,
+          error,
+        }
       );
 
       return res
@@ -3044,13 +3413,10 @@ app.post(
           );
       }
 
-      /*
-       * Atomic state transition.
-       *
-       * This prevents two simultaneous outcome requests from
-       * both completing the same decision and both rewarding
-       * the bandit.
-       */
+      /* -----------------------------------------------------
+         ATOMIC DECISION COMPLETION
+      ----------------------------------------------------- */
+
       const result =
         await db.query(
           `
@@ -3065,23 +3431,24 @@ app.post(
               AND state = 'ACTIONED'
             RETURNING
               id,
-              action
+              site_id,
+              session_id,
+              action,
+              converted,
+              revenue,
+              completed_at
           `,
           [
             converted,
             revenueValue,
             decisionId,
-            req.site.site_id
+            req.site.site_id,
           ]
         );
 
       if (
         !result.rowCount
       ) {
-        /*
-         * Determine whether the decision exists so the API can
-         * distinguish "not found" from "already completed/invalid state".
-         */
         const existing =
           await db.query(
             `
@@ -3095,7 +3462,7 @@ app.post(
             `,
             [
               decisionId,
-              req.site.site_id
+              req.site.site_id,
             ]
           );
 
@@ -3120,33 +3487,67 @@ app.post(
           );
       }
 
-      const action =
-        result.rows[0]
-          .action;
+      const completedDecision =
+        result.rows[0];
 
-      /*
-       * IMPORTANT:
-       * updateBandit signature is:
-       *
-       * updateBandit(site_id, action, converted)
-       *
-       * The old server passed the arguments incorrectly.
-       */
+      /* -----------------------------------------------------
+         BANDIT LEARNING
+      ----------------------------------------------------- */
+
       await updateBandit(
         req.site.site_id,
-        action,
-        converted
+        completedDecision.action,
+        completedDecision.converted
       );
+
+      /* -----------------------------------------------------
+         ADAPTIVE SESSION CONTEXT
+      ----------------------------------------------------- */
+
+      /*
+       * If the merchant sends PURCHASE through the event
+       * pipeline, the context engine will already receive it.
+       *
+       * The outcome endpoint itself still updates the
+       * decision system independently.
+       */
 
       return res.json(
         success({
-          updated: true
+          updated:
+            true,
+
+          decision: {
+            id:
+              completedDecision.id,
+
+            action:
+              completedDecision.action,
+
+            converted:
+              Boolean(
+                completedDecision.converted
+              ),
+
+            revenue:
+              Number(
+                completedDecision.revenue ||
+                  0
+              ),
+
+            completedAt:
+              completedDecision.completed_at,
+          },
         })
       );
     } catch (error) {
       console.error(
         "[OUTCOME ERROR]",
-        error
+        {
+          requestId:
+            req.requestId,
+          error,
+        }
       );
 
       return res
@@ -3172,14 +3573,16 @@ app.get(
         await db.query(
           `
             SELECT
-              COUNT(*) AS total,
+              COUNT(*)::int AS total,
 
               COUNT(*) FILTER (
                 WHERE converted = true
-              ) AS conversions,
+              )::int AS conversions,
 
               COALESCE(
-                SUM(revenue),
+                SUM(revenue) FILTER (
+                  WHERE converted = true
+                ),
                 0
               ) AS revenue
 
@@ -3189,7 +3592,7 @@ app.get(
               AND state = 'COMPLETED'
           `,
           [
-            req.site.site_id
+            req.site.site_id,
           ]
         );
 
@@ -3205,20 +3608,23 @@ app.get(
 
           conversions:
             Number(
-              row.conversions ||
-                0
+              row.conversions || 0
             ),
 
           revenue:
             Number(
               row.revenue || 0
-            )
+            ),
         })
       );
     } catch (error) {
       console.error(
         "[METRICS ERROR]",
-        error
+        {
+          requestId:
+            req.requestId,
+          error,
+        }
       );
 
       return res
@@ -3250,13 +3656,10 @@ cron.schedule(
     let client;
 
     try {
-      /*
-       * Recover jobs that were marked PROCESSING but whose
-       * worker died before completing them.
-       *
-       * This is deliberately conservative: only jobs that have
-       * been processing for at least 30 minutes are reset.
-       */
+      /* -----------------------------------------------------
+         RESET STALE PROCESSING JOBS
+      ----------------------------------------------------- */
+
       await db.query(
         `
           UPDATE recovery_queue
@@ -3267,6 +3670,10 @@ cron.schedule(
               NOW() - INTERVAL '30 minutes'
         `
       );
+
+      /* -----------------------------------------------------
+         CLAIM BATCH
+      ----------------------------------------------------- */
 
       client =
         await db.connect();
@@ -3299,28 +3706,34 @@ cron.schedule(
         "COMMIT"
       );
 
+      /* -----------------------------------------------------
+         PROCESS CLAIMED JOBS
+      ----------------------------------------------------- */
+
       for (
         const item of
           batch.rows
       ) {
         try {
-          /*
-           * IMPORTANT:
-           * Recovery conversion checks must be tenant-scoped.
-           */
+          /* -----------------------------------------------
+             CHECK EXISTING CONVERSION
+          ----------------------------------------------- */
+
           const conversionCheck =
             await db.query(
               `
-                SELECT id
+                SELECT
+                  id
                 FROM decisions
                 WHERE site_id = $1
                   AND session_id = $2
                   AND converted = true
+                  AND state = 'COMPLETED'
                 LIMIT 1
               `,
               [
                 item.site_id,
-                item.session_id
+                item.session_id,
               ]
             );
 
@@ -3334,14 +3747,19 @@ cron.schedule(
                   status = 'COMPLETED',
                   processed_at = NOW()
                 WHERE id = $1
+                  AND status = 'PROCESSING'
               `,
               [
-                item.id
+                item.id,
               ]
             );
 
             continue;
           }
+
+          /* -----------------------------------------------
+             SEND RECOVERY EMAIL
+          ----------------------------------------------- */
 
           await sendRecoveryEmail({
             to:
@@ -3351,22 +3769,41 @@ cron.schedule(
               item.incentive,
 
             cart:
-              item.cart_data
+              item.cart_data,
           });
 
-          await db.query(
-            `
-              UPDATE recovery_queue
-              SET
-                status = 'SENT',
-                processed_at = NOW()
-              WHERE id = $1
-                AND status = 'PROCESSING'
-            `,
-            [
-              item.id
-            ]
-          );
+          /* -----------------------------------------------
+             MARK SENT
+          ----------------------------------------------- */
+
+          const sentResult =
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'SENT',
+                  processed_at = NOW()
+                WHERE id = $1
+                  AND status = 'PROCESSING'
+              `,
+              [
+                item.id,
+              ]
+            );
+
+          if (
+            !sentResult.rowCount
+          ) {
+            console.warn(
+              `[RECOVERY] Job ${item.id} was no longer PROCESSING after email send.`
+            );
+
+            continue;
+          }
+
+          /* -----------------------------------------------
+             EMAIL LOG
+          ----------------------------------------------- */
 
           await db.query(
             `
@@ -3387,13 +3824,19 @@ cron.schedule(
             `,
             [
               item.site_id,
-              item.customer_email
+              item.customer_email,
             ]
           );
         } catch (error) {
           console.error(
             "[RECOVERY EMAIL ERROR]",
-            error
+            {
+              recoveryId:
+                item.id,
+              siteId:
+                item.site_id,
+              error,
+            }
           );
 
           try {
@@ -3404,9 +3847,10 @@ cron.schedule(
                   status = 'FAILED',
                   processed_at = NOW()
                 WHERE id = $1
+                  AND status = 'PROCESSING'
               `,
               [
-                item.id
+                item.id,
               ]
             );
           } catch (
@@ -3450,10 +3894,6 @@ cron.schedule(
     let lockClient;
 
     try {
-      /*
-       * PostgreSQL advisory lock protects the daily report
-       * when REDEN is running on multiple server instances.
-       */
       lockClient =
         await db.connect();
 
@@ -3510,14 +3950,16 @@ cron.schedule(
             await lockClient.query(
               `
                 SELECT
-                  COUNT(*) AS total,
+                  COUNT(*)::int AS total,
 
                   COUNT(*) FILTER (
                     WHERE converted = true
-                  ) AS conversions,
+                  )::int AS conversions,
 
                   COALESCE(
-                    SUM(revenue),
+                    SUM(revenue) FILTER (
+                      WHERE converted = true
+                    ),
                     0
                   ) AS revenue
 
@@ -3529,7 +3971,7 @@ cron.schedule(
                     - INTERVAL '1 day'
               `,
               [
-                merchant.site_id
+                merchant.site_id,
               ]
             );
 
@@ -3560,8 +4002,8 @@ cron.schedule(
                 Number(
                   metrics.revenue ||
                     0
-                )
-            }
+                ),
+            },
           });
 
           await lockClient.query(
@@ -3583,14 +4025,10 @@ cron.schedule(
             `,
             [
               merchant.site_id,
-              merchant.owner_email
+              merchant.owner_email,
             ]
           );
         } catch (merchantError) {
-          /*
-           * One merchant's email failure must not stop the
-           * daily reports for every other merchant.
-           */
           console.error(
             `[DAILY REPORT] Failed for site ${merchant.site_id}:`,
             merchantError
@@ -3623,7 +4061,7 @@ cron.schedule(
   },
   {
     timezone:
-      "UTC"
+      "UTC",
   }
 );
 
@@ -3656,7 +4094,11 @@ app.use(
   ) => {
     console.error(
       "[UNHANDLED ERROR]",
-      error
+      {
+        requestId:
+          req.requestId,
+        error,
+      }
     );
 
     if (
@@ -3688,27 +4130,43 @@ const server =
       );
 
       console.log(
-        `[REDEN] Internal intelligence authentication: ENABLED`
+        "[REDEN] Internal intelligence authentication: ENABLED"
       );
 
       console.log(
-        `[REDEN] Installation lookup: INTERNAL`
+        "[REDEN] Installation lookup: INTERNAL"
       );
 
       console.log(
-        `[REDEN] Installation verification: PUBLIC`
+        "[REDEN] Installation verification: PUBLIC"
       );
 
       console.log(
-        `[REDEN] Dashboard intelligence: ENABLED`
+        "[REDEN] Dashboard intelligence: ENABLED"
       );
 
       console.log(
-        `[REDEN] Session context integration: ENABLED`
+        "[REDEN] Adaptive session context: ENABLED"
       );
 
       console.log(
-        `[REDEN] Paystack dependency: DISABLED`
+        "[REDEN] Bandit optimization: ENABLED"
+      );
+
+      console.log(
+        "[REDEN] Outcome learning: ENABLED"
+      );
+
+      console.log(
+        "[REDEN] Recovery processing: ENABLED"
+      );
+
+      console.log(
+        "[REDEN] Daily reports: ENABLED"
+      );
+
+      console.log(
+        "[REDEN] Paystack dependency: DISABLED"
       );
     }
   );
@@ -3717,7 +4175,8 @@ const server =
    GRACEFUL SHUTDOWN
 ========================================================= */
 
-let shuttingDown = false;
+let shuttingDown =
+  false;
 
 const shutdownHandler =
   async (signal) => {
@@ -3725,7 +4184,8 @@ const shutdownHandler =
       return;
     }
 
-    shuttingDown = true;
+    shuttingDown =
+      true;
 
     console.log(
       `[${signal}] REDEN shutting down...`
