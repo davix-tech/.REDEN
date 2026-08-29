@@ -1,4 +1,3 @@
-```js
 import { db } from "../infrastructure/db.js";
 
 const ACTIONS = [
@@ -16,7 +15,7 @@ const MIN_PULLS = 3;
 ========================================================= */
 
 function randomItem(items) {
-  if (!items.length) {
+  if (!Array.isArray(items) || items.length === 0) {
     return "NONE";
   }
 
@@ -35,8 +34,17 @@ function normalizeNumber(value) {
   return number;
 }
 
+function normalizeBoolean(value) {
+  return (
+    value === true ||
+    value === 1 ||
+    value === "1" ||
+    value === "true"
+  );
+}
+
 /* =========================================================
-   ENSURE TENANT BANDIT STATE
+   ENSURE BANDIT STATE
 ========================================================= */
 
 async function ensureBanditState(siteId) {
@@ -55,17 +63,11 @@ async function ensureBanditState(siteId) {
         0,
         0,
         NOW()
-      FROM unnest($2::text[]) AS actions(action)
-      ON CONFLICT (
-        site_id,
-        action
-      )
+      FROM unnest($2::text[]) AS action
+      ON CONFLICT (site_id, action)
       DO NOTHING
     `,
-    [
-      siteId,
-      ACTIONS,
-    ]
+    [siteId, ACTIONS]
   );
 }
 
@@ -105,120 +107,112 @@ export async function pickAction({
       return "NONE";
     }
 
-    /*
-     * Always test actions that have
-     * never received an observation.
-     */
+    /* -----------------------------------------------------
+       1. Every action must be observed at least once.
+    ----------------------------------------------------- */
 
     const untested = rows.filter(
-      (row) =>
-        Number(row.pulls || 0) === 0
+      (row) => Number(row.pulls || 0) === 0
     );
 
-    if (untested.length) {
+    if (untested.length > 0) {
       return randomItem(
-        untested.map(
-          (row) => row.action
-        )
+        untested.map((row) => row.action)
       );
     }
 
-    /*
-     * Give every action a minimum
-     * number of learning opportunities.
-     */
+    /* -----------------------------------------------------
+       2. Give weakly-observed actions more opportunities.
+    ----------------------------------------------------- */
 
     const underExplored = rows.filter(
       (row) =>
         Number(row.pulls || 0) < MIN_PULLS
     );
 
-    if (underExplored.length) {
+    if (underExplored.length > 0) {
       return randomItem(
-        underExplored.map(
-          (row) => row.action
-        )
+        underExplored.map((row) => row.action)
       );
     }
 
-    /*
-     * Epsilon exploration.
-     */
+    /* -----------------------------------------------------
+       3. Epsilon exploration.
+    ----------------------------------------------------- */
 
     if (Math.random() < EPSILON) {
       return randomItem(
-        rows.map(
-          (row) => row.action
-        )
+        rows.map((row) => row.action)
       );
     }
 
-    /*
-     * Exploitation.
-     *
-     * Current reward model:
-     *
-     * conversion = 1
-     * no conversion = 0
-     *
-     * Therefore rewards / pulls represents
-     * observed conversion probability.
-     */
+    /* -----------------------------------------------------
+       4. Exploitation.
+    ----------------------------------------------------- */
+
+    const cartValue = normalizeNumber(cart_value);
 
     let bestAction = "NONE";
     let bestScore = -Infinity;
 
-    const value = normalizeNumber(
-      cart_value
-    );
-
     for (const row of rows) {
-      const pulls = Number(
-        row.pulls || 0
-      );
-
-      const rewards = Number(
-        row.rewards || 0
-      );
+      const pulls = Number(row.pulls || 0);
+      const rewards = Number(row.rewards || 0);
 
       if (pulls <= 0) {
         continue;
       }
 
-      let score =
-        rewards / pulls;
+      /*
+       * Base reward:
+       *
+       * conversions / observations
+       */
+      let score = rewards / pulls;
+
+      /* ---------------------------------------------------
+         BUSINESS GUARDRAILS
+      --------------------------------------------------- */
 
       /*
-       * Conservative business constraints.
-       *
-       * Higher incentives should not automatically
-       * dominate simply because they convert better.
+       * Do not aggressively discount very small carts.
        */
 
       if (
         row.action === "INCENTIVE_HIGH" &&
-        value < 1000
+        cartValue < 1000
       ) {
         score *= 0.85;
       }
 
       if (
         row.action === "INCENTIVE_MED" &&
-        value < 500
+        cartValue < 500
       ) {
         score *= 0.90;
       }
 
       /*
-       * Returning customers generally require
-       * less aggressive intervention.
+       * Returning customers usually need less intervention.
        */
 
       if (
         row.action !== "NONE" &&
-        behavior?.returning_customer
+        behavior?.returning_customer === true
       ) {
         score *= 0.97;
+      }
+
+      /*
+       * Keep NONE competitive for low-value carts.
+       */
+
+      if (
+        row.action === "NONE" &&
+        cartValue > 0 &&
+        cartValue < 500
+      ) {
+        score *= 1.03;
       }
 
       if (score > bestScore) {
@@ -235,8 +229,8 @@ export async function pickAction({
     );
 
     /*
-     * Optimization failure must never
-     * break storefront operation.
+     * The optimizer must never break
+     * the merchant storefront.
      */
 
     return "NONE";
@@ -260,7 +254,17 @@ export async function updateBandit(
       return;
     }
 
-    const reward = converted ? 1 : 0;
+    const reward = normalizeBoolean(converted)
+      ? 1
+      : 0;
+
+    /*
+     * Atomic upsert.
+     *
+     * This is important because multiple
+     * shoppers can generate outcomes at
+     * the same time.
+     */
 
     await db.query(
       `
@@ -313,9 +317,7 @@ export async function updateBandit(
    BANDIT STATS
 ========================================================= */
 
-export async function getBanditStats(
-  site_id
-) {
+export async function getBanditStats(site_id) {
   if (!site_id) {
     return [];
   }
@@ -332,8 +334,8 @@ export async function getBanditStats(
             WHEN pulls > 0
             THEN ROUND(
               (
-                rewards /
-                pulls
+                rewards::numeric /
+                pulls::numeric
               ) * 100,
               2
             )
@@ -363,4 +365,3 @@ export async function getBanditStats(
     return [];
   }
 }
-```
