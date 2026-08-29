@@ -8,27 +8,72 @@ const ACTIONS = [
 ];
 
 const EPSILON = 0.10;
-
-/*
- * Minimum number of observations before an action
- * can be considered properly exploited.
- */
-const MIN_EXPLORATION_PULLS = 3;
+const MIN_PULLS = 3;
 
 /* =========================================================
-   RANDOM ACTION
+   HELPERS
 ========================================================= */
 
-function randomAction(actions = ACTIONS) {
-  if (!actions.length) {
+function randomItem(items) {
+  if (!items.length) {
     return "NONE";
   }
 
-  return actions[
+  return items[
     Math.floor(
-      Math.random() * actions.length
+      Math.random() * items.length
     )
   ];
+}
+
+function normalizeNumber(value) {
+  const number = Number(value);
+
+  if (
+    !Number.isFinite(number) ||
+    number < 0
+  ) {
+    return 0;
+  }
+
+  return number;
+}
+
+/* =========================================================
+   ENSURE TENANT BANDIT STATE
+========================================================= */
+
+async function ensureBanditState(siteId) {
+  await db.query(
+    `
+      INSERT INTO bandit_state (
+        site_id,
+        action,
+        pulls,
+        rewards,
+        updated_at
+      )
+      SELECT
+        $1,
+        action,
+        0,
+        0,
+        NOW()
+
+      FROM unnest($2::text[]) AS action
+
+      ON CONFLICT (
+        site_id,
+        action
+      )
+
+      DO NOTHING
+    `,
+    [
+      siteId,
+      ACTIONS,
+    ]
+  );
 }
 
 /* =========================================================
@@ -43,83 +88,33 @@ export async function pickAction({
 } = {}) {
   try {
     if (!site_id) {
-      console.warn(
-        "[BANDIT] Missing site_id. Falling back to NONE."
-      );
-
       return "NONE";
     }
 
-    const result = await db.query(
-      `
-        SELECT
-          action,
-          pulls,
-          rewards
-        FROM bandit_state
-        WHERE site_id = $1
-        ORDER BY action
-      `,
-      [site_id]
+    await ensureBanditState(
+      site_id
     );
 
-    let rows = result.rows || [];
-
-    /*
-     * Ensure every action exists for the tenant.
-     *
-     * This protects against old installations that were
-     * created before the tenant-scoped bandit schema.
-     */
-
-    if (rows.length < ACTIONS.length) {
+    const result =
       await db.query(
         `
-          INSERT INTO bandit_state (
-            site_id,
+          SELECT
             action,
             pulls,
             rewards
-          )
-          SELECT
-            $1,
-            action,
-            0,
-            0
-          FROM unnest($2::text[]) AS action
-          ON CONFLICT (
-            site_id,
-            action
-          )
-          DO NOTHING
+          FROM bandit_state
+          WHERE site_id = $1
+          ORDER BY action
         `,
-        [
-          site_id,
-          ACTIONS,
-        ]
+        [site_id]
       );
 
-      const refreshed =
-        await db.query(
-          `
-            SELECT
-              action,
-              pulls,
-              rewards
-            FROM bandit_state
-            WHERE site_id = $1
-          `,
-          [site_id]
-        );
-
-      rows =
-        refreshed.rows || [];
-    }
+    const rows =
+      result.rows || [];
 
     /*
-     * First priority:
-     * deliberately explore actions that have never
-     * been observed.
+     * Always test actions that have
+     * never received an observation.
      */
 
     const untested =
@@ -129,7 +124,7 @@ export async function pickAction({
       );
 
     if (untested.length) {
-      return randomAction(
+      return randomItem(
         untested.map(
           (row) => row.action
         )
@@ -137,20 +132,19 @@ export async function pickAction({
     }
 
     /*
-     * Second priority:
-     * make sure every action gets a small amount
-     * of exploration before exploitation dominates.
+     * Give every action a minimum
+     * learning opportunity.
      */
 
     const underExplored =
       rows.filter(
         (row) =>
           Number(row.pulls || 0) <
-          MIN_EXPLORATION_PULLS
+          MIN_PULLS
       );
 
     if (underExplored.length) {
-      return randomAction(
+      return randomItem(
         underExplored.map(
           (row) => row.action
         )
@@ -161,8 +155,11 @@ export async function pickAction({
      * Epsilon exploration.
      */
 
-    if (Math.random() < EPSILON) {
-      return randomAction(
+    if (
+      Math.random() <
+      EPSILON
+    ) {
+      return randomItem(
         rows.map(
           (row) => row.action
         )
@@ -171,14 +168,22 @@ export async function pickAction({
 
     /*
      * Exploitation.
-     *
-     * Current reward is conversion probability.
      */
 
-    let bestAction = "NONE";
-    let bestScore = -Infinity;
+    let bestAction =
+      "NONE";
 
-    for (const row of rows) {
+    let bestScore =
+      -Infinity;
+
+    const value =
+      normalizeNumber(
+        cart_value
+      );
+
+    for (
+      const row of rows
+    ) {
       const pulls =
         Number(
           row.pulls || 0
@@ -193,24 +198,15 @@ export async function pickAction({
         continue;
       }
 
-      const conversionRate =
+      let score =
         rewards / pulls;
 
       /*
-       * Small context adjustment.
+       * Conservative business constraints.
        *
-       * This is intentionally conservative.
-       * We do not allow cart value or behavior
-       * to completely override learned conversion.
+       * High discounts should not automatically
+       * dominate simply because they convert.
        */
-
-      let score =
-        conversionRate;
-
-      const value =
-        Number(
-          cart_value || 0
-        );
 
       if (
         row.action ===
@@ -222,13 +218,28 @@ export async function pickAction({
 
       if (
         row.action ===
-          "NONE" &&
-        behavior?.returning_customer
+          "INCENTIVE_MED" &&
+        value < 500
       ) {
-        score *= 1.05;
+        score *= 0.90;
       }
 
-      if (score > bestScore) {
+      /*
+       * Returning customers generally
+       * require less aggressive intervention.
+       */
+
+      if (
+        row.action !== "NONE" &&
+        behavior?.returning_customer
+      ) {
+        score *= 0.97;
+      }
+
+      if (
+        score >
+        bestScore
+      ) {
         bestScore =
           score;
 
@@ -237,10 +248,7 @@ export async function pickAction({
       }
     }
 
-    return (
-      bestAction ||
-      "NONE"
-    );
+    return bestAction;
   } catch (error) {
     console.error(
       "[BANDIT PICK ERROR]",
@@ -248,8 +256,8 @@ export async function pickAction({
     );
 
     /*
-     * The optimization layer must NEVER take
-     * the storefront decision API down.
+     * Optimization failure must never
+     * break storefront operation.
      */
 
     return "NONE";
@@ -266,19 +274,10 @@ export async function updateBandit(
   converted
 ) {
   try {
-    if (!site_id) {
-      console.warn(
-        "[BANDIT UPDATE] Missing site_id."
-      );
-
-      return;
-    }
-
-    if (!ACTIONS.includes(action)) {
-      console.warn(
-        `[BANDIT UPDATE] Invalid action: ${action}`
-      );
-
+    if (
+      !site_id ||
+      !ACTIONS.includes(action)
+    ) {
       return;
     }
 
@@ -312,7 +311,8 @@ export async function updateBandit(
             bandit_state.pulls + 1,
 
           rewards =
-            bandit_state.rewards + EXCLUDED.rewards,
+            bandit_state.rewards +
+            EXCLUDED.rewards,
 
           updated_at =
             NOW()
