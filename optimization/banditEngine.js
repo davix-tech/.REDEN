@@ -1,3 +1,4 @@
+```js
 import { db } from "../infrastructure/db.js";
 
 const ACTIONS = [
@@ -20,19 +21,14 @@ function randomItem(items) {
   }
 
   return items[
-    Math.floor(
-      Math.random() * items.length
-    )
+    Math.floor(Math.random() * items.length)
   ];
 }
 
 function normalizeNumber(value) {
   const number = Number(value);
 
-  if (
-    !Number.isFinite(number) ||
-    number < 0
-  ) {
+  if (!Number.isFinite(number) || number < 0) {
     return 0;
   }
 
@@ -59,14 +55,11 @@ async function ensureBanditState(siteId) {
         0,
         0,
         NOW()
-
-      FROM unnest($2::text[]) AS action
-
+      FROM unnest($2::text[]) AS actions(action)
       ON CONFLICT (
         site_id,
         action
       )
-
       DO NOTHING
     `,
     [
@@ -91,37 +84,36 @@ export async function pickAction({
       return "NONE";
     }
 
-    await ensureBanditState(
-      site_id
+    await ensureBanditState(site_id);
+
+    const result = await db.query(
+      `
+        SELECT
+          action,
+          pulls,
+          rewards
+        FROM bandit_state
+        WHERE site_id = $1
+        ORDER BY action
+      `,
+      [site_id]
     );
 
-    const result =
-      await db.query(
-        `
-          SELECT
-            action,
-            pulls,
-            rewards
-          FROM bandit_state
-          WHERE site_id = $1
-          ORDER BY action
-        `,
-        [site_id]
-      );
+    const rows = result.rows || [];
 
-    const rows =
-      result.rows || [];
+    if (!rows.length) {
+      return "NONE";
+    }
 
     /*
      * Always test actions that have
      * never received an observation.
      */
 
-    const untested =
-      rows.filter(
-        (row) =>
-          Number(row.pulls || 0) === 0
-      );
+    const untested = rows.filter(
+      (row) =>
+        Number(row.pulls || 0) === 0
+    );
 
     if (untested.length) {
       return randomItem(
@@ -133,15 +125,13 @@ export async function pickAction({
 
     /*
      * Give every action a minimum
-     * learning opportunity.
+     * number of learning opportunities.
      */
 
-    const underExplored =
-      rows.filter(
-        (row) =>
-          Number(row.pulls || 0) <
-          MIN_PULLS
-      );
+    const underExplored = rows.filter(
+      (row) =>
+        Number(row.pulls || 0) < MIN_PULLS
+    );
 
     if (underExplored.length) {
       return randomItem(
@@ -155,10 +145,7 @@ export async function pickAction({
      * Epsilon exploration.
      */
 
-    if (
-      Math.random() <
-      EPSILON
-    ) {
+    if (Math.random() < EPSILON) {
       return randomItem(
         rows.map(
           (row) => row.action
@@ -168,31 +155,31 @@ export async function pickAction({
 
     /*
      * Exploitation.
+     *
+     * Current reward model:
+     *
+     * conversion = 1
+     * no conversion = 0
+     *
+     * Therefore rewards / pulls represents
+     * observed conversion probability.
      */
 
-    let bestAction =
-      "NONE";
+    let bestAction = "NONE";
+    let bestScore = -Infinity;
 
-    let bestScore =
-      -Infinity;
+    const value = normalizeNumber(
+      cart_value
+    );
 
-    const value =
-      normalizeNumber(
-        cart_value
+    for (const row of rows) {
+      const pulls = Number(
+        row.pulls || 0
       );
 
-    for (
-      const row of rows
-    ) {
-      const pulls =
-        Number(
-          row.pulls || 0
-        );
-
-      const rewards =
-        Number(
-          row.rewards || 0
-        );
+      const rewards = Number(
+        row.rewards || 0
+      );
 
       if (pulls <= 0) {
         continue;
@@ -204,29 +191,27 @@ export async function pickAction({
       /*
        * Conservative business constraints.
        *
-       * High discounts should not automatically
-       * dominate simply because they convert.
+       * Higher incentives should not automatically
+       * dominate simply because they convert better.
        */
 
       if (
-        row.action ===
-          "INCENTIVE_HIGH" &&
+        row.action === "INCENTIVE_HIGH" &&
         value < 1000
       ) {
         score *= 0.85;
       }
 
       if (
-        row.action ===
-          "INCENTIVE_MED" &&
+        row.action === "INCENTIVE_MED" &&
         value < 500
       ) {
         score *= 0.90;
       }
 
       /*
-       * Returning customers generally
-       * require less aggressive intervention.
+       * Returning customers generally require
+       * less aggressive intervention.
        */
 
       if (
@@ -236,15 +221,9 @@ export async function pickAction({
         score *= 0.97;
       }
 
-      if (
-        score >
-        bestScore
-      ) {
-        bestScore =
-          score;
-
-        bestAction =
-          row.action;
+      if (score > bestScore) {
+        bestScore = score;
+        bestAction = row.action;
       }
     }
 
@@ -281,8 +260,7 @@ export async function updateBandit(
       return;
     }
 
-    const reward =
-      converted ? 1 : 0;
+    const reward = converted ? 1 : 0;
 
     await db.query(
       `
@@ -343,38 +321,37 @@ export async function getBanditStats(
   }
 
   try {
-    const result =
-      await db.query(
-        `
-          SELECT
-            action,
-            pulls,
-            rewards,
+    const result = await db.query(
+      `
+        SELECT
+          action,
+          pulls,
+          rewards,
 
-            CASE
-              WHEN pulls > 0
-              THEN ROUND(
-                (
-                  rewards /
-                  pulls
-                ) * 100,
-                2
-              )
-              ELSE 0
-            END AS conversion_rate,
+          CASE
+            WHEN pulls > 0
+            THEN ROUND(
+              (
+                rewards /
+                pulls
+              ) * 100,
+              2
+            )
+            ELSE 0
+          END AS conversion_rate,
 
-            updated_at
+          updated_at
 
-          FROM bandit_state
+        FROM bandit_state
 
-          WHERE site_id = $1
+        WHERE site_id = $1
 
-          ORDER BY
-            conversion_rate DESC,
-            pulls DESC
-        `,
-        [site_id]
-      );
+        ORDER BY
+          conversion_rate DESC,
+          pulls DESC
+      `,
+      [site_id]
+    );
 
     return result.rows || [];
   } catch (error) {
@@ -386,3 +363,4 @@ export async function getBanditStats(
     return [];
   }
 }
+```
