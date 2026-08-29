@@ -20,7 +20,7 @@ import {
 import {
   updateSessionContext,
   getSessionContext,
-} from "../adaptive/ContextEngine.js";
+} from "../adaptive/contextEngine.js";
 
 import {
   initRedis,
