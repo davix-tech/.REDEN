@@ -4,6 +4,7 @@
   const SDK_VERSION = "1.0.0";
 
   const DEFAULT_API_BASE = "https://reden.dcore.name.ng";
+
   const MAX_SITE_ID_LENGTH = 200;
   const MAX_API_KEY_LENGTH = 500;
   const MAX_SESSION_ID_LENGTH = 128;
@@ -100,6 +101,7 @@
 
     if (window.crypto?.getRandomValues) {
       const bytes = new Uint8Array(16);
+
       window.crypto.getRandomValues(bytes);
 
       bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -224,9 +226,9 @@
 
   /* ─────────────────────────────────────────────
      CONFIGURATION
-     
+
      apiBase is deliberately NOT user-overridable.
-     
+
      The SDK must never send merchant credentials to
      an arbitrary origin supplied by storefront code.
   ───────────────────────────────────────────── */
@@ -244,10 +246,6 @@
 
       ...scriptConfig,
 
-      /*
-       * Only safe, non-security-sensitive options can be
-       * overridden through Reden.init().
-       */
       debug:
         typeof safeUserConfig.debug === "boolean"
           ? safeUserConfig.debug
@@ -298,7 +296,7 @@
   }
 
   async function request(path, options = {}) {
-    if (!state.initialized && !isValidSiteId(config.siteId)) {
+    if (!state.initialized) {
       throw new Error("sdk_not_initialized");
     }
 
@@ -330,12 +328,6 @@
           keepalive:
             options.keepalive === true,
 
-          /*
-           * Optional headers are intentionally restricted.
-           *
-           * Security-sensitive REDEN headers are set AFTER
-           * user/internal headers so they cannot be replaced.
-           */
           headers: {
             ...(options.headers || {}),
 
@@ -390,9 +382,13 @@
           ? error.message
           : String(error);
 
+      const isAbort =
+        error instanceof Error &&
+        error.name === "AbortError";
+
       if (
         config.debug &&
-        message !== "AbortError"
+        !isAbort
       ) {
         warn(
           "request failed",
@@ -446,6 +442,10 @@
       return null;
     }
 
+    if (!state.sessionId) {
+      ensureSession();
+    }
+
     const body = {
       session_id:
         state.sessionId,
@@ -492,8 +492,10 @@
         "/event",
         {
           method: "POST",
+
           keepalive:
             options.keepalive === true,
+
           body:
             JSON.stringify(body),
         }
@@ -571,6 +573,7 @@
         "/score",
         {
           method: "POST",
+
           body:
             JSON.stringify(body),
         }
@@ -606,6 +609,7 @@
       "/action",
       {
         method: "POST",
+
         body:
           JSON.stringify({
             decision_id: id,
@@ -653,11 +657,14 @@
       "/outcome",
       {
         method: "POST",
+
         body:
           JSON.stringify({
             decision_id: id,
+
             converted:
               Boolean(converted),
+
             revenue:
               numericRevenue,
           }),
@@ -667,7 +674,7 @@
 
   /* ─────────────────────────────────────────────
      DOM ENGINE
-     
+
      DOM mutation is deliberately conservative.
      No arbitrary HTML injection.
   ───────────────────────────────────────────── */
@@ -711,12 +718,6 @@
     return true;
   }
 
-  /*
-   * Kept only as a compatibility-safe operation.
-   *
-   * It intentionally behaves like updateText instead of
-   * executing arbitrary HTML supplied by a decision.
-   */
   function updateHTML(
     selector,
     value
@@ -747,9 +748,6 @@
         MAX_CLASS_LENGTH
       );
 
-    /*
-     * Only allow one ordinary CSS class.
-     */
     if (
       !/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(
         className
@@ -768,9 +766,7 @@
   function injectBanner(
     content
   ) {
-    if (
-      !document.body
-    ) {
+    if (!document.body) {
       return null;
     }
 
@@ -998,9 +994,7 @@
         options.meta || {}
       );
 
-    if (
-      !decision
-    ) {
+    if (!decision) {
       return null;
     }
 
@@ -1073,13 +1067,11 @@
   ───────────────────────────────────────────── */
 
   function setupPageTracking() {
-    if (
-      !config.autoPageview
-    ) {
+    if (!config.autoPageview) {
       return;
     }
 
-    track(
+    void track(
       "PAGE_VIEW",
       {
         referrer:
@@ -1118,9 +1110,7 @@
   }
 
   function setupClickTracking() {
-    if (
-      !config.autoTrack
-    ) {
+    if (!config.autoTrack) {
       return;
     }
 
@@ -1137,10 +1127,6 @@
           return;
         }
 
-        /*
-         * Track the nearest useful element instead of
-         * blindly collecting arbitrary DOM text.
-         */
         const interactive =
           el.closest(
             "a,button,[role='button'],input,textarea,select"
@@ -1170,10 +1156,6 @@
             ),
         };
 
-        /*
-         * Click text is OFF by default because visible
-         * page text can contain customer information.
-         */
         if (
           config.captureClickText &&
           ![
@@ -1189,7 +1171,12 @@
             );
         }
 
-        track(
+        /*
+         * Generic interaction telemetry must use
+         * BEHAVIOR. "CLICK" is not a valid REDEN
+         * business event.
+         */
+        void track(
           "BEHAVIOR",
           payload
         );
@@ -1216,7 +1203,7 @@
         state.sessionEnded =
           true;
 
-        track(
+        void track(
           "SESSION_END",
           {
             duration:
@@ -1241,10 +1228,6 @@
       }
     );
 
-    /*
-     * Visibility change is useful for mobile browsers,
-     * but only marks the session once.
-     */
     document.addEventListener(
       "visibilitychange",
       () => {
@@ -1294,6 +1277,11 @@
         userConfig
       );
 
+    /*
+     * Security-sensitive configuration is fixed.
+     * Storefront code cannot redirect the SDK to
+     * another API origin or change its credential source.
+     */
     config.apiBase =
       DEFAULT_API_BASE;
 
@@ -1343,12 +1331,20 @@
     state.sessionEnded =
       false;
 
+    /*
+     * Mark initialized BEFORE any automatic
+     * telemetry is emitted.
+     *
+     * This guarantees that auto PAGE_VIEW,
+     * BEHAVIOR, and SESSION_END events all pass
+     * through the normal request guard.
+     */
+    state.initialized =
+      true;
+
     setupPageTracking();
     setupClickTracking();
     setupUnloadTracking();
-
-    state.initialized =
-      true;
 
     log(
       "SDK initialized",
@@ -1418,6 +1414,7 @@
        */
       return {
         ...config,
+
         apiKey:
           config.apiKey
             ? "[REDACTED]"
