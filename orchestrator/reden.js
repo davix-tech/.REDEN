@@ -1934,6 +1934,73 @@ app.post(
       }
 
       /* -----------------------------------------------------
+         PURCHASE REVENUE (session_summaries)
+
+         This is real, storefront-reported purchase revenue,
+         written by contextEngine.updateSessionContext() off
+         payload.revenue on any event (most notably PURCHASE).
+         It does NOT require the /score -> /action -> /outcome
+         chain to populate.
+
+         This is a DIFFERENT metric from decisions.revenue
+         above, which is bandit-attributed revenue -- a
+         narrower figure about decision-policy effectiveness,
+         not total merchant revenue. Both are kept: this block
+         is purely additive and does not replace the DECISIONS
+         query above.
+      ----------------------------------------------------- */
+
+      let purchaseRevenue = 0;
+
+      let purchasedSessions = 0;
+
+      try {
+        const result =
+          await db.query(
+            `
+              SELECT
+                COALESCE(
+                  SUM(revenue),
+                  0
+                ) AS total_revenue,
+
+                COUNT(*)::int AS purchased_sessions
+
+              FROM session_summaries
+
+              WHERE site_id = $1
+                AND purchased = true
+                AND updated_at >= NOW()
+                  - INTERVAL '24 hours'
+            `,
+            [
+              siteId,
+            ]
+          );
+
+        if (
+          result.rowCount
+        ) {
+          purchaseRevenue =
+            Number(
+              result.rows[0]
+                .total_revenue || 0
+            );
+
+          purchasedSessions =
+            Number(
+              result.rows[0]
+                .purchased_sessions || 0
+            );
+        }
+      } catch (error) {
+        console.warn(
+          "[INTELLIGENCE] purchase revenue unavailable:",
+          error.message
+        );
+      }
+
+      /* -----------------------------------------------------
          RECOVERY
       ----------------------------------------------------- */
 
@@ -2796,6 +2863,10 @@ app.post(
 
               revenue,
             },
+
+            purchaseRevenue,
+
+            purchasedSessions,
 
             recovery,
 
