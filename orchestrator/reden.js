@@ -1695,7 +1695,144 @@ app.get(
     }
   }
 );
+/* =========================================================
+   REDEN INTEGRATION HEALTH
+========================================================= */
 
+app.get(
+  "/api/v1/integration-health",
+  async (req, res) => {
+    try {
+      /*
+       * authenticate() already validated:
+       * - x-api-key
+       * - x-site-id
+       * - active site
+       *
+       * and populated req.site.
+       */
+      const siteId =
+        req.site?.site_id;
+
+      if (!siteId) {
+        return res
+          .status(401)
+          .json(
+            failure(
+              "unauthorized"
+            )
+          );
+      }
+
+      /*
+       * Check the last 30 days.
+       *
+       * Integration status should not reset every day.
+       */
+      const result =
+        await db.query(
+          `
+            SELECT
+              event,
+              COUNT(*)::int AS count
+            FROM event_logs
+            WHERE site_id = $1
+              AND created_at >= NOW() - INTERVAL '30 days'
+              AND event IN (
+                'PAGE_VIEW',
+                'PRODUCT_VIEW',
+                'ADD_TO_CART',
+                'CHECKOUT_STARTED',
+                'PURCHASE',
+                'SESSION_END'
+              )
+            GROUP BY event
+          `,
+          [
+            siteId,
+          ]
+        );
+
+      const received =
+        new Set(
+          result.rows.map(
+            (row) =>
+              String(
+                row.event
+              ).toUpperCase()
+          )
+        );
+
+      const events = {
+        PAGE_VIEW:
+          received.has(
+            "PAGE_VIEW"
+          ),
+
+        PRODUCT_VIEW:
+          received.has(
+            "PRODUCT_VIEW"
+          ),
+
+        ADD_TO_CART:
+          received.has(
+            "ADD_TO_CART"
+          ),
+
+        CHECKOUT_STARTED:
+          received.has(
+            "CHECKOUT_STARTED"
+          ),
+
+        PURCHASE:
+          received.has(
+            "PURCHASE"
+          ),
+
+        SESSION_END:
+          received.has(
+            "SESSION_END"
+          ),
+      };
+
+      const sdkInstalled =
+        events.PAGE_VIEW;
+
+      const businessEventsComplete =
+        events.PRODUCT_VIEW &&
+        events.ADD_TO_CART &&
+        events.CHECKOUT_STARTED &&
+        events.PURCHASE;
+
+      return res.json(
+        success({
+          siteId,
+          name:
+            req.site.name || null,
+
+          sdkInstalled,
+
+          businessEventsComplete,
+
+          events,
+        })
+      );
+    } catch (error) {
+      console.error(
+        "[INTEGRATION HEALTH ERROR]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json(
+          failure(
+            "integration_health_failed"
+          )
+        );
+    }
+  }
+);
 /* =========================================================
    REDEN INTELLIGENCE
 ========================================================= */
