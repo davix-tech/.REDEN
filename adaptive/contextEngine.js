@@ -144,12 +144,38 @@ export async function updateSessionContext({
               ELSE session_summaries.cart_value
             END,
 
+          /*
+           * IMPORTANT: revenue ACCUMULATES, unlike cart_value.
+           *
+           * cart_value is a live snapshot of "what's in the
+           * cart right now" -- replacing it on each update is
+           * correct.
+           *
+           * revenue represents realized purchase amounts. If
+           * this session/browser (session_id persists in
+           * localStorage indefinitely -- it is never cleared,
+           * not even on SESSION_END) completes more than one
+           * purchase over time, each purchase's revenue must
+           * be added to the running total, not overwrite the
+           * previous one. The prior "replace if positive"
+           * logic silently discarded all but the most recent
+           * purchase's revenue for any repeat-purchasing
+           * session, which is why dashboard revenue reflected
+           * only the latest purchase rather than a true sum.
+           *
+           * This is safe against double-counting from retried
+           * requests: updateSessionContext() is only invoked
+           * by /event when the underlying event insert into
+           * event_logs actually happened (i.e. "recorded" is
+           * true). Duplicate event_ids are rejected at the
+           * database level via
+           * ON CONFLICT (site_id, event_id) DO NOTHING before
+           * this function is ever called, so a retried
+           * PURCHASE event cannot add its revenue twice.
+           */
           revenue =
-            CASE
-              WHEN EXCLUDED.revenue > 0
-              THEN EXCLUDED.revenue
-              ELSE session_summaries.revenue
-            END,
+            session_summaries.revenue
+            + EXCLUDED.revenue,
 
           last_seen_at =
             NOW(),
