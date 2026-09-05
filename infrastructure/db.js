@@ -1,813 +1,217 @@
-import pg from "pg";
-import dotenv from "dotenv";
+import { db } from "../infrastructure/db.js";
 
-dotenv.config();
-
-const { Pool } = pg;
-
-const DATABASE_URL = process.env.DATABASE_URL;
-
-if (!DATABASE_URL) {
-  throw new Error("Missing mandatory environment variable: DATABASE_URL");
-}
-
-export const db = new Pool({
-  connectionString: DATABASE_URL,
-
-  ssl: {
-    rejectUnauthorized: false,
-  },
-
-  max: Number(process.env.DB_POOL_MAX || 20),
-  min: Number(process.env.DB_POOL_MIN || 2),
-
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 10_000,
-
-  application_name: "reden-api",
-});
-
-/* =========================================================
-   DATABASE INITIALIZATION
-========================================================= */
-
-let initialized = false;
-let initializing = null;
-
-export async function initDB() {
-  if (initialized) {
-    return;
+export async function updateSessionContext({
+  siteId,
+  sessionId,
+  event,
+  payload = {},
+}) {
+  if (!siteId || !sessionId || !event) {
+    return null;
   }
-
-  if (initializing) {
-    return initializing;
-  }
-
-  initializing = initializeDatabase();
 
   try {
-    await initializing;
-    initialized = true;
-  } finally {
-    initializing = null;
-  }
-}
-
-/* =========================================================
-   SCHEMA + MIGRATIONS
-========================================================= */
-
-async function initializeDatabase() {
-  const client = await db.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    /* =====================================================
-       SITES
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS sites (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) UNIQUE NOT NULL,
-        api_key VARCHAR(150) UNIQUE NOT NULL,
-
-        name VARCHAR(255) NOT NULL,
-        owner_email VARCHAR(255),
-
-        active BOOLEAN NOT NULL DEFAULT true,
-
-        plan VARCHAR(50) NOT NULL DEFAULT 'basic',
-
-        subscription_status VARCHAR(50)
-          NOT NULL DEFAULT 'inactive',
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       DECISIONS
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS decisions (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        session_id TEXT NOT NULL,
-        cart_id TEXT,
-
-        action TEXT NOT NULL,
-
-        discount NUMERIC(12,2)
-          NOT NULL DEFAULT 0,
-
-        expected_value NUMERIC(12,2)
-          NOT NULL DEFAULT 0,
-
-        converted BOOLEAN
-          NOT NULL DEFAULT false,
-
-        revenue NUMERIC(12,2)
-          NOT NULL DEFAULT 0,
-
-        state TEXT NOT NULL
-          CHECK (
-            state IN (
-              'SCORED',
-              'ACTIONED',
-              'COMPLETED'
-            )
-          ),
-
-        completed_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       BANDIT STATE
-       Tenant-specific adaptive learning.
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bandit_state (
-        site_id VARCHAR(100) NOT NULL,
-
-        action TEXT NOT NULL,
-
-        pulls INTEGER NOT NULL DEFAULT 0
-          CHECK (pulls >= 0),
-
-        rewards NUMERIC(12,4) NOT NULL DEFAULT 0
-          CHECK (rewards >= 0),
-
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        PRIMARY KEY (site_id, action)
-      )
-    `);
-
-    /* =====================================================
-       EVENT LOGS
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS event_logs (
-        id SERIAL PRIMARY KEY,
-
-        event_id TEXT NOT NULL,
-        site_id VARCHAR(100) NOT NULL,
-
-        session_id TEXT NOT NULL,
-
-        event TEXT NOT NULL,
-
-        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-
-        ip_address INET,
-        user_agent TEXT,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        UNIQUE(site_id, event_id)
-      )
-    `);
-
-    /* =====================================================
-       RECOVERY QUEUE
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS recovery_queue (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        session_id TEXT NOT NULL,
-        customer_email TEXT NOT NULL,
-
-        cart_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-
-        incentive TEXT,
-
-        status TEXT NOT NULL DEFAULT 'PENDING'
-          CHECK (
-            status IN (
-              'PENDING',
-              'PROCESSING',
-              'SENT',
-              'COMPLETED',
-              'FAILED'
-            )
-          ),
-
-        attempts INTEGER NOT NULL DEFAULT 0
-          CHECK (attempts >= 0),
-
-        last_error TEXT,
-
-        processed_at TIMESTAMPTZ,
-        next_attempt_at TIMESTAMPTZ,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        UNIQUE(site_id, session_id, customer_email)
-      )
-    `);
-
-    /* =====================================================
-       INSTALLATIONS
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS reden_installations (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) UNIQUE NOT NULL,
-
-        name TEXT NOT NULL,
-        owner_email TEXT NOT NULL,
-
-        api_key_hash TEXT NOT NULL,
-
-        status TEXT NOT NULL DEFAULT 'active'
-          CHECK (
-            status IN (
-              'active',
-              'disabled'
-            )
-          ),
-
-        first_event_at TIMESTAMPTZ,
-        last_event_at TIMESTAMPTZ,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       INTELLIGENCE
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS intelligence (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        type TEXT NOT NULL,
-
-        priority TEXT NOT NULL DEFAULT 'normal'
-          CHECK (
-            priority IN (
-              'low',
-              'normal',
-              'high',
-              'critical'
-            )
-          ),
-
-        title TEXT NOT NULL,
-        summary TEXT NOT NULL,
-
-        why_it_matters TEXT,
-        likely_cause TEXT,
-        recommendation TEXT,
-
-        evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-
-        status TEXT NOT NULL DEFAULT 'active'
-          CHECK (
-            status IN (
-              'active',
-              'resolved',
-              'dismissed'
-            )
-          ),
-
-        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        resolved_at TIMESTAMPTZ,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       RECOMMENDATIONS
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS recommendations (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        intelligence_id INTEGER
-          REFERENCES intelligence(id)
-          ON DELETE SET NULL,
-
-        recommendation TEXT NOT NULL,
-
-        status TEXT NOT NULL DEFAULT 'pending'
-          CHECK (
-            status IN (
-              'pending',
-              'accepted',
-              'rejected',
-              'completed',
-              'expired'
-            )
-          ),
-
-        outcome TEXT,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        acted_at TIMESTAMPTZ,
-        completed_at TIMESTAMPTZ
-      )
-    `);
-
-    /* =====================================================
-       INTELLIGENCE OUTCOMES
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS intelligence_outcomes (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        intelligence_id INTEGER
-          REFERENCES intelligence(id)
-          ON DELETE SET NULL,
-
-        recommendation_id INTEGER
-          REFERENCES recommendations(id)
-          ON DELETE SET NULL,
-
-        metric TEXT,
-
-        before_value NUMERIC(12,4),
-        after_value NUMERIC(12,4),
-        change_percent NUMERIC(12,4),
-
-        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       REPORT RUNS
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS report_runs (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        report_type TEXT NOT NULL
-          CHECK (
-            report_type IN (
-              'MORNING',
-              'EVENING'
-            )
-          ),
-
-        report_date DATE NOT NULL,
-
-        status TEXT NOT NULL DEFAULT 'PENDING'
-          CHECK (
-            status IN (
-              'PENDING',
-              'SENT',
-              'FAILED',
-              'SKIPPED'
-            )
-          ),
-
-        intelligence_count INTEGER NOT NULL DEFAULT 0,
-
-        summary JSONB NOT NULL DEFAULT '{}'::jsonb,
-
-        sent_at TIMESTAMPTZ,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        UNIQUE(
-          site_id,
-          report_type,
-          report_date
-        )
-      )
-    `);
-
-    /* =====================================================
-       EMAIL LOGS
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS email_logs (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        email_type TEXT NOT NULL,
-
-        recipient TEXT NOT NULL,
-
-        subject TEXT,
-
-        status TEXT NOT NULL DEFAULT 'SENT',
-
-        provider_message_id TEXT,
-
-        error_message TEXT,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       SESSION SUMMARIES
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS session_summaries (
-        id SERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        session_id TEXT NOT NULL,
-
-        page_views INTEGER NOT NULL DEFAULT 0,
-        product_views INTEGER NOT NULL DEFAULT 0,
-        cart_additions INTEGER NOT NULL DEFAULT 0,
-
-        checkout_started BOOLEAN NOT NULL DEFAULT false,
-        purchased BOOLEAN NOT NULL DEFAULT false,
-
-        cart_value NUMERIC(12,2) NOT NULL DEFAULT 0,
-        revenue NUMERIC(12,2) NOT NULL DEFAULT 0,
-
-        intent_score NUMERIC(8,4) NOT NULL DEFAULT 0,
-
-        first_seen_at TIMESTAMPTZ,
-        last_seen_at TIMESTAMPTZ,
-
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        UNIQUE(site_id, session_id)
-      )
-    `);
-
-    /* =====================================================
-       SAFE MIGRATIONS
-       These handle databases created by older REDEN builds.
-    ===================================================== */
-
-    /* =====================================================
-       RECOVERY QUEUE MIGRATIONS
-    ===================================================== */
-
-    await client.query(`
-      ALTER TABLE recovery_queue
-      ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
-    `);
-
-    await client.query(`
-      ALTER TABLE recovery_queue
-      ADD COLUMN IF NOT EXISTS last_error TEXT
-    `);
-
-    await client.query(`
-      ALTER TABLE recovery_queue
-      ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ
-    `);
-
-    /* =====================================================
-       EMAIL LOG MIGRATIONS
-    ===================================================== */
-
-    await client.query(`
-      ALTER TABLE email_logs
-      ADD COLUMN IF NOT EXISTS provider_message_id TEXT
-    `);
-
-    await client.query(`
-      ALTER TABLE email_logs
-      ADD COLUMN IF NOT EXISTS error_message TEXT
-    `);
-
-    /* =====================================================
-       SESSION SUMMARY MIGRATIONS
-    ===================================================== */
-
-    await client.query(`
-      ALTER TABLE session_summaries
-      ADD COLUMN IF NOT EXISTS intent_score NUMERIC(8,4) NOT NULL DEFAULT 0
-    `);
-
-    /* =====================================================
-       BANDIT SCHEMA MIGRATION
-       
-       Older REDEN:
-         action PRIMARY KEY
-
-       Current REDEN:
-         site_id + action PRIMARY KEY
-    ===================================================== */
-
-    const banditColumns = await client.query(`
-      SELECT column_name
-      FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = 'bandit_state'
-    `);
-
-    const hasBanditSiteId = banditColumns.rows.some(
-      (row) => row.column_name === "site_id"
+    const safePayload =
+      payload && typeof payload === "object" ? payload : {};
+
+    const cartValue = Number(
+      safePayload.cart_value ??
+      safePayload.cartValue ??
+      safePayload.cart?.value ??
+      0
     );
 
-    if (!hasBanditSiteId) {
-      console.log(
-        "[DB MIGRATION] Migrating legacy bandit_state..."
-      );
+    const normalizedCartValue =
+      Number.isFinite(cartValue) ? Math.max(0, cartValue) : 0;
 
-      await client.query(`
-        ALTER TABLE bandit_state
-        RENAME TO bandit_state_legacy
-      `);
+    const revenue = Number(safePayload.revenue ?? 0);
 
-      await client.query(`
-        CREATE TABLE bandit_state (
-          site_id VARCHAR(100) NOT NULL,
+    const normalizedRevenue =
+      Number.isFinite(revenue) ? Math.max(0, revenue) : 0;
 
-          action TEXT NOT NULL,
+    const isPurchase = event === "PURCHASE";
+    const isCheckout = event === "CHECKOUT_STARTED";
+    const pageView = event === "PAGE_VIEW";
+    const productView = event === "PRODUCT_VIEW";
+    const addToCart = event === "ADD_TO_CART";
 
-          pulls INTEGER NOT NULL DEFAULT 0
-            CHECK (pulls >= 0),
-
-          rewards NUMERIC(12,4) NOT NULL DEFAULT 0
-            CHECK (rewards >= 0),
-
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-          PRIMARY KEY (site_id, action)
-        )
-      `);
-
-      /*
-        Legacy learning was global.
-
-        Preserve it by copying the existing
-        learning state into every current site.
-      */
-
-      await client.query(`
-        INSERT INTO bandit_state (
+    await db.query(
+      `
+        INSERT INTO session_summaries (
           site_id,
-          action,
-          pulls,
-          rewards
+          session_id,
+
+          page_views,
+          product_views,
+          cart_additions,
+
+          checkout_started,
+          purchased,
+
+          cart_value,
+          revenue,
+
+          purchased_at,
+
+          first_seen_at,
+          last_seen_at,
+          updated_at
         )
+
+        VALUES (
+          $1,
+          $2,
+
+          $3,
+          $4,
+          $5,
+
+          $6,
+          $7,
+
+          $8,
+          $9,
+
+          CASE WHEN $7 THEN NOW() ELSE NULL END,
+
+          NOW(),
+          NOW(),
+          NOW()
+        )
+
+        ON CONFLICT (
+          site_id,
+          session_id
+        )
+
+        DO UPDATE SET
+
+          page_views =
+            session_summaries.page_views
+            + EXCLUDED.page_views,
+
+          product_views =
+            session_summaries.product_views
+            + EXCLUDED.product_views,
+
+          cart_additions =
+            session_summaries.cart_additions
+            + EXCLUDED.cart_additions,
+
+          checkout_started =
+            session_summaries.checkout_started
+            OR EXCLUDED.checkout_started,
+
+          purchased =
+            session_summaries.purchased
+            OR EXCLUDED.purchased,
+
+          cart_value =
+            CASE
+              WHEN EXCLUDED.cart_value > 0
+              THEN EXCLUDED.cart_value
+              ELSE session_summaries.cart_value
+            END,
+
+          /*
+           * revenue ACCUMULATES across repeat purchases on the
+           * same session_id (see original note: session_id
+           * persists indefinitely in localStorage). Safe against
+           * double-count because /event only calls this function
+           * when the event_logs insert actually happened
+           * (ON CONFLICT DO NOTHING already filtered retries).
+           */
+          revenue =
+            session_summaries.revenue
+            + EXCLUDED.revenue,
+
+          /*
+           * purchased_at tracks the MOST RECENT purchase event
+           * on this session, not the first. This is what lets
+           * "today's purchase revenue" queries filter correctly
+           * by calendar day instead of drifting with unrelated
+           * session activity (page views, cart edits, etc.)
+           * the way updated_at did.
+           *
+           * KNOWN LIMITATION: because revenue is a single
+           * cumulative total per session row, a session that
+           * purchases on two different calendar days will have
+           * its ENTIRE historical revenue attributed to
+           * whichever day purchased_at last reflects. This is a
+           * pre-existing consequence of the one-row-per-session
+           * schema, not something this fix introduces -- flagging
+           * it now so it's a known, documented tradeoff rather
+           * than a surprise later. A per-purchase-event ledger
+           * table would be the eventual correct fix if repeat
+           * purchases across days become common.
+           */
+          purchased_at =
+            CASE
+              WHEN EXCLUDED.purchased
+              THEN NOW()
+              ELSE session_summaries.purchased_at
+            END,
+
+          last_seen_at = NOW(),
+          updated_at = NOW()
+      `,
+      [
+        siteId,
+        sessionId,
+        pageView ? 1 : 0,
+        productView ? 1 : 0,
+        addToCart ? 1 : 0,
+        isCheckout,
+        isPurchase,
+        normalizedCartValue,
+        normalizedRevenue,
+      ]
+    );
+
+    return getSessionContext(siteId, sessionId);
+  } catch (error) {
+    console.error("[CONTEXT UPDATE ERROR]", error);
+    return null;
+  }
+}
+
+export async function getSessionContext(siteId, sessionId) {
+  if (!siteId || !sessionId) {
+    return null;
+  }
+
+  try {
+    const result = await db.query(
+      `
         SELECT
-          sites.site_id,
-          legacy.action,
-          legacy.pulls,
-          legacy.rewards
-        FROM sites
-        CROSS JOIN bandit_state_legacy AS legacy
-        ON CONFLICT (site_id, action)
-        DO NOTHING
-      `);
+          session_id,
+          page_views,
+          product_views,
+          cart_additions,
+          checkout_started,
+          purchased,
+          cart_value,
+          revenue,
+          intent_score,
+          purchased_at,
+          first_seen_at,
+          last_seen_at,
+          updated_at
+        FROM session_summaries
+        WHERE site_id = $1
+          AND session_id = $2
+        LIMIT 1
+      `,
+      [siteId, sessionId]
+    );
 
-      await client.query(`
-        DROP TABLE bandit_state_legacy
-      `);
-
-      console.log(
-        "[DB MIGRATION] Legacy bandit_state migrated."
-      );
+    if (!result.rowCount) {
+      return null;
     }
 
-    /* =====================================================
-       BANDIT ACTION BACKFILL
-       
-       Every site must have every available action.
-    ===================================================== */
-
-    await client.query(`
-      INSERT INTO bandit_state (
-        site_id,
-        action,
-        pulls,
-        rewards
-      )
-      SELECT
-        sites.site_id,
-        actions.action,
-        0,
-        0
-      FROM sites
-      CROSS JOIN (
-        VALUES
-          ('NONE'),
-          ('INCENTIVE_LOW'),
-          ('INCENTIVE_MED'),
-          ('INCENTIVE_HIGH')
-      ) AS actions(action)
-
-      ON CONFLICT (
-        site_id,
-        action
-      )
-      DO NOTHING
-    `);
-
-    /* =====================================================
-       INDEXES
-    ===================================================== */
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_owner_email
-      ON sites(owner_email)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_owner_name
-      ON sites(owner_email, name)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
-      ON event_logs(site_id, created_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_event_logs_session
-      ON event_logs(
-        site_id,
-        session_id,
-        created_at DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_event_logs_event
-      ON event_logs(
-        site_id,
-        event,
-        created_at DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_created
-      ON decisions(
-        site_id,
-        created_at DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_state
-      ON decisions(
-        site_id,
-        state
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_completed
-      ON decisions(
-        site_id,
-        completed_at DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_recovery_queue_pending
-      ON recovery_queue(
-        status,
-        next_attempt_at,
-        created_at
-      )
-      WHERE status IN ('PENDING', 'PROCESSING')
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_recovery_queue_site
-      ON recovery_queue(
-        site_id,
-        status
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_email_logs_lookup
-      ON email_logs(
-        site_id,
-        email_type,
-        created_at DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_intelligence_site_status
-      ON intelligence(
-        site_id,
-        status,
-        detected_at DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_recommendations_site_status
-      ON recommendations(
-        site_id,
-        status,
-        created_at DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_report_runs_site_date
-      ON report_runs(
-        site_id,
-        report_date DESC
-      )
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site
-      ON session_summaries(site_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_bandit_state_site
-      ON bandit_state(site_id)
-    `);
-
-    /* =====================================================
-       INSTALLATION ACTIVITY INDEXES
-    ===================================================== */
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_reden_installations_owner_email
-      ON reden_installations(owner_email)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_reden_installations_status
-      ON reden_installations(status)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_reden_installations_activity
-      ON reden_installations(
-        status,
-        last_event_at DESC
-      )
-    `);
-
-    /* =====================================================
-       COMMIT
-    ===================================================== */
-
-    await client.query("COMMIT");
-
-    console.log(
-      "[DB] REDEN production database architecture initialized."
-    );
+    return result.rows[0];
   } catch (error) {
-    await client.query("ROLLBACK");
-
-    console.error(
-      "[DB INIT ERROR]",
-      error
-    );
-
-    throw error;
-  } finally {
-    client.release();
+    console.error("[CONTEXT READ ERROR]", error);
+    return null;
   }
 }
-
-/* =========================================================
-   CONNECTION ERROR
-========================================================= */
-
-db.on("error", (error) => {
-  console.error(
-    "[DB POOL ERROR]",
-    error
-  );
-});
