@@ -1,9 +1,5 @@
 import { db } from "../infrastructure/db.js";
 
-/* =========================================================
-   EVENT → SESSION CONTEXT
-========================================================= */
-
 export async function updateSessionContext({
   siteId,
   sessionId,
@@ -16,59 +12,28 @@ export async function updateSessionContext({
 
   try {
     const safePayload =
-      payload &&
-      typeof payload === "object"
-        ? payload
-        : {};
+      payload && typeof payload === "object" ? payload : {};
 
-    const cartValue =
-      Number(
-        safePayload.cart_value ??
-        safePayload.cartValue ??
-        safePayload.cart?.value ??
-        0
-      );
+    const cartValue = Number(
+      safePayload.cart_value ??
+      safePayload.cartValue ??
+      safePayload.cart?.value ??
+      0
+    );
 
     const normalizedCartValue =
-      Number.isFinite(cartValue)
-        ? Math.max(
-            0,
-            cartValue
-          )
-        : 0;
+      Number.isFinite(cartValue) ? Math.max(0, cartValue) : 0;
 
-    const revenue =
-      Number(
-        safePayload.revenue ??
-        0
-      );
+    const revenue = Number(safePayload.revenue ?? 0);
 
     const normalizedRevenue =
-      Number.isFinite(revenue)
-        ? Math.max(
-            0,
-            revenue
-          )
-        : 0;
+      Number.isFinite(revenue) ? Math.max(0, revenue) : 0;
 
-    const isPurchase =
-      event === "PURCHASE";
-
-    const isCheckout =
-      event ===
-      "CHECKOUT_STARTED";
-
-    const pageView =
-      event ===
-      "PAGE_VIEW";
-
-    const productView =
-      event ===
-      "PRODUCT_VIEW";
-
-    const addToCart =
-      event ===
-      "ADD_TO_CART";
+    const isPurchase = event === "PURCHASE";
+    const isCheckout = event === "CHECKOUT_STARTED";
+    const pageView = event === "PAGE_VIEW";
+    const productView = event === "PRODUCT_VIEW";
+    const addToCart = event === "ADD_TO_CART";
 
     await db.query(
       `
@@ -85,6 +50,8 @@ export async function updateSessionContext({
 
           cart_value,
           revenue,
+
+          purchased_at,
 
           first_seen_at,
           last_seen_at,
@@ -104,6 +71,8 @@ export async function updateSessionContext({
 
           $8,
           $9,
+
+          CASE WHEN $7 THEN NOW() ELSE NULL END,
 
           NOW(),
           NOW(),
@@ -145,122 +114,96 @@ export async function updateSessionContext({
             END,
 
           /*
-           * IMPORTANT: revenue ACCUMULATES, unlike cart_value.
-           *
-           * cart_value is a live snapshot of "what's in the
-           * cart right now" -- replacing it on each update is
-           * correct.
-           *
-           * revenue represents realized purchase amounts. If
-           * this session/browser (session_id persists in
-           * localStorage indefinitely -- it is never cleared,
-           * not even on SESSION_END) completes more than one
-           * purchase over time, each purchase's revenue must
-           * be added to the running total, not overwrite the
-           * previous one. The prior "replace if positive"
-           * logic silently discarded all but the most recent
-           * purchase's revenue for any repeat-purchasing
-           * session, which is why dashboard revenue reflected
-           * only the latest purchase rather than a true sum.
-           *
-           * This is safe against double-counting from retried
-           * requests: updateSessionContext() is only invoked
-           * by /event when the underlying event insert into
-           * event_logs actually happened (i.e. "recorded" is
-           * true). Duplicate event_ids are rejected at the
-           * database level via
-           * ON CONFLICT (site_id, event_id) DO NOTHING before
-           * this function is ever called, so a retried
-           * PURCHASE event cannot add its revenue twice.
+           * revenue ACCUMULATES across repeat purchases on the
+           * same session_id (see original note: session_id
+           * persists indefinitely in localStorage). Safe against
+           * double-count because /event only calls this function
+           * when the event_logs insert actually happened
+           * (ON CONFLICT DO NOTHING already filtered retries).
            */
           revenue =
             session_summaries.revenue
             + EXCLUDED.revenue,
 
-          last_seen_at =
-            NOW(),
+          /*
+           * purchased_at tracks the MOST RECENT purchase event
+           * on this session, not the first. This is what lets
+           * "today's purchase revenue" queries filter correctly
+           * by calendar day instead of drifting with unrelated
+           * session activity (page views, cart edits, etc.)
+           * the way updated_at did.
+           *
+           * KNOWN LIMITATION: because revenue is a single
+           * cumulative total per session row, a session that
+           * purchases on two different calendar days will have
+           * its ENTIRE historical revenue attributed to
+           * whichever day purchased_at last reflects. This is a
+           * pre-existing consequence of the one-row-per-session
+           * schema, not something this fix introduces -- flagging
+           * it now so it's a known, documented tradeoff rather
+           * than a surprise later. A per-purchase-event ledger
+           * table would be the eventual correct fix if repeat
+           * purchases across days become common.
+           */
+          purchased_at =
+            CASE
+              WHEN EXCLUDED.purchased
+              THEN NOW()
+              ELSE session_summaries.purchased_at
+            END,
 
-          updated_at =
-            NOW()
+          last_seen_at = NOW(),
+          updated_at = NOW()
       `,
       [
         siteId,
         sessionId,
-
         pageView ? 1 : 0,
         productView ? 1 : 0,
         addToCart ? 1 : 0,
-
         isCheckout,
         isPurchase,
-
         normalizedCartValue,
         normalizedRevenue,
       ]
     );
 
-    return getSessionContext(
-      siteId,
-      sessionId
-    );
+    return getSessionContext(siteId, sessionId);
   } catch (error) {
-    console.error(
-      "[CONTEXT UPDATE ERROR]",
-      error
-    );
-
+    console.error("[CONTEXT UPDATE ERROR]", error);
     return null;
   }
 }
 
-/* =========================================================
-   READ SESSION CONTEXT
-========================================================= */
-
-export async function getSessionContext(
-  siteId,
-  sessionId
-) {
+export async function getSessionContext(siteId, sessionId) {
   if (!siteId || !sessionId) {
     return null;
   }
 
   try {
-    const result =
-      await db.query(
-        `
-          SELECT
-            session_id,
-
-            page_views,
-            product_views,
-            cart_additions,
-
-            checkout_started,
-            purchased,
-
-            cart_value,
-            revenue,
-
-            intent_score,
-
-            first_seen_at,
-            last_seen_at,
-
-            updated_at
-
-          FROM session_summaries
-
-          WHERE site_id = $1
-            AND session_id = $2
-
-          LIMIT 1
-        `,
-        [
-          siteId,
-          sessionId,
-        ]
-      );
+    const result = await db.query(
+      `
+        SELECT
+          session_id,
+          page_views,
+          product_views,
+          cart_additions,
+          checkout_started,
+          purchased,
+          cart_value,
+          revenue,
+          intent_score,
+          purchased_at,
+          first_seen_at,
+          last_seen_at,
+          updated_at
+        FROM session_summaries
+        WHERE site_id = $1
+          AND session_id = $2
+        LIMIT 1
+      `,
+      [siteId, sessionId]
+    );
 
     if (!result.rowCount) {
       return null;
@@ -268,11 +211,7 @@ export async function getSessionContext(
 
     return result.rows[0];
   } catch (error) {
-    console.error(
-      "[CONTEXT READ ERROR]",
-      error
-    );
-
+    console.error("[CONTEXT READ ERROR]", error);
     return null;
   }
 }
