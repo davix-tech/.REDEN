@@ -5,315 +5,209 @@ import crypto from "crypto";
 import timeout from "connect-timeout";
 import { fileURLToPath } from "url";
 import cron from "node-cron";
-
 import helmet from "helmet";
 import compression from "compression";
 import rateLimit from "express-rate-limit";
 
-import { db, initDB } from "../infrastructure/db.js";
-
-import {
-  pickAction,
-  updateBandit,
-} from "../optimization/banditEngine.js";
-
+import { db, initDB } from "./infrastructure/db.js";
+import { pickAction, updateBandit } from "./optimization/banditEngine.js";
 import {
   updateSessionContext,
   getSessionContext,
-} from "../adaptive/contextEngine.js";
-
+} from "./adaptive/contextEngine.js";
+import { initRedis, redis } from "./infrastructure/redis.js";
 import {
-  initRedis,
-  redis,
-} from "../infrastructure/redis.js";
-
-import {
-  sendDailyReport,
   sendRecoveryEmail,
-} from "../notification/emailEngine.js";
+  sendDailyReport,
+} from "./notification/emailEngine.js";
 
 dotenv.config();
 
-/* =========================================================
-   PROCESS-LEVEL SAFETY NETS
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-   These must be registered before anything else runs.
-   Without them, an unexpected synchronous throw or a
-   rejected promise with no attached .catch() anywhere in
-   the app can crash the process with no log line at all,
-   or leave it in a zombie state that never recovers.
-
-   We log with full context and exit deliberately so the
-   platform's process manager (Render) restarts a clean
-   instance, rather than limping along in a broken state.
-========================================================= */
-
-process.on("uncaughtException", (error) => {
-  console.error("[FATAL] Uncaught exception:", error);
-  process.exit(1);
-});
-
-process.on("unhandledRejection", (reason) => {
-  console.error("[FATAL] Unhandled promise rejection:", reason);
-  process.exit(1);
-});
-
-/* =========================================================
-   ENVIRONMENT
-========================================================= */
+const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
-
-const DATABASE_URL =
-  process.env.DATABASE_URL;
-
 const ADMIN_SECRET =
-  process.env.REDEN_ADMIN_SECRET ||
-  process.env.ADMIN_SECRET;
+  process.env.REDEN_ADMIN_SECRET || process.env.ADMIN_SECRET;
 
-if (!DATABASE_URL) {
-  throw new Error(
-    "Missing mandatory environment variable: DATABASE_URL"
-  );
+const PUBLIC_DIR = path.join(__dirname, "public");
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is required");
 }
 
 if (!ADMIN_SECRET) {
-  throw new Error(
-    "Missing mandatory environment variable: REDEN_ADMIN_SECRET or ADMIN_SECRET"
-  );
+  throw new Error("REDEN_ADMIN_SECRET or ADMIN_SECRET is required");
 }
 
 /* =========================================================
-   INITIALIZATION
+   PROCESS SAFETY
+========================================================= */
+
+process.on("uncaughtException", (error) => {
+  console.error("[UNCAUGHT EXCEPTION]", error);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (error) => {
+  console.error("[UNHANDLED REJECTION]", error);
+  process.exit(1);
+});
+
+/* =========================================================
+   DATABASE INITIALIZATION
 ========================================================= */
 
 await initDB();
 
-try {
-  /* -------------------------------------------------------
-     SITES
-  ------------------------------------------------------- */
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS sites (
-      id SERIAL PRIMARY KEY,
-      site_id VARCHAR(100) UNIQUE NOT NULL,
-      api_key VARCHAR(150) UNIQUE NOT NULL,
-      name VARCHAR(255) NOT NULL,
-      owner_email VARCHAR(255),
-      active BOOLEAN DEFAULT true,
-      plan VARCHAR(50) DEFAULT 'basic',
-      subscription_status VARCHAR(50) DEFAULT 'inactive',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_sites_owner_email
-    ON sites(owner_email);
-  `);
-
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS idx_sites_owner_name
-    ON sites(owner_email, name);
-  `);
-
-  /* -------------------------------------------------------
-     EVENT LOGS
-  ------------------------------------------------------- */
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
-      ON event_logs(site_id, created_at DESC);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] event_logs index skipped:",
-      error.message
-    );
-  }
-
-  try {
-    await db.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS
-      idx_event_logs_site_event_id
-      ON event_logs(site_id, event_id);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] event_id uniqueness index skipped:",
-      error.message
-    );
-  }
-
-  /* -------------------------------------------------------
-     DECISIONS
-  ------------------------------------------------------- */
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_completed
-      ON decisions(site_id, completed_at DESC);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] decisions index skipped:",
-      error.message
-    );
-  }
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_session
-      ON decisions(site_id, session_id);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] decision session index skipped:",
-      error.message
-    );
-  }
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_state
-      ON decisions(site_id, state);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] decision state index skipped:",
-      error.message
-    );
-  }
-
-  /* -------------------------------------------------------
-     SESSION SUMMARIES
-  ------------------------------------------------------- */
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_updated
-      ON session_summaries(site_id, updated_at DESC);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] session_summaries index skipped:",
-      error.message
-    );
-  }
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_session
-      ON session_summaries(site_id, session_id);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] session_summaries session index skipped:",
-      error.message
-    );
-  }
-
-  /* -------------------------------------------------------
-     EMAIL LOGS
-  ------------------------------------------------------- */
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_email_logs_lookup
-      ON email_logs(email_type, recipient, subject);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] email_logs index skipped:",
-      error.message
-    );
-  }
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_email_logs_site_created
-      ON email_logs(site_id, created_at DESC);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] email_logs site index skipped:",
-      error.message
-    );
-  }
-
-  /* -------------------------------------------------------
-     RECOVERY
-  ------------------------------------------------------- */
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_recovery_site_status
-      ON recovery_queue(site_id, status, created_at DESC);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] recovery index skipped:",
-      error.message
-    );
-  }
-
-  /* -------------------------------------------------------
-     BANDIT
-  ------------------------------------------------------- */
-
-  try {
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_bandit_state_site
-      ON bandit_state(site_id);
-    `);
-  } catch (error) {
-    console.warn(
-      "[DB INDEX] bandit_state index skipped:",
-      error.message
-    );
-  }
-
-  console.log(
-    "[DB INIT] REDEN database infrastructure verified."
+await db.query(`
+  CREATE TABLE IF NOT EXISTS sites (
+    id SERIAL PRIMARY KEY,
+    site_id VARCHAR(100) UNIQUE NOT NULL,
+    api_key VARCHAR(150) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    owner_email VARCHAR(255),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    plan VARCHAR(50) NOT NULL DEFAULT 'basic',
+    subscription_status VARCHAR(50) NOT NULL DEFAULT 'inactive',
+    timezone VARCHAR(64) NOT NULL DEFAULT 'Africa/Lagos',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
-} catch (error) {
-  console.error(
-    "[DB INIT ERROR]",
-    error
-  );
+`);
 
-  throw error;
-}
+await db.query(`
+  ALTER TABLE sites
+  ADD COLUMN IF NOT EXISTS timezone VARCHAR(64)
+  NOT NULL DEFAULT 'Africa/Lagos';
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_sites_owner_email
+  ON sites (LOWER(owner_email));
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_sites_name
+  ON sites (LOWER(name));
+`);
+
+await db.query(`
+  ALTER TABLE session_summaries
+  ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ;
+`);
+
+/*
+ * IMPORTANT:
+ * Do not backfill purchased_at from updated_at.
+ *
+ * updated_at is session activity time, not purchase time.
+ *
+ * Historical purchase timestamps must come from actual
+ * PURCHASE events in event_logs.
+ */
+await db.query(`
+  UPDATE session_summaries ss
+  SET purchased_at = (
+    SELECT MIN(el.created_at)
+    FROM event_logs el
+    WHERE el.site_id = ss.site_id
+      AND el.session_id = ss.session_id
+      AND el.event = 'PURCHASE'
+  )
+  WHERE ss.purchased = TRUE
+    AND ss.purchased_at IS NULL;
+`);
+
+/*
+ * RECOVERY QUEUE — customer_email
+ *
+ * Required so sendRecoveryEmail() has a real recipient.
+ * Nullable at the schema level (a CHECKOUT_STARTED event
+ * without an email in its payload can't be recovered by
+ * email), but the /event handler below always attempts to
+ * capture it when present.
+ */
+await db.query(`
+  ALTER TABLE recovery_queue
+  ADD COLUMN IF NOT EXISTS customer_email TEXT;
+`);
+
+await db.query(`
+  CREATE TABLE IF NOT EXISTS intelligence_answers (
+    id BIGSERIAL PRIMARY KEY,
+    site_id VARCHAR(100) NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    intents JSONB NOT NULL DEFAULT '[]'::jsonb,
+    latency_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_intelligence_answers_site_created
+  ON intelligence_answers (site_id, created_at DESC);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
+  ON event_logs (site_id, created_at DESC);
+`);
+
+await db.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_event_logs_site_event_id
+  ON event_logs (site_id, event_id);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_decisions_site_completed
+  ON decisions (site_id, completed_at DESC);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_decisions_site_session_state
+  ON decisions (site_id, session_id, state);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_session_summaries_site_updated
+  ON session_summaries (site_id, updated_at DESC);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_session_summaries_site_session
+  ON session_summaries (site_id, session_id);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_email_logs_site_created
+  ON email_logs (site_id, created_at DESC);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_recovery_site_status
+  ON recovery_queue (site_id, status);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_bandit_state_site
+  ON bandit_state (site_id);
+`);
 
 await initRedis();
-
-const app = express();
-
-app.set(
-  "trust proxy",
-  Number(
-    process.env.TRUST_PROXY_HOPS || 1
-  )
-);
-
-const __filename =
-  fileURLToPath(import.meta.url);
-
-const __dirname =
-  path.dirname(__filename);
 
 /* =========================================================
    SECURITY
 ========================================================= */
 
-app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
 app.use(
   helmet({
     contentSecurityPolicy: false,
-
     crossOriginResourcePolicy: {
       policy: "cross-origin",
     },
@@ -326,428 +220,1620 @@ app.use(compression());
    REQUEST ID
 ========================================================= */
 
-app.use(
-  (req, res, next) => {
-    const supplied =
-      typeof req.headers["x-request-id"] === "string"
-        ? req.headers["x-request-id"].trim()
-        : "";
+app.use((req, res, next) => {
+  const incoming = req.get("x-request-id");
 
-    const requestId =
-      supplied &&
-      supplied.length <= 100
-        ? supplied
-        : crypto.randomUUID();
+  const requestId =
+    typeof incoming === "string" &&
+    incoming.length > 0 &&
+    incoming.length <= 100
+      ? incoming
+      : crypto.randomUUID();
 
-    req.requestId =
-      requestId;
+  req.requestId = requestId;
+  res.setHeader("x-request-id", requestId);
 
-    res.setHeader(
-      "X-Request-Id",
-      requestId
-    );
-
-    next();
-  }
-);
+  next();
+});
 
 /* =========================================================
    CORS
 ========================================================= */
 
-app.use(
-  (req, res, next) => {
-    const publicCorsRoutes = [
-      "/event",
-      "/score",
-      "/action",
-      "/outcome",
-      "/sdk.js",
-      "/api/v1/verify",
-    ];
+const PUBLIC_CORS_PATHS = new Set([
+  "/event",
+  "/score",
+  "/action",
+  "/outcome",
+  "/sdk.js",
+  "/api/v1/verify",
+]);
 
-    const isPublicCorsRoute =
-      publicCorsRoutes.some(
-        (route) =>
-          req.path === route ||
-          req.path.startsWith(
-            `${route}/`
-          )
-      );
+function isPublicAsset(req) {
+  if (req.path === "/" || req.path === "/health") {
+    return true;
+  }
 
-    if (isPublicCorsRoute) {
-      res.setHeader(
-        "Access-Control-Allow-Origin",
-        "*"
-      );
+  if (req.path === "/sdk.js") {
+    return true;
+  }
 
-      res.setHeader(
-        "Access-Control-Allow-Methods",
-        "GET, POST, OPTIONS"
-      );
+  return /\.(js|css|png|jpg|jpeg|gif|svg|ico|webp|woff|woff2|ttf)$/i.test(
+    req.path
+  );
+}
 
-      res.setHeader(
-        "Access-Control-Allow-Headers",
-        [
-          "Content-Type",
-          "X-Api-Key",
-          "X-Site-Id",
-          "X-Request-Id",
-          "X-SDK-Version",
-        ].join(", ")
-      );
+function isPublicRoute(req) {
+  return isPublicAsset(req) || PUBLIC_CORS_PATHS.has(req.path);
+}
 
-      res.setHeader(
-        "Access-Control-Max-Age",
-        "600"
-      );
-    }
+app.use((req, res, next) => {
+  if (isPublicRoute(req)) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET,POST,OPTIONS"
+    );
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      [
+        "Content-Type",
+        "X-Api-Key",
+        "X-Site-Id",
+        "X-Request-Id",
+        "X-SDK-Version",
+      ].join(", ")
+    );
+    res.setHeader("Access-Control-Max-Age", "600");
 
     if (req.method === "OPTIONS") {
-      if (isPublicCorsRoute) {
-        return res.sendStatus(204);
-      }
-
-      return res.sendStatus(403);
+      return res.sendStatus(204);
     }
-
-    next();
   }
-);
+
+  next();
+});
 
 /* =========================================================
    RATE LIMITING
-
-   IMPORTANT: telemetryLimiter (1000/min, keyed per site+ip)
-   is intended to be the ONLY limiter that governs /event
-   traffic. generalLimiter (120/min) is deliberately skipped
-   for /event below -- otherwise both limiters apply in
-   sequence to every /event request, and the effective limit
-   silently collapses to whichever is stricter (120/min),
-   defeating the higher telemetry allowance entirely.
 ========================================================= */
 
-const generalLimiter =
-  rateLimit({
-    windowMs: 60 * 1000,
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === "/event",
+});
 
-    max: 120,
+const telemetryLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const siteId =
+      req.headers["x-site-id"] ||
+      req.body?.site_id ||
+      req.body?.siteId ||
+      "unknown";
 
-    standardHeaders: true,
+    return `${siteId}:${req.ip}`;
+  },
+});
 
-    legacyHeaders: false,
+app.use(generalLimiter);
 
-    skip: (req) => req.path === "/event",
-
-    message: {
-      ok: false,
-      error: "rate_limit_exceeded",
-    },
-  });
-
-const telemetryLimiter =
-  rateLimit({
-    windowMs: 60 * 1000,
-
-    max: 1000,
-
-    keyGenerator: (req) => {
-      const siteId =
-        typeof req.headers[
-          "x-site-id"
-        ] === "string"
-          ? req.headers[
-              "x-site-id"
-            ].trim()
-          : "anonymous";
-
-      return `${siteId}:${req.ip}`;
-    },
-
-    standardHeaders: true,
-
-    legacyHeaders: false,
-
-    message: {
-      ok: false,
-      error:
-        "tenant_rate_limit_exceeded",
-    },
-  });
-
-app.use(
-  "/event",
-  telemetryLimiter
-);
-
-app.use(
-  generalLimiter
-);
+app.use("/event", telemetryLimiter);
 
 /* =========================================================
    BODY PARSING
 ========================================================= */
 
-app.use(
-  express.json({
-    limit: "100kb",
-    strict: true,
-  })
-);
-
-app.use(
-  express.urlencoded({
-    extended: true,
-    limit: "100kb",
-  })
-);
+app.use(express.json({ limit: "100kb" }));
+app.use(express.urlencoded({ extended: true, limit: "100kb" }));
 
 /* =========================================================
    TIMEOUT
 ========================================================= */
 
-app.use(
-  timeout("15s")
-);
+app.use(timeout("15s"));
 
-const haltOnTimeout =
-  (req, res, next) => {
-    if (req.timedout) {
-      return;
-    }
+app.use((req, res, next) => {
+  if (!req.timedout) {
+    return next();
+  }
 
-    next();
-  };
+  console.error("[REQUEST TIMEOUT]", {
+    requestId: req.requestId,
+    method: req.method,
+    path: req.path,
+  });
 
-app.use(
-  haltOnTimeout
-);
+  return res.status(408).json({
+    success: false,
+    error: "Request timeout",
+    requestId: req.requestId,
+  });
+});
 
 /* =========================================================
-   RESPONSE HELPERS
+   HELPERS
 ========================================================= */
 
-const success =
-  (data = {}) => ({
-    ok: true,
-
-    timestamp:
-      new Date().toISOString(),
-
+function success(res, data = {}) {
+  return res.status(200).json({
+    success: true,
     ...data,
   });
+}
 
-const failure =
-  (
+function failure(res, status, error, details = undefined) {
+  const body = {
+    success: false,
     error,
-    details = null
-  ) => ({
-    ok: false,
+  };
 
-    error,
-
-    details,
-
-    timestamp:
-      new Date().toISOString(),
-  });
-
-/* =========================================================
-   UTILITIES
-========================================================= */
-
-function validateNumber(
-  value,
-  {
-    defaultValue = 0,
-    allowNull = false,
-  } = {}
-) {
-  if (
-    value === undefined ||
-    value === null ||
-    value === ""
-  ) {
-    if (allowNull) {
-      return null;
-    }
-
-    return defaultValue;
+  if (details !== undefined) {
+    body.details = details;
   }
 
-  const number =
-    Number(value);
-
-  if (
-    Number.isNaN(number) ||
-    !Number.isFinite(number)
-  ) {
-    return null;
-  }
-
-  if (number < 0) {
-    return null;
-  }
-
-  return number;
+  return res.status(status).json(body);
 }
 
-function normalizeBoolean(
-  value
-) {
-  return (
-    value === true ||
-    value === 1 ||
-    value === "1" ||
-    (
-      typeof value === "string" &&
-      value.toLowerCase() ===
-        "true"
-    )
-  );
+function validateNumber(value, fallback = 0) {
+  const number = Number(value);
+
+  return Number.isFinite(number) ? number : fallback;
 }
 
-function safeCompare(
-  input,
-  secret
-) {
-  if (
-    typeof input !== "string" ||
-    typeof secret !== "string" ||
-    !input ||
-    !secret
-  ) {
-    return false;
+function normalizeBoolean(value) {
+  if (typeof value === "boolean") {
+    return value;
   }
 
-  const inputBuffer =
-    Buffer.from(
-      input,
-      "utf8"
-    );
-
-  const secretBuffer =
-    Buffer.from(
-      secret,
-      "utf8"
-    );
-
-  if (
-    inputBuffer.length !==
-    secretBuffer.length
-  ) {
-    return false;
+  if (typeof value === "string") {
+    return value.toLowerCase() === "true";
   }
 
-  return crypto.timingSafeEqual(
-    inputBuffer,
-    secretBuffer
-  );
+  return Boolean(value);
 }
 
-function normalizeString(
-  value,
-  maxLength
-) {
-  if (
-    typeof value !==
-    "string"
-  ) {
+function normalizeString(value, maxLength = 500) {
+  if (typeof value !== "string") {
     return "";
   }
 
-  const normalized =
-    value.trim();
-
-  if (
-    normalized.length >
-    maxLength
-  ) {
-    return "";
-  }
-
-  return normalized;
+  return value.trim().slice(0, maxLength);
 }
 
-function normalizeEmail(
-  value
-) {
-  if (
-    typeof value !==
-    "string"
-  ) {
-    return "";
-  }
+function normalizeEmail(value) {
+  const email = normalizeString(value, 255).toLowerCase();
 
-  const email =
-    value
-      .trim()
-      .toLowerCase();
-
-  if (
-    email.length < 3 ||
-    email.length > 255
-  ) {
-    return "";
-  }
-
-  if (
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-      email
-    )
-  ) {
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return "";
   }
 
   return email;
 }
 
-function hashAuthKey(
-  siteId,
-  apiKey
-) {
+function safeCompare(a, b) {
+  if (
+    typeof a !== "string" ||
+    typeof b !== "string" ||
+    !a ||
+    !b
+  ) {
+    return false;
+  }
+
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
+}
+
+function hashAuthKey(siteId, apiKey) {
   return crypto
     .createHash("sha256")
-    .update(
-      `${siteId}:${apiKey}`,
-      "utf8"
-    )
+    .update(`${siteId}:${apiKey}`)
     .digest("hex");
 }
 
-function safePayload(
-  payload
-) {
-  return (
-    payload &&
-    typeof payload === "object" &&
-    !Array.isArray(payload)
-      ? payload
-      : {}
-  );
+function safePayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return {};
+  }
+
+  try {
+    const serialized = JSON.stringify(payload);
+
+    if (serialized.length > 50_000) {
+      return {};
+    }
+
+    return JSON.parse(serialized);
+  } catch {
+    return {};
+  }
 }
 
-function safeJson(
-  value,
-  fallback = {}
-) {
+function safeJson(value) {
   try {
-    return JSON.stringify(
-      value
-    );
+    return JSON.stringify(value ?? {});
   } catch {
-    return JSON.stringify(
-      fallback
+    return "{}";
+  }
+}
+
+function generateSiteId() {
+  return `site_${crypto.randomBytes(8).toString("hex")}`;
+}
+
+function generateApiKey() {
+  return `rd_${crypto.randomBytes(24).toString("hex")}`;
+}
+
+/* =========================================================
+   TIMEZONE / CALENDAR HELPERS
+========================================================= */
+
+function zonedDateTimeToUtc(
+  year,
+  month,
+  day,
+  hour,
+  minute,
+  second,
+  timeZone
+) {
+  const target = new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second)
+  );
+
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+
+  const parts = formatter.formatToParts(target);
+
+  const values = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      values[part.type] = Number(part.value);
+    }
+  }
+
+  const asUtc = Date.UTC(
+    values.year,
+    values.month - 1,
+    values.day,
+    values.hour,
+    values.minute,
+    values.second
+  );
+
+  const offset = asUtc - target.getTime();
+
+  return new Date(target.getTime() - offset);
+}
+
+function getSiteDayBounds(timeZone, referenceDate = new Date()) {
+  let validTimeZone = timeZone || "Africa/Lagos";
+
+  try {
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: validTimeZone,
+    }).format(referenceDate);
+  } catch {
+    throw new Error(`Invalid site timezone: ${validTimeZone}`);
+  }
+
+  const localDateParts = new Intl.DateTimeFormat("en-US", {
+    timeZone: validTimeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(referenceDate);
+
+  const parts = {};
+
+  for (const part of localDateParts) {
+    if (part.type !== "literal") {
+      parts[part.type] = Number(part.value);
+    }
+  }
+
+  const startUTC = zonedDateTimeToUtc(
+    parts.year,
+    parts.month,
+    parts.day,
+    0,
+    0,
+    0,
+    validTimeZone
+  );
+
+  const tomorrow = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day) +
+      24 * 60 * 60 * 1000
+  );
+
+  const nextPartsRaw = new Intl.DateTimeFormat("en-US", {
+    timeZone: validTimeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(tomorrow);
+
+  const nextParts = {};
+
+  for (const part of nextPartsRaw) {
+    if (part.type !== "literal") {
+      nextParts[part.type] = Number(part.value);
+    }
+  }
+
+  const endUTC = zonedDateTimeToUtc(
+    nextParts.year,
+    nextParts.month,
+    nextParts.day,
+    0,
+    0,
+    0,
+    validTimeZone
+  );
+
+  return {
+    startUTC,
+    endUTC,
+    localDate: `${String(parts.year).padStart(4, "0")}-${String(
+      parts.month
+    ).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`,
+    timeZone: validTimeZone,
+  };
+}
+
+/* =========================================================
+   INTELLIGENCE HELPERS
+========================================================= */
+
+function normalizeQuestion(question) {
+  return normalizeString(question, 2_000)
+    .toLowerCase()
+    .replace(/[^\w\s$%.-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectIntents(question) {
+  const q = normalizeQuestion(question);
+
+  const intents = [];
+
+  if (
+    /\b(who|identity|name|merchant|store|business|company)\b/.test(
+      q
+    )
+  ) {
+    intents.push("identity");
+  }
+
+  if (
+    /\b(revenue|income|money|earnings|earned|turnover)\b/.test(q)
+  ) {
+    intents.push("revenue");
+  }
+
+  if (
+    /\b(visitor|visitors|traffic|sessions|users|people)\b/.test(q)
+  ) {
+    intents.push("traffic");
+  }
+
+  if (
+    /\b(purchase|purchases|bought|orders|order|sales volume)\b/.test(
+      q
+    )
+  ) {
+    intents.push("purchases");
+  }
+
+  if (
+    /\b(conversion|conversions|convert|converted|rate)\b/.test(q)
+  ) {
+    intents.push("conversion");
+  }
+
+  if (/\b(sales|sold|selling)\b/.test(q)) {
+    intents.push("sales");
+  }
+
+  if (
+    /\b(cart|checkout|checkouts|basket|abandon)\b/.test(q)
+  ) {
+    intents.push("cart");
+  }
+
+  if (
+    /\b(recovery|recover|recovered|recovery email)\b/.test(q)
+  ) {
+    intents.push("recovery");
+  }
+
+  if (
+    /\b(email|emails|mail|messages)\b/.test(q)
+  ) {
+    intents.push("email");
+  }
+
+  if (
+    /\b(product|products|interest|interested|viewed)\b/.test(q)
+  ) {
+    intents.push("product_interest");
+  }
+
+  if (
+    /\b(bandit|experiment|exploration|exploit|incentive|discount|offer|action)\b/.test(
+      q
+    )
+  ) {
+    intents.push("bandit");
+  }
+
+  if (
+    /\b(advice|recommend|recommendation|suggest|suggestion|what should|how can|improve|improvement)\b/.test(
+      q
+    )
+  ) {
+    intents.push("advice");
+  }
+
+  if (
+    /\b(overview|summary|performance|performing|doing|today)\b/.test(
+      q
+    )
+  ) {
+    intents.push("overview");
+  }
+
+  if (
+    /\b(funnel|journey|flow|stage|stages)\b/.test(q)
+  ) {
+    intents.push("funnel");
+  }
+
+  return [...new Set(intents)];
+}
+
+function composeIdentity(site) {
+  return `${site.name} is the connected merchant site in REDEN.`;
+}
+
+function composeRevenue(evidence) {
+  return `Storefront purchase revenue recorded today is ${evidence.purchaseRevenue.toFixed(
+    2
+  )}. REDEN-attributed decision revenue is ${evidence.decisionRevenue.toFixed(
+    2
+  )}.`;
+}
+
+function composeTraffic(evidence) {
+  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions and ${evidence.totalEvents} events.`;
+}
+
+function composePurchases(evidence) {
+  return `Today REDEN recorded ${evidence.purchases} purchase events across ${evidence.purchasedSessions} purchased sessions, with storefront purchase revenue of ${evidence.purchaseRevenue.toFixed(
+    2
+  )}.`;
+}
+
+function composeConversion(evidence) {
+  if (evidence.decisions === 0) {
+    return "There are no completed REDEN decisions today, so a decision conversion rate cannot be calculated.";
+  }
+
+  const rate =
+    (evidence.conversions / evidence.decisions) * 100;
+
+  return `Today REDEN completed ${evidence.decisions} decisions and recorded ${evidence.conversions} conversions, giving a decision conversion rate of ${rate.toFixed(
+    2
+  )}%.`;
+}
+
+function composeSales(evidence) {
+  return `Today there were ${evidence.purchases} purchase events and ${evidence.purchaseRevenue.toFixed(
+    2
+  )} in recorded storefront purchase revenue.`;
+}
+
+function composeCart(evidence) {
+  const gap = Math.max(
+    0,
+    evidence.checkoutStarted - evidence.purchases
+  );
+
+  return `Today REDEN recorded ${evidence.checkoutStarted} checkout starts and ${evidence.purchases} purchase events. The difference between those event counts is ${gap}. This is a checkout-to-purchase event gap, not a confirmed abandonment count.`;
+}
+
+function composeRecovery(evidence) {
+  return `Recovery activity today: ${evidence.recovery.pending} pending, ${evidence.recovery.sent} sent, ${evidence.recovery.completed} completed, and ${evidence.recovery.failed} failed.`;
+}
+
+function composeEmail(evidence) {
+  return `Today REDEN recorded ${evidence.emails.total} email records: ${evidence.emails.sent} sent, ${evidence.emails.delivered} delivered, and ${evidence.emails.failed} failed.`;
+}
+
+function composeProductInterest(evidence) {
+  return `Today REDEN recorded ${evidence.productViews} product-view events and ${evidence.addToCart} add-to-cart events.`;
+}
+
+function composeBandit(evidence) {
+  if (!evidence.bandit) {
+    return "No bandit state is currently available for this site.";
+  }
+
+  return `The current bandit state contains ${evidence.bandit.pulls} recorded pulls across ${evidence.bandit.actions} actions.`;
+}
+
+function composeAdvice(evidence) {
+  const recommendations = [];
+
+  if (
+    evidence.checkoutStarted > 0 &&
+    evidence.purchases === 0
+  ) {
+    recommendations.push(
+      "Monitor the checkout-to-purchase gap because checkout activity is present without a recorded purchase event today."
     );
+  }
+
+  if (
+    evidence.checkoutStarted > 0 &&
+    evidence.purchases > 0 &&
+    evidence.checkoutStarted > evidence.purchases * 2
+  ) {
+    recommendations.push(
+      "Review the checkout-to-purchase event gap and verify that purchase tracking is firing reliably."
+    );
+  }
+
+  if (
+    evidence.purchases === 0 &&
+    evidence.uniqueSessions > 0
+  ) {
+    recommendations.push(
+      "There is traffic without a recorded purchase event today; verify the storefront purchase event before interpreting this as a conversion problem."
+    );
+  }
+
+  if (!recommendations.length) {
+    return "No evidence-based intervention is required from the available signals today.";
+  }
+
+  return recommendations.join(" ");
+}
+
+function composeOverview(evidence) {
+  const conversionRate =
+    evidence.decisions > 0
+      ? (evidence.conversions / evidence.decisions) * 100
+      : null;
+
+  const conversionText =
+    conversionRate === null
+      ? "no completed REDEN decision conversion rate is available"
+      : `a REDEN decision conversion rate of ${conversionRate.toFixed(
+          2
+        )}%`;
+
+  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions, ${evidence.totalEvents} events, ${evidence.purchases} purchase events, and ${evidence.purchaseRevenue.toFixed(
+    2
+  )} in storefront purchase revenue. It also completed ${
+    evidence.decisions
+  } decisions with ${evidence.conversions} conversions, giving ${conversionText}.`;
+}
+
+function composeFunnel(evidence) {
+  return `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
+}
+
+function composeIntent(intent, evidence, site) {
+  switch (intent) {
+    case "identity":
+      return composeIdentity(site);
+
+    case "revenue":
+      return composeRevenue(evidence);
+
+    case "traffic":
+      return composeTraffic(evidence);
+
+    case "purchases":
+      return composePurchases(evidence);
+
+    case "conversion":
+      return composeConversion(evidence);
+
+    case "sales":
+      return composeSales(evidence);
+
+    case "cart":
+      return composeCart(evidence);
+
+    case "recovery":
+      return composeRecovery(evidence);
+
+    case "email":
+      return composeEmail(evidence);
+
+    case "product_interest":
+      return composeProductInterest(evidence);
+
+    case "bandit":
+      return composeBandit(evidence);
+
+    case "advice":
+      return composeAdvice(evidence);
+
+    case "overview":
+      return composeOverview(evidence);
+
+    case "funnel":
+      return composeFunnel(evidence);
+
+    default:
+      return null;
   }
 }
 
 /* =========================================================
-   EVENT DEFINITIONS
+   AUTHENTICATION
 ========================================================= */
 
-const VALID_EVENTS =
-  new Set([
+const ADMIN_ROUTES = new Set([
+  "/api/v1/intelligence",
+  "/api/v1/onboard",
+]);
+
+async function authenticate(req, res, next) {
+  try {
+    if (isPublicRoute(req)) {
+      return next();
+    }
+
+    if (ADMIN_ROUTES.has(req.path)) {
+      const providedSecret = req.get("x-admin-secret");
+
+      if (!safeCompare(providedSecret, ADMIN_SECRET)) {
+        return failure(res, 401, "Unauthorized");
+      }
+
+      req.authType = "admin";
+      return next();
+    }
+
+    const siteId = normalizeString(
+      req.get("x-site-id") ||
+        req.body?.site_id ||
+        req.body?.siteId,
+      100
+    );
+
+    const apiKey = normalizeString(
+      req.get("x-api-key") ||
+        req.body?.api_key ||
+        req.body?.apiKey,
+      150
+    );
+
+    if (!siteId || !apiKey) {
+      return failure(res, 401, "Missing site credentials");
+    }
+
+    const cacheKey = `site_auth:${hashAuthKey(
+      siteId,
+      apiKey
+    )}`;
+
+    /*
+     * Cache hits are trusted for up to 300s (5 min). A site
+     * deactivated mid-window can still authenticate until the
+     * cache entry expires. Lower the TTL below if that window
+     * is wider than your risk tolerance.
+     */
+    try {
+      const cached = await redis?.get?.(cacheKey);
+
+      if (cached) {
+        const cachedSite = JSON.parse(cached);
+
+        if (cachedSite?.active === true) {
+          req.site = cachedSite;
+          req.authType = "merchant";
+          return next();
+        }
+      }
+    } catch (error) {
+      console.error("[REDIS AUTH READ ERROR]", error);
+    }
+
+    const result = await db.query(
+      `
+        SELECT
+          id,
+          site_id,
+          api_key,
+          name,
+          owner_email,
+          active,
+          plan,
+          subscription_status,
+          timezone,
+          created_at
+        FROM sites
+        WHERE site_id = $1
+          AND api_key = $2
+          AND active = TRUE
+        LIMIT 1
+      `,
+      [siteId, apiKey]
+    );
+
+    if (!result.rowCount) {
+      return failure(res, 401, "Invalid site credentials");
+    }
+
+    const site = result.rows[0];
+
+    req.site = site;
+    req.authType = "merchant";
+
+    try {
+      await redis?.set?.(
+        cacheKey,
+        JSON.stringify(site),
+        "EX",
+        300
+      );
+    } catch (error) {
+      console.error("[REDIS AUTH WRITE ERROR]", error);
+    }
+
+    next();
+  } catch (error) {
+    console.error("[AUTH ERROR]", error);
+    return failure(res, 500, "Authentication failed");
+  }
+}
+
+app.use(authenticate);
+
+/* =========================================================
+   SITE CONTEXT
+========================================================= */
+
+app.use((req, res, next) => {
+  if (
+    isPublicRoute(req) ||
+    req.authType === "admin"
+  ) {
+    return next();
+  }
+
+  if (!req.site?.site_id) {
+    return failure(res, 401, "Missing site context");
+  }
+
+  next();
+});
+
+/* =========================================================
+   STATIC SDK
+========================================================= */
+
+app.get("/sdk.js", (req, res) => {
+  res.setHeader(
+    "Cache-Control",
+    "public, max-age=300, must-revalidate"
+  );
+
+  return res.sendFile(path.join(PUBLIC_DIR, "sdk.js"));
+});
+
+app.use(express.static(PUBLIC_DIR));
+
+/* =========================================================
+   ROOT
+========================================================= */
+
+app.get("/", async (req, res) => {
+  let redisHealthy = false;
+
+  try {
+    if (redis?.ping) {
+      const result = await redis.ping();
+      redisHealthy = result === "PONG";
+    }
+  } catch {
+    redisHealthy = false;
+  }
+
+  return success(res, {
+    service: "REDEN API",
+    operational: true,
+    redis: redisHealthy,
+  });
+});
+
+/* =========================================================
+   HEALTH
+========================================================= */
+
+app.get("/health", async (req, res) => {
+  try {
+    await db.query("SELECT 1");
+
+    return success(res, {
+      database: true,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("[HEALTH ERROR]", error);
+
+    return failure(res, 503, "Database unavailable");
+  }
+});
+
+/* =========================================================
+   ONBOARD
+========================================================= */
+
+app.post("/api/v1/onboard", async (req, res) => {
+  const name = normalizeString(req.body?.name, 255);
+  const ownerEmail = normalizeEmail(req.body?.owner_email);
+
+  if (!name || !ownerEmail) {
+    return failure(
+      res,
+      400,
+      "name and owner_email are required"
+    );
+  }
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    await client.query(
+      `
+        SELECT pg_advisory_xact_lock(
+          hashtext($1),
+          hashtext($2)
+        )
+      `,
+      [ownerEmail, name.toLowerCase()]
+    );
+
+    const existing = await client.query(
+      `
+        SELECT
+          site_id,
+          api_key,
+          name,
+          owner_email,
+          active,
+          plan,
+          subscription_status,
+          timezone,
+          created_at
+        FROM sites
+        WHERE LOWER(owner_email) = LOWER($1)
+          AND LOWER(name) = LOWER($2)
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+      [ownerEmail, name]
+    );
+
+    if (existing.rowCount) {
+      await client.query("COMMIT");
+
+      return success(res, {
+        existing: true,
+        site: existing.rows[0],
+      });
+    }
+
+    const siteId = generateSiteId();
+    const apiKey = generateApiKey();
+
+    const inserted = await client.query(
+      `
+        INSERT INTO sites (
+          site_id,
+          api_key,
+          name,
+          owner_email,
+          active,
+          plan,
+          subscription_status,
+          timezone
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          TRUE,
+          'basic',
+          'active',
+          'Africa/Lagos'
+        )
+        RETURNING
+          site_id,
+          api_key,
+          name,
+          owner_email,
+          active,
+          plan,
+          subscription_status,
+          timezone,
+          created_at
+      `,
+      [siteId, apiKey, name, ownerEmail]
+    );
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      existing: false,
+      site: inserted.rows[0],
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[ONBOARD ERROR]", error);
+
+    return failure(res, 500, "Onboarding failed");
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   VERIFY
+========================================================= */
+
+app.get("/api/v1/verify", async (req, res) => {
+  const clientEmail = normalizeEmail(
+    req.query?.clientEmail ||
+      req.query?.client_email
+  );
+
+  const siteId = normalizeString(
+    req.query?.siteId ||
+      req.query?.site_id,
+    100
+  );
+
+  if (!siteId) {
+    return failure(
+      res,
+      400,
+      "siteId is required"
+    );
+  }
+
+  try {
+    const result = clientEmail
+      ? await db.query(
+          `
+            SELECT
+              site_id,
+              name,
+              owner_email,
+              active,
+              plan,
+              subscription_status,
+              timezone,
+              created_at
+            FROM sites
+            WHERE site_id = $1
+              AND LOWER(owner_email) = LOWER($2)
+            LIMIT 1
+          `,
+          [siteId, clientEmail]
+        )
+      : await db.query(
+          `
+            SELECT
+              site_id,
+              name,
+              owner_email,
+              active,
+              plan,
+              subscription_status,
+              timezone,
+              created_at
+            FROM sites
+            WHERE site_id = $1
+            LIMIT 1
+          `,
+          [siteId]
+        );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        404,
+        "Site verification failed"
+      );
+    }
+
+    const site = result.rows[0];
+
+    let lastEventAt = null;
+
+    const eventResult = await db.query(
+      `
+        SELECT created_at
+        FROM event_logs
+        WHERE site_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+      [site.site_id]
+    );
+
+    if (eventResult.rowCount) {
+      lastEventAt = eventResult.rows[0].created_at;
+    }
+
+    return success(res, {
+      verified: true,
+      siteId: site.site_id,
+      clientEmail: clientEmail || site.owner_email,
+      name: site.name,
+      active: site.active,
+      plan: site.plan,
+      subscriptionStatus: site.subscription_status,
+      connected: Boolean(lastEventAt),
+      lastEventAt,
+      createdAt: site.created_at,
+      timezone: site.timezone,
+    });
+  } catch (error) {
+    console.error("[VERIFY ERROR]", error);
+
+    return failure(res, 500, "Verification failed");
+  }
+});
+
+/* =========================================================
+   INTEGRATION HEALTH
+========================================================= */
+
+app.get("/api/v1/integration-health", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          event,
+          COUNT(*)::INTEGER AS count,
+          MAX(created_at) AS last_at
+        FROM event_logs
+        WHERE site_id = $1
+          AND created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY event
+      `,
+      [siteId]
+    );
+
+    const events = {};
+
+    for (const row of result.rows) {
+      events[row.event] = {
+        count: row.count,
+        lastAt: row.last_at,
+      };
+    }
+
+    const sdkInstalled =
+      Number(events.PAGE_VIEW?.count || 0) > 0;
+
+    const requiredBusinessEvents = [
+      "PRODUCT_VIEW",
+      "ADD_TO_CART",
+      "CHECKOUT_STARTED",
+      "PURCHASE",
+    ];
+
+    const requiredBusinessEventsReceived =
+      requiredBusinessEvents.every(
+        (event) => Number(events[event]?.count || 0) > 0
+      );
+
+    return success(res, {
+      siteId,
+      sdkInstalled,
+      requiredBusinessEventsReceived,
+      events,
+      checkedPeriod: "last_30_days",
+    });
+  } catch (error) {
+    console.error(
+      "[INTEGRATION HEALTH ERROR]",
+      error
+    );
+
+    return failure(
+      res,
+      500,
+      "Unable to determine integration health"
+    );
+  }
+});
+
+/* =========================================================
+   INTELLIGENCE
+========================================================= */
+
+app.post("/api/v1/intelligence", async (req, res) => {
+  const startedAt = Date.now();
+
+  const siteId = normalizeString(
+    req.body?.siteId ||
+      req.body?.site_id,
+    100
+  );
+
+  const question = normalizeString(
+    req.body?.question,
+    2_000
+  );
+
+  if (!siteId || !question) {
+    return failure(
+      res,
+      400,
+      "siteId and question are required"
+    );
+  }
+
+  try {
+    const siteResult = await db.query(
+      `
+        SELECT
+          site_id,
+          name,
+          owner_email,
+          active,
+          plan,
+          subscription_status,
+          timezone,
+          created_at
+        FROM sites
+        WHERE site_id = $1
+          AND active = TRUE
+        LIMIT 1
+      `,
+      [siteId]
+    );
+
+    if (!siteResult.rowCount) {
+      return failure(res, 404, "Site not found");
+    }
+
+    const site = siteResult.rows[0];
+
+    const {
+      startUTC,
+      endUTC,
+      localDate,
+      timeZone,
+    } = getSiteDayBounds(site.timezone);
+
+    const eventResult = await db.query(
+      `
+        SELECT
+          event,
+          COUNT(*)::INTEGER AS count
+        FROM event_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+        GROUP BY event
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const eventCounts = {};
+
+    for (const row of eventResult.rows) {
+      eventCounts[row.event] = Number(row.count || 0);
+    }
+
+    const sessionResult = await db.query(
+      `
+        SELECT COUNT(DISTINCT session_id)::INTEGER AS count
+        FROM event_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const uniqueSessions = Number(
+      sessionResult.rows[0]?.count || 0
+    );
+
+    const decisionResult = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE completed_at >= $2
+                AND completed_at < $3
+            ),
+            0
+          )::NUMERIC AS revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND completed_at >= $2
+          AND completed_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const decisionRow = decisionResult.rows[0] || {};
+
+    const decisions = Number(
+      decisionRow.decisions || 0
+    );
+
+    const conversions = Number(
+      decisionRow.conversions || 0
+    );
+
+    const decisionRevenue = Number(
+      decisionRow.revenue || 0
+    );
+
+    const purchaseResult = await db.query(
+      `
+        SELECT
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue,
+
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchased_sessions
+        FROM session_summaries
+        WHERE site_id = $1
+          AND purchased = TRUE
+          AND purchased_at >= $2
+          AND purchased_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const purchaseRow = purchaseResult.rows[0] || {};
+
+    const purchaseRevenue = Number(
+      purchaseRow.revenue || 0
+    );
+
+    const purchasedSessions = Number(
+      purchaseRow.purchased_sessions || 0
+    );
+
+    const recoveryResult = await db.query(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    const banditResult = await db.query(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      intents = ["overview"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await db.query(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
     "PAGE_VIEW",
     "PRODUCT_VIEW",
     "ADD_TO_CART",
@@ -758,3150 +1844,478 @@ const VALID_EVENTS =
     "BEHAVIOR",
   ]);
 
-/* =========================================================
-   PUBLIC ROUTES
-========================================================= */
-
-const isPublicAsset =
-  (pathname) => {
-    if (
-      pathname === "/" ||
-      pathname === "/health" ||
-      pathname === "/sdk.js"
-    ) {
-      return true;
-    }
-
-    if (
-      pathname.startsWith(
-        "/api/"
-      )
-    ) {
-      return false;
-    }
-
-    return (
-      /\.(png|jpg|jpeg|svg|css|js|ico|webp|woff|woff2|ttf)$/i.test(
-        pathname
-      )
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
     );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
   };
 
-const isPublicRoute =
-  (req) =>
-    isPublicAsset(
-      req.path
-    ) ||
-    req.path ===
-      "/api/v1/verify";
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
 
-/* =========================================================
-   ADMIN ROUTES
-========================================================= */
+  const client = await db.connect();
 
-const isAdminRoute =
-  (req) =>
-    req.path ===
-      "/api/v1/intelligence" ||
-    req.path ===
-      "/api/v1/onboard" ||
-    req.path ===
-      "/api/v1/installation";
-
-/* =========================================================
-   STATIC FILES
-========================================================= */
-
-app.get(
-  "/sdk.js",
-  (req, res) => {
-    res.type(
-      "application/javascript"
-    );
-
-    return res.sendFile(
-      path.join(
-        __dirname,
-        "..",
-        "public",
-        "sdk.js"
-      )
-    );
-  }
-);
-
-app.use(
-  express.static(
-    path.join(
-      __dirname,
-      "..",
-      "public"
-    )
-  )
-);
-
-/* =========================================================
-   INTERNAL + MERCHANT AUTH
-========================================================= */
-
-async function authenticate(
-  req,
-  res,
-  next
-) {
   try {
-    /* -----------------------------------------------------
-       PUBLIC
-    ----------------------------------------------------- */
+    await client.query("BEGIN");
 
-    if (
-      isPublicRoute(req)
-    ) {
-      return next();
-    }
-
-    /* -----------------------------------------------------
-       INTERNAL PRETHIM -> REDEN
-    ----------------------------------------------------- */
-
-    if (
-      isAdminRoute(req)
-    ) {
-      const suppliedSecret =
-        req.headers[
-          "x-admin-secret"
-        ];
-
-      if (
-        typeof suppliedSecret !==
-        "string"
-      ) {
-        console.warn(
-          `[INTERNAL AUTH] Missing x-admin-secret ${req.method} ${req.path} request=${req.requestId}`
-        );
-
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
-      if (
-        !safeCompare(
-          suppliedSecret,
-          ADMIN_SECRET
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
         )
-      ) {
-        console.warn(
-          `[INTERNAL AUTH] Invalid x-admin-secret ${req.method} ${req.path} request=${req.requestId}`
-        );
-
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
-      req.isAdminRoute =
-        true;
-
-      return next();
-    }
-
-    /* -----------------------------------------------------
-       MERCHANT / SDK
-    ----------------------------------------------------- */
-
-    const apiKey =
-      typeof req.headers[
-        "x-api-key"
-      ] === "string"
-        ? req.headers[
-            "x-api-key"
-          ]
-        : req.body?.api_key;
-
-    const siteId =
-      typeof req.headers[
-        "x-site-id"
-      ] === "string"
-        ? req.headers[
-            "x-site-id"
-          ]
-        : req.body?.site_id;
-
-    if (
-      typeof apiKey !==
-        "string" ||
-      typeof siteId !==
-        "string"
-    ) {
-      return res
-        .status(401)
-        .json(
-          failure(
-            "missing_credentials"
-          )
-        );
-    }
-
-    const normalizedApiKey =
-      apiKey.trim();
-
-    const normalizedSiteId =
-      siteId.trim();
-
-    if (
-      !normalizedApiKey ||
-      !normalizedSiteId ||
-      normalizedApiKey.length >
-        150 ||
-      normalizedSiteId.length >
-        100
-    ) {
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_credentials"
-          )
-        );
-    }
-
-    const cacheKey =
-      `site_auth:${hashAuthKey(
-        normalizedSiteId,
-        normalizedApiKey
-      )}`;
-
-    /* -----------------------------------------------------
-       REDIS AUTH CACHE
-    ----------------------------------------------------- */
-
-    if (redis) {
-      try {
-        const cached =
-          await redis.get(
-            cacheKey
-          );
-
-        if (cached) {
-          const cachedSite =
-            JSON.parse(
-              cached
-            );
-
-          if (
-            cachedSite?.active ===
-            true &&
-            cachedSite?.site_id ===
-              normalizedSiteId
-          ) {
-            req.site =
-              cachedSite;
-
-            return next();
-          }
-        }
-      } catch (error) {
-        console.warn(
-          "[AUTH REDIS READ ERROR]",
-          error.message
-        );
-      }
-    }
-
-    /* -----------------------------------------------------
-       DATABASE AUTH
-    ----------------------------------------------------- */
-
-    const result =
-      await db.query(
-        `
-          SELECT
-            id,
-            site_id,
-            name,
-            owner_email,
-            active,
-            plan,
-            subscription_status
-          FROM sites
-          WHERE api_key = $1
-            AND site_id = $2
-            AND active = true
-          LIMIT 1
-        `,
-        [
-          normalizedApiKey,
-          normalizedSiteId,
-        ]
-      );
-
-    if (
-      !result.rowCount
-    ) {
-      return res
-        .status(403)
-        .json(
-          failure(
-            "invalid_credentials"
-          )
-        );
-    }
-
-    req.site =
-      result.rows[0];
-
-    /* -----------------------------------------------------
-       CACHE AUTH RESULT
-    ----------------------------------------------------- */
-
-    if (redis) {
-      try {
-        await redis.set(
-          cacheKey,
-          JSON.stringify(
-            req.site
-          ),
-          "EX",
-          60
-        );
-      } catch (error) {
-        console.warn(
-          "[AUTH REDIS WRITE ERROR]",
-          error.message
-        );
-      }
-    }
-
-    return next();
-  } catch (error) {
-    console.error(
-      "[AUTH ERROR]",
-      {
-        requestId:
-          req.requestId,
-        error,
-      }
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
     );
 
-    return res
-      .status(500)
-      .json(
-        failure(
-          "auth_failed"
-        )
-      );
-  }
-}
-
-app.use(
-  authenticate
-);
-
-/* =========================================================
-   SITE CONTEXT
-========================================================= */
-
-app.use(
-  (req, res, next) => {
-    if (
-      isPublicRoute(req)
-    ) {
-      return next();
-    }
-
-    if (
-      isAdminRoute(req)
-    ) {
-      return next();
-    }
-
-    if (
-      !req.site?.site_id
-    ) {
-      return res
-        .status(401)
-        .json(
-          failure(
-            "invalid_site_context"
-          )
-        );
-    }
-
-    next();
-  }
-);
-
-app.use(
-  haltOnTimeout
-);
-
-/* =========================================================
-   ROOT
-========================================================= */
-
-app.get(
-  "/",
-  (req, res) => {
-    return res.json(
-      success({
-        service:
-          "REDEN API",
-
-        status:
-          "operational",
-
-        redis:
-          Boolean(redis),
-      })
-    );
-  }
-);
-
-/* =========================================================
-   HEALTH
-========================================================= */
-
-app.get(
-  "/health",
-  async (req, res) => {
-    let database =
-      "healthy";
-
-    try {
-      await db.query(
-        "SELECT 1"
-      );
-    } catch {
-      database =
-        "unhealthy";
-    }
-
-    const payload =
-      success({
-        uptime:
-          process.uptime(),
-
-        database,
-
-        redis:
-          Boolean(redis),
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
       });
-
-    if (
-      database !==
-      "healthy"
-    ) {
-      return res
-        .status(503)
-        .json(payload);
     }
 
-    return res.json(
-      payload
-    );
-  }
-);
-
-/* =========================================================
-   ONBOARD
-========================================================= */
-
-app.post(
-  "/api/v1/onboard",
-  async (req, res) => {
-    let client;
-
-    try {
-      if (
-        !req.isAdminRoute
-      ) {
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
-      const name =
-        normalizeString(
-          req.body?.name,
-          255
-        );
-
-      const ownerEmail =
-        normalizeEmail(
-          req.body?.owner_email
-        );
-
-      if (
-        !name ||
-        !ownerEmail
-      ) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "missing_or_invalid_fields",
-              {
-                required: [
-                  "name",
-                  "owner_email",
-                ],
-              }
-            )
-          );
-      }
-
-      client =
-        await db.connect();
-
-      await client.query(
-        "BEGIN"
-      );
-
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
       await client.query(
         `
-          SELECT
-            pg_advisory_xact_lock(
-              hashtext($1)
-            )
-        `,
-        [
-          `reden:onboard:${ownerEmail}:${name.toLowerCase()}`,
-        ]
-      );
-
-      const existing =
-        await client.query(
-          `
-            SELECT
-              site_id,
-              api_key,
-              name,
-              owner_email,
-              active,
-              plan,
-              subscription_status,
-              created_at
-            FROM sites
-            WHERE LOWER(owner_email) = $1
-              AND LOWER(name) = $2
-            LIMIT 1
-          `,
-          [
-            ownerEmail,
-            name.toLowerCase(),
-          ]
-        );
-
-      if (
-        existing.rowCount
-      ) {
-        const site =
-          existing.rows[0];
-
-        await client.query(
-          "COMMIT"
-        );
-
-        client.release();
-        client = null;
-
-        return res
-          .status(200)
-          .json(
-            success({
-              existing:
-                true,
-
-              siteId:
-                site.site_id,
-
-              apiKey:
-                site.api_key,
-
-              name:
-                site.name,
-
-              plan:
-                site.plan,
-
-              subscriptionStatus:
-                site.subscription_status,
-
-              active:
-                site.active,
-            })
-          );
-      }
-
-      const siteId =
-        `site_${crypto
-          .randomBytes(8)
-          .toString("hex")}`;
-
-      const apiKey =
-        `rd_${crypto
-          .randomBytes(24)
-          .toString("hex")}`;
-
-      await client.query(
-        `
-          INSERT INTO sites (
+          INSERT INTO recovery_queue (
             site_id,
-            api_key,
-            name,
-            owner_email,
-            active,
-            plan,
-            subscription_status
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
           )
           VALUES (
             $1,
             $2,
             $3,
-            $4,
-            true,
-            'basic',
-            'active'
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
           )
         `,
-        [
-          siteId,
-          apiKey,
-          name,
-          ownerEmail,
-        ]
+        [siteId, sessionId, customerEmail || null]
       );
-
-      await client.query(
-        "COMMIT"
-      );
-
-      client.release();
-      client = null;
-
-      console.log(
-        `[ONBOARD] Created ${siteId} for ${ownerEmail}`
-      );
-
-      return res
-        .status(201)
-        .json(
-          success({
-            existing:
-              false,
-
-            siteId,
-
-            apiKey,
-
-            name,
-
-            plan:
-              "basic",
-
-            subscriptionStatus:
-              "active",
-          })
-        );
-    } catch (error) {
-      try {
-        if (client) {
-          await client.query(
-            "ROLLBACK"
-          );
-        }
-      } catch {}
-
-      console.error(
-        "[ONBOARD ERROR]",
-        error
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "onboard_failed"
-          )
-        );
-    } finally {
-      if (client) {
-        client.release();
-      }
     }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
   }
-);
-
-/* =========================================================
-   INSTALLATION LOOKUP
-========================================================= */
-
-app.get(
-  "/api/v1/installation",
-  async (req, res) => {
-    try {
-      if (
-        !req.isAdminRoute
-      ) {
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
-      const ownerEmail =
-        normalizeEmail(
-          req.query?.owner_email
-        );
-
-      if (!ownerEmail) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "owner_email_required"
-            )
-          );
-      }
-
-      const result =
-        await db.query(
-          `
-            SELECT
-              site_id,
-              name,
-              active,
-              plan,
-              subscription_status,
-              created_at
-            FROM sites
-            WHERE LOWER(owner_email) = $1
-            ORDER BY created_at DESC
-            LIMIT 1
-          `,
-          [
-            ownerEmail,
-          ]
-        );
-
-      if (
-        !result.rowCount
-      ) {
-        return res
-          .status(404)
-          .json(
-            failure(
-              "installation_not_found"
-            )
-          );
-      }
-
-      const site =
-        result.rows[0];
-
-      return res.json(
-        success({
-          installation: {
-            site_id:
-              site.site_id,
-
-            store_name:
-              site.name,
-
-            status:
-              site.active
-                ? "active"
-                : "inactive",
-
-            active:
-              site.active,
-
-            plan:
-              site.plan,
-
-            subscription_status:
-              site.subscription_status,
-
-            created_at:
-              site.created_at,
-          },
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[INSTALLATION LOOKUP ERROR]",
-        error
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "installation_lookup_failed"
-          )
-        );
-    }
-  }
-);
-
-/* =========================================================
-   INSTALLATION VERIFICATION
-========================================================= */
-
-app.get(
-  "/api/v1/verify",
-  async (req, res) => {
-    try {
-      const siteId =
-        normalizeString(
-          req.query?.siteId,
-          100
-        );
-
-      if (!siteId) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "site_id_required"
-            )
-          );
-      }
-
-      const result =
-        await db.query(
-          `
-            SELECT
-              site_id,
-              name,
-              active,
-              plan,
-              subscription_status,
-              created_at
-            FROM sites
-            WHERE site_id = $1
-            LIMIT 1
-          `,
-          [
-            siteId,
-          ]
-        );
-
-      if (
-        !result.rowCount
-      ) {
-        return res
-          .status(404)
-          .json(
-            failure(
-              "installation_not_found"
-            )
-          );
-      }
-
-      const site =
-        result.rows[0];
-
-      let lastEventAt =
-        null;
-
-      try {
-        const eventResult =
-          await db.query(
-            `
-              SELECT
-                created_at
-              FROM event_logs
-              WHERE site_id = $1
-              ORDER BY created_at DESC
-              LIMIT 1
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        if (
-          eventResult.rowCount
-        ) {
-          lastEventAt =
-            eventResult.rows[0]
-              .created_at;
-        }
-      } catch (error) {
-        console.warn(
-          "[VERIFY] Could not read last event:",
-          error.message
-        );
-      }
-
-      return res.json(
-        success({
-          siteId:
-            site.site_id,
-
-          name:
-            site.name,
-
-          active:
-            site.active,
-
-          plan:
-            site.plan,
-
-          subscriptionStatus:
-            site.subscription_status,
-
-          connected:
-            Boolean(
-              lastEventAt
-            ),
-
-          lastEventAt,
-
-          createdAt:
-            site.created_at,
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[VERIFY ERROR]",
-        error
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "verification_failed"
-          )
-        );
-    }
-  }
-);
-/* =========================================================
-   REDEN INTEGRATION HEALTH
-========================================================= */
-
-app.get(
-  "/api/v1/integration-health",
-  async (req, res) => {
-    try {
-      /*
-       * authenticate() already validated:
-       * - x-api-key
-       * - x-site-id
-       * - active site
-       *
-       * and populated req.site.
-       */
-      const siteId =
-        req.site?.site_id;
-
-      if (!siteId) {
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized"
-            )
-          );
-      }
-
-      /*
-       * Check the last 30 days.
-       *
-       * Integration status should not reset every day.
-       */
-      const result =
-        await db.query(
-          `
-            SELECT
-              event,
-              COUNT(*)::int AS count
-            FROM event_logs
-            WHERE site_id = $1
-              AND created_at >= NOW() - INTERVAL '30 days'
-              AND event IN (
-                'PAGE_VIEW',
-                'PRODUCT_VIEW',
-                'ADD_TO_CART',
-                'CHECKOUT_STARTED',
-                'PURCHASE',
-                'SESSION_END'
-              )
-            GROUP BY event
-          `,
-          [
-            siteId,
-          ]
-        );
-
-      const received =
-        new Set(
-          result.rows.map(
-            (row) =>
-              String(
-                row.event
-              ).toUpperCase()
-          )
-        );
-
-      const events = {
-        PAGE_VIEW:
-          received.has(
-            "PAGE_VIEW"
-          ),
-
-        PRODUCT_VIEW:
-          received.has(
-            "PRODUCT_VIEW"
-          ),
-
-        ADD_TO_CART:
-          received.has(
-            "ADD_TO_CART"
-          ),
-
-        CHECKOUT_STARTED:
-          received.has(
-            "CHECKOUT_STARTED"
-          ),
-
-        PURCHASE:
-          received.has(
-            "PURCHASE"
-          ),
-
-        SESSION_END:
-          received.has(
-            "SESSION_END"
-          ),
-      };
-
-      const sdkInstalled =
-        events.PAGE_VIEW;
-
-      const businessEventsComplete =
-        events.PRODUCT_VIEW &&
-        events.ADD_TO_CART &&
-        events.CHECKOUT_STARTED &&
-        events.PURCHASE;
-
-      return res.json(
-        success({
-          siteId,
-          name:
-            req.site.name || null,
-
-          sdkInstalled,
-
-          businessEventsComplete,
-
-          events,
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[INTEGRATION HEALTH ERROR]",
-        error
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "integration_health_failed"
-          )
-        );
-    }
-  }
-);
-/* =========================================================
-   REDEN INTELLIGENCE
-========================================================= */
-
-app.post(
-  "/api/v1/intelligence",
-  async (req, res) => {
-    try {
-      if (
-        !req.isAdminRoute
-      ) {
-        return res
-          .status(401)
-          .json(
-            failure(
-              "unauthorized_internal_access"
-            )
-          );
-      }
-
-      const siteId =
-        normalizeString(
-          req.body?.siteId,
-          100
-        );
-
-      const question =
-        normalizeString(
-          req.body?.question,
-          2000
-        );
-
-      if (!siteId) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "site_id_required"
-            )
-          );
-      }
-
-      if (!question) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "question_required"
-            )
-          );
-      }
-
-      /* -----------------------------------------------------
-         SITE
-      ----------------------------------------------------- */
-
-      const siteResult =
-        await db.query(
-          `
-            SELECT
-              site_id,
-              name,
-              owner_email,
-              active,
-              plan,
-              subscription_status
-            FROM sites
-            WHERE site_id = $1
-            LIMIT 1
-          `,
-          [
-            siteId,
-          ]
-        );
-
-      if (
-        !siteResult.rowCount
-      ) {
-        return res
-          .status(404)
-          .json(
-            failure(
-              "installation_not_found"
-            )
-          );
-      }
-
-      const site =
-        siteResult.rows[0];
-
-      if (!site.active) {
-        return res
-          .status(403)
-          .json(
-            failure(
-              "installation_inactive"
-            )
-          );
-      }
-
-      /* -----------------------------------------------------
-         EVENT TELEMETRY
-      ----------------------------------------------------- */
-
-      let events = [];
-
-      try {
-        const result =
-          await db.query(
-            `
-              SELECT
-                event,
-                COUNT(*)::int AS count
-              FROM event_logs
-              WHERE site_id = $1
-                AND created_at >= NOW()
-                  - INTERVAL '24 hours'
-              GROUP BY event
-              ORDER BY count DESC
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        events =
-          result.rows.map(
-            (row) => ({
-              event:
-                row.event,
-
-              count:
-                Number(
-                  row.count
-                ),
-            })
-          );
-      } catch (error) {
-        console.warn(
-          "[INTELLIGENCE] event telemetry unavailable:",
-          error.message
-        );
-      }
-
-      /* -----------------------------------------------------
-         UNIQUE SESSIONS
-      ----------------------------------------------------- */
-
-      let uniqueVisitors = 0;
-
-      try {
-        const result =
-          await db.query(
-            `
-              SELECT
-                COUNT(
-                  DISTINCT session_id
-                )::int AS visitors
-              FROM event_logs
-              WHERE site_id = $1
-                AND created_at >= NOW()
-                  - INTERVAL '24 hours'
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        if (
-          result.rowCount
-        ) {
-          uniqueVisitors =
-            Number(
-              result.rows[0]
-                .visitors || 0
-            );
-        }
-      } catch (error) {
-        console.warn(
-          "[INTELLIGENCE] visitor count unavailable:",
-          error.message
-        );
-      }
-
-      /* -----------------------------------------------------
-         DECISIONS
-      ----------------------------------------------------- */
-
-      let decision = {
-        completed_decisions: 0,
-        conversions: 0,
-        revenue: 0,
-      };
-
-      try {
-        const result =
-          await db.query(
-            `
-              SELECT
-                COUNT(*)::int AS completed_decisions,
-
-                COUNT(*) FILTER (
-                  WHERE converted = true
-                )::int AS conversions,
-
-                COALESCE(
-                  SUM(revenue) FILTER (
-                    WHERE converted = true
-                  ),
-                  0
-                ) AS revenue
-
-              FROM decisions
-
-              WHERE site_id = $1
-                AND state = 'COMPLETED'
-                AND completed_at >= NOW()
-                  - INTERVAL '24 hours'
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        if (
-          result.rowCount
-        ) {
-          decision =
-            result.rows[0];
-        }
-      } catch (error) {
-        console.warn(
-          "[INTELLIGENCE] decision data unavailable:",
-          error.message
-        );
-      }
-
-      /* -----------------------------------------------------
-         PURCHASE REVENUE (session_summaries)
-
-         This is real, storefront-reported purchase revenue,
-         written by contextEngine.updateSessionContext() off
-         payload.revenue on any event (most notably PURCHASE).
-         It does NOT require the /score -> /action -> /outcome
-         chain to populate.
-
-         This is a DIFFERENT metric from decisions.revenue
-         above, which is bandit-attributed revenue -- a
-         narrower figure about decision-policy effectiveness,
-         not total merchant revenue. Both are kept: this block
-         is purely additive and does not replace the DECISIONS
-         query above.
-      ----------------------------------------------------- */
-
-      let purchaseRevenue = 0;
-
-      let purchasedSessions = 0;
-
-      try {
-        const result =
-          await db.query(
-            `
-              SELECT
-                COALESCE(
-                  SUM(revenue),
-                  0
-                ) AS total_revenue,
-
-                COUNT(*)::int AS purchased_sessions
-
-              FROM session_summaries
-
-              WHERE site_id = $1
-                AND purchased = true
-                AND updated_at >= NOW()
-                  - INTERVAL '24 hours'
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        if (
-          result.rowCount
-        ) {
-          purchaseRevenue =
-            Number(
-              result.rows[0]
-                .total_revenue || 0
-            );
-
-          purchasedSessions =
-            Number(
-              result.rows[0]
-                .purchased_sessions || 0
-            );
-        }
-      } catch (error) {
-        console.warn(
-          "[INTELLIGENCE] purchase revenue unavailable:",
-          error.message
-        );
-      }
-
-      /* -----------------------------------------------------
-         RECOVERY
-      ----------------------------------------------------- */
-
-      let recovery = {
-        total: 0,
-        pending: 0,
-        processing: 0,
-        sent: 0,
-        completed: 0,
-        failed: 0,
-      };
-
-      try {
-        const result =
-          await db.query(
-            `
-              SELECT
-                COUNT(*)::int AS total,
-
-                COUNT(*) FILTER (
-                  WHERE status = 'PENDING'
-                )::int AS pending,
-
-                COUNT(*) FILTER (
-                  WHERE status = 'PROCESSING'
-                )::int AS processing,
-
-                COUNT(*) FILTER (
-                  WHERE status = 'SENT'
-                )::int AS sent,
-
-                COUNT(*) FILTER (
-                  WHERE status = 'COMPLETED'
-                )::int AS completed,
-
-                COUNT(*) FILTER (
-                  WHERE status = 'FAILED'
-                )::int AS failed
-
-              FROM recovery_queue
-
-              WHERE site_id = $1
-                AND created_at >= NOW()
-                  - INTERVAL '24 hours'
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        if (
-          result.rowCount
-        ) {
-          const row =
-            result.rows[0];
-
-          recovery = {
-            total:
-              Number(
-                row.total || 0
-              ),
-
-            pending:
-              Number(
-                row.pending || 0
-              ),
-
-            processing:
-              Number(
-                row.processing || 0
-              ),
-
-            sent:
-              Number(
-                row.sent || 0
-              ),
-
-            completed:
-              Number(
-                row.completed || 0
-              ),
-
-            failed:
-              Number(
-                row.failed || 0
-              ),
-          };
-        }
-      } catch (error) {
-        console.warn(
-          "[INTELLIGENCE] recovery data unavailable:",
-          error.message
-        );
-      }
-
-      /* -----------------------------------------------------
-         EMAILS
-      ----------------------------------------------------- */
-
-      let emails = [];
-
-      try {
-        const result =
-          await db.query(
-            `
-              SELECT
-                email_type,
-                status,
-                COUNT(*)::int AS count
-
-              FROM email_logs
-
-              WHERE site_id = $1
-                AND created_at >= NOW()
-                  - INTERVAL '24 hours'
-
-              GROUP BY
-                email_type,
-                status
-
-              ORDER BY count DESC
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        emails =
-          result.rows.map(
-            (row) => ({
-              type:
-                row.email_type,
-
-              status:
-                row.status,
-
-              count:
-                Number(
-                  row.count
-                ),
-            })
-          );
-      } catch (error) {
-        console.warn(
-          "[INTELLIGENCE] email data unavailable:",
-          error.message
-        );
-      }
-
-      /* -----------------------------------------------------
-         BANDIT STATE
-      ----------------------------------------------------- */
-
-      let bandit = [];
-
-      try {
-        const result =
-          await db.query(
-            `
-              SELECT
-                action,
-                pulls,
-                rewards,
-
-                CASE
-                  WHEN pulls > 0
-                  THEN ROUND(
-                    (
-                      rewards::numeric /
-                      pulls::numeric
-                    ) * 100,
-                    2
-                  )
-                  ELSE 0
-                END AS conversion_rate,
-
-                updated_at
-
-              FROM bandit_state
-
-              WHERE site_id = $1
-
-              ORDER BY
-                conversion_rate DESC,
-                pulls DESC
-            `,
-            [
-              siteId,
-            ]
-          );
-
-        bandit =
-          result.rows.map(
-            (row) => ({
-              action:
-                row.action,
-
-              pulls:
-                Number(
-                  row.pulls || 0
-                ),
-
-              rewards:
-                Number(
-                  row.rewards || 0
-                ),
-
-              conversionRate:
-                Number(
-                  row.conversion_rate ||
-                    0
-                ),
-
-              updatedAt:
-                row.updated_at,
-            })
-          );
-      } catch (error) {
-        console.warn(
-          "[INTELLIGENCE] bandit data unavailable:",
-          error.message
-        );
-      }
-
-      /* -----------------------------------------------------
-         NORMALIZED METRICS
-      ----------------------------------------------------- */
-
-      const completedDecisions =
-        Number(
-          decision.completed_decisions ||
-            0
-        );
-
-      const conversions =
-        Number(
-          decision.conversions ||
-            0
-        );
-
-      const revenue =
-        Number(
-          decision.revenue ||
-            0
-        );
-
-      const conversionRate =
-        completedDecisions > 0
-          ? Number(
-              (
-                (
-                  conversions /
-                  completedDecisions
-                ) *
-                100
-              ).toFixed(2)
-            )
-          : 0;
-
-      const eventCount =
-        (eventName) =>
-          events.find(
-            (item) =>
-              item.event ===
-              eventName
-          )?.count || 0;
-
-      const pageViews =
-        eventCount(
-          "PAGE_VIEW"
-        );
-
-      const productViews =
-        eventCount(
-          "PRODUCT_VIEW"
-        );
-
-      const addToCart =
-        eventCount(
-          "ADD_TO_CART"
-        );
-
-      const checkoutStarted =
-        eventCount(
-          "CHECKOUT_STARTED"
-        );
-
-      const purchases =
-        eventCount(
-          "PURCHASE"
-        );
-
-      const checkoutGap =
-        Math.max(
-          0,
-          checkoutStarted -
-            purchases
-        );
-
-      const totalEmails =
-        emails.reduce(
-          (sum, item) =>
-            sum +
-            Number(
-              item.count || 0
-            ),
-          0
-        );
-
-      const money =
-        new Intl.NumberFormat(
-          "en-NG",
-          {
-            maximumFractionDigits:
-              2,
-          }
-        ).format(
-          revenue
-        );
-
-      const formatNumber =
-        (value) =>
-          new Intl.NumberFormat(
-            "en-NG"
-          ).format(
-            Number(
-              value || 0
-            )
-          );
-
-      /* -----------------------------------------------------
-         QUESTION
-      ----------------------------------------------------- */
-
-      const q =
-        question
-          .toLowerCase()
-          .replace(
-            /[?!.,;:]+/g,
-            " "
-          )
-          .replace(
-            /\s+/g,
-            " "
-          )
-          .trim();
-
-      const hasAny =
-        (phrases) =>
-          phrases.some(
-            (phrase) =>
-              q.includes(
-                phrase
-              )
-          );
-
-      let answer = "";
-
-      /* -----------------------------------------------------
-         IDENTITY
-      ----------------------------------------------------- */
-
-      if (
-        hasAny([
-          "what do you think i do",
-          "what do i do",
-          "what is my business",
-          "what kind of business",
-          "what business am i in",
-          "what do you know about my business",
-          "what does my business do",
-        ])
-      ) {
-        answer =
-          `Based on the activity REDEN monitors, ` +
-          `${site.name} operates as an online storefront or digital business. ` +
-          `REDEN is currently observing visitor activity, product interest, ` +
-          `cart activity, checkout behavior, purchases, decisions, ` +
-          `conversions and attributed revenue.`;
-      }
-
-      /* -----------------------------------------------------
-         REVENUE
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "how much did i earn",
-          "how much have i earned",
-          "how much money did i make",
-          "how much money have i made",
-          "how much did i make",
-          "how much have i made",
-          "what did i earn",
-          "what have i earned",
-          "what did i make",
-          "what have i made",
-          "how much revenue",
-          "what is my revenue",
-          "whats my revenue",
-          "revenue",
-          "earnings",
-          "money made",
-          "money earned",
-          "sales revenue",
-          "income",
-          "how much did we earn",
-          "how much did we make",
-          "how much have we made",
-          "how much have we earned",
-        ])
-      ) {
-        answer =
-          `Over the last 24 hours, REDEN attributes ` +
-          `${money} in revenue to completed decisions for ${site.name}. ` +
-          `There were ${formatNumber(
-            conversions
-          )} conversions from ${formatNumber(
-            completedDecisions
-          )} completed decisions.`;
-      }
-
-      /* -----------------------------------------------------
-         TRAFFIC
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "how many people entered",
-          "how many people came",
-          "how many people visited",
-          "how many visitors",
-          "how many users visited",
-          "how many users came",
-          "how many people came to my site",
-          "how many people entered my site",
-          "how many people visited my site",
-          "how many visitors did i get",
-          "how many visitors do i have",
-          "how many visitors came",
-          "how many people viewed my site",
-          "how many people saw my site",
-          "how much traffic",
-          "what is my traffic",
-          "whats my traffic",
-          "site traffic",
-          "visitors",
-          "visitor count",
-          "people on my site",
-          "people visited",
-          "traffic",
-        ])
-      ) {
-        answer =
-          `Over the last 24 hours, REDEN recorded approximately ` +
-          `${formatNumber(
-            uniqueVisitors
-          )} unique sessions on ${site.name}. ` +
-          `There were ${formatNumber(
-            pageViews
-          )} page views, ${formatNumber(
-            productViews
-          )} product views, ${formatNumber(
-            addToCart
-          )} add-to-cart events, ${formatNumber(
-            checkoutStarted
-          )} checkout starts, and ${formatNumber(
-            purchases
-          )} purchase events.`;
-      }
-
-      /* -----------------------------------------------------
-         PURCHASES
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "did anyone buy",
-          "did anybody buy",
-          "did someone buy",
-          "did anyone purchase",
-          "did anybody purchase",
-          "how many people bought",
-          "how many people purchased",
-          "how many purchases",
-          "how many orders",
-          "how many sales did i make",
-          "how many sales did we make",
-          "how many customers bought",
-          "how many customers purchased",
-          "did i make any sales",
-          "did we make any sales",
-          "any sales",
-          "any purchases",
-          "any orders",
-          "people bought",
-          "customers bought",
-          "purchases",
-        ])
-      ) {
-        answer =
-          `REDEN recorded ${formatNumber(
-            purchases
-          )} purchase events over the last 24 hours. ` +
-          `There were ${formatNumber(
-            conversions
-          )} conversions attributed to completed REDEN decisions.`;
-      }
-
-      /* -----------------------------------------------------
-         CONVERSION
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "conversion rate",
-          "convert",
-          "converted",
-          "conversions",
-          "how many converted",
-          "how many customers converted",
-          "how many people converted",
-          "are people converting",
-          "did people convert",
-          "conversion",
-        ])
-      ) {
-        answer =
-          `REDEN recorded ${formatNumber(
-            conversions
-          )} conversions from ${formatNumber(
-            completedDecisions
-          )} completed decisions over the last 24 hours. ` +
-          `The decision conversion rate is ${conversionRate}%. ` +
-          `Attributed revenue is ${money}.`;
-      }
-
-      /* -----------------------------------------------------
-         SALES
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "how are sales",
-          "how is sales",
-          "how are my sales",
-          "how is my sales",
-          "sales doing",
-          "how is business",
-          "how's business",
-          "how is the business",
-          "how is my business",
-          "business doing",
-          "are sales good",
-          "sales performance",
-          "sales",
-        ])
-      ) {
-        answer =
-          `Over the last 24 hours, ${site.name} recorded ` +
-          `${formatNumber(
-            purchases
-          )} purchases, ${formatNumber(
-            conversions
-          )} REDEN-attributed conversions, and ` +
-          `${money} in attributed revenue. ` +
-          `The decision conversion rate is ${conversionRate}%.`;
-      }
-
-      /* -----------------------------------------------------
-         CART / CHECKOUT
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "abandon",
-          "abandoned",
-          "abandonment",
-          "left my cart",
-          "left their cart",
-          "left the cart",
-          "lost carts",
-          "lost cart",
-          "cart abandonment",
-          "checkout abandonment",
-          "checkout",
-          "cart",
-        ])
-      ) {
-        answer =
-          `REDEN recorded ${formatNumber(
-            checkoutStarted
-          )} checkout starts and ${formatNumber(
-            purchases
-          )} purchase events over the last 24 hours. ` +
-          `The observed checkout-to-purchase event gap is ${formatNumber(
-            checkoutGap
-          )}. ` +
-          `The recovery queue currently contains ${formatNumber(
-            recovery.pending
-          )} pending, ${formatNumber(
-            recovery.processing
-          )} processing, ${formatNumber(
-            recovery.sent
-          )} sent, ${formatNumber(
-            recovery.completed
-          )} completed, and ${formatNumber(
-            recovery.failed
-          )} failed records.`;
-      }
-
-      /* -----------------------------------------------------
-         RECOVERY
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "recovery",
-          "recover",
-          "recoveries",
-          "recovered customers",
-          "recover customers",
-          "recovery emails",
-          "recovery email",
-        ])
-      ) {
-        answer =
-          `REDEN's recovery activity over the last 24 hours is ` +
-          `${formatNumber(
-            recovery.pending
-          )} pending, ${formatNumber(
-            recovery.processing
-          )} processing, ${formatNumber(
-            recovery.sent
-          )} sent, ${formatNumber(
-            recovery.completed
-          )} completed, and ${formatNumber(
-            recovery.failed
-          )} failed. ` +
-          `There are ${formatNumber(
-            recovery.total
-          )} recovery records in the period.`;
-      }
-
-      /* -----------------------------------------------------
-         EMAIL
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "email",
-          "emails",
-          "mail",
-          "email activity",
-          "email performance",
-        ])
-      ) {
-        answer =
-          `REDEN recorded ${formatNumber(
-            totalEmails
-          )} email operations over the last 24 hours.`;
-      }
-
-      /* -----------------------------------------------------
-         PRODUCT INTEREST
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "product views",
-          "products viewed",
-          "people viewing products",
-          "people viewed products",
-          "product interest",
-          "interested in products",
-          "product activity",
-        ])
-      ) {
-        answer =
-          `REDEN recorded ${formatNumber(
-            productViews
-          )} product views over the last 24 hours. ` +
-          `There were also ${formatNumber(
-            addToCart
-          )} add-to-cart events and ${formatNumber(
-            purchases
-          )} purchase events.`;
-      }
-
-      /* -----------------------------------------------------
-         BANDIT / DECISION PERFORMANCE
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "which incentive works",
-          "which discount works",
-          "best incentive",
-          "best discount",
-          "best action",
-          "which action works",
-          "optimization",
-          "optimizer",
-          "bandit",
-          "decision performance",
-        ])
-      ) {
-        if (!bandit.length) {
-          answer =
-            `REDEN does not have enough decision-learning data for ${site.name} yet.`;
-        } else {
-          const best =
-            bandit[0];
-
-          answer =
-            `REDEN's current leading action for ${site.name} is ` +
-            `${best.action}, with a ${best.conversionRate}% observed conversion rate ` +
-            `across ${formatNumber(
-              best.pulls
-            )} recorded outcomes. ` +
-            `REDEN continues testing the other actions so the decision policy can adapt from real outcomes.`;
-        }
-      }
-
-      /* -----------------------------------------------------
-         OVERVIEW
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "performance",
-          "how am i doing",
-          "how are we doing",
-          "how is everything",
-          "what is happening",
-          "what happened",
-          "what's happening",
-          "whats happening",
-          "give me an overview",
-          "give me a summary",
-          "summary",
-          "overview",
-          "today",
-          "store doing",
-          "store performance",
-          "business performance",
-        ])
-      ) {
-        answer =
-          `For ${site.name}, over the last 24 hours, REDEN recorded ` +
-          `${formatNumber(
-            completedDecisions
-          )} completed decisions, ${formatNumber(
-            conversions
-          )} conversions, and ${money} in attributed revenue. ` +
-          `The decision conversion rate is ${conversionRate}%. ` +
-          `Storefront activity includes ${formatNumber(
-            uniqueVisitors
-          )} unique sessions, ${formatNumber(
-            pageViews
-          )} page views, ${formatNumber(
-            productViews
-          )} product views, ${formatNumber(
-            addToCart
-          )} add-to-cart events, ${formatNumber(
-            checkoutStarted
-          )} checkout starts, and ${formatNumber(
-            purchases
-          )} purchase events.`;
-      }
-
-      /* -----------------------------------------------------
-         FUNNEL
-      ----------------------------------------------------- */
-
-      else if (
-        hasAny([
-          "funnel",
-          "customer journey",
-          "journey",
-          "where are customers dropping",
-          "where are people dropping",
-          "where do people drop",
-          "where do customers drop",
-        ])
-      ) {
-        answer =
-          `The current 24-hour event funnel for ${site.name} is ` +
-          `${formatNumber(
-            pageViews
-          )} page views → ${formatNumber(
-            productViews
-          )} product views → ${formatNumber(
-            addToCart
-          )} add-to-cart events → ${formatNumber(
-            checkoutStarted
-          )} checkout starts → ${formatNumber(
-            purchases
-          )} purchase events.`;
-      }
-
-      /* -----------------------------------------------------
-         FALLBACK
-      ----------------------------------------------------- */
-
-      else {
-        answer =
-          `REDEN is monitoring ${site.name}. ` +
-          `Over the last 24 hours there were ${formatNumber(
-            uniqueVisitors
-          )} unique sessions, ${formatNumber(
-            pageViews
-          )} page views, ${formatNumber(
-            productViews
-          )} product views, ${formatNumber(
-            addToCart
-          )} add-to-cart events, ${formatNumber(
-            checkoutStarted
-          )} checkout starts, ${formatNumber(
-            purchases
-          )} purchase events, ${formatNumber(
-            conversions
-          )} conversions, and ${money} in attributed revenue.`;
-      }
-
-      return res.json(
-        success({
-          answer,
-
-          site: {
-            siteId:
-              site.site_id,
-
-            name:
-              site.name,
-
-            plan:
-              site.plan,
-
-            subscriptionStatus:
-              site.subscription_status,
-          },
-
-          evidence: {
-            period:
-              "last_24_hours",
-
-            visitors:
-              uniqueVisitors,
-
-            events,
-
-            decisions: {
-              completed:
-                completedDecisions,
-
-              conversions,
-
-              conversionRate,
-
-              revenue,
-            },
-
-            purchaseRevenue,
-
-            purchasedSessions,
-
-            recovery,
-
-            emails,
-
-            bandit,
-          },
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[INTELLIGENCE ERROR]",
-        {
-          requestId:
-            req.requestId,
-          error,
-        }
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "intelligence_failed"
-          )
-        );
-    }
-  }
-);
-
-/* =========================================================
-   EVENT TELEMETRY
-========================================================= */
-
-app.post(
-  "/event",
-  async (req, res) => {
-    try {
-      const {
-        session_id,
-        event,
-        payload,
-        event_id,
-      } = req.body;
-
-      const sessionId =
-        normalizeString(
-          session_id,
-          200
-        );
-
-      if (!sessionId) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "missing_session_id"
-            )
-          );
-      }
-
-      const normalizedEvent =
-        typeof event ===
-        "string"
-          ? event
-              .trim()
-              .toUpperCase()
-          : "";
-
-      if (
-        !VALID_EVENTS.has(
-          normalizedEvent
-        )
-      ) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "invalid_event"
-            )
-          );
-      }
-
-      const safeEventId =
-        normalizeString(
-          event_id,
-          200
-        ) ||
-        `evt_${crypto.randomUUID()}`;
-
-      /*
-       * IMPORTANT: the sanitized JSON string is named
-       * `safePayloadJson` here, deliberately NOT
-       * `safePayload`. `safePayload` is the module-level
-       * sanitizer function declared above (see UTILITIES).
-       * Naming a local const `safePayload` in this same
-       * block would shadow that function for the entire
-       * block (including the line above that calls it),
-       * throwing "Cannot access 'safePayload' before
-       * initialization" on every single request.
-       */
-
-      const safePayloadObject =
-        safePayload(
-          payload
-        );
-
-      const safePayloadJson =
-        safeJson(
-          safePayloadObject
-        );
-
-      const safeCart =
-        safeJson(
-          safePayloadObject.cart &&
-          typeof safePayloadObject.cart ===
-            "object"
-            ? safePayloadObject.cart
-            : {}
-        );
-
-      if (
-        Buffer.byteLength(
-          safePayloadJson,
-          "utf8"
-        ) > 50000 ||
-        Buffer.byteLength(
-          safeCart,
-          "utf8"
-        ) > 20000
-      ) {
-        return res
-          .status(413)
-          .json(
-            failure(
-              "payload_bounds_exceeded"
-            )
-          );
-      }
-
-      const clientIp =
-        req.ip || null;
-
-      /* -----------------------------------------------------
-         EVENT INSERT
-      ----------------------------------------------------- */
-
-      const insertResult =
-        await db.query(
-          `
-            INSERT INTO event_logs (
-              event_id,
-              site_id,
-              session_id,
-              event,
-              payload,
-              ip_address,
-              user_agent
-            )
-            VALUES (
-              $1,
-              $2,
-              $3,
-              $4,
-              $5,
-              $6,
-              $7
-            )
-            ON CONFLICT DO NOTHING
-          `,
-          [
-            safeEventId,
-            req.site.site_id,
-            sessionId,
-            normalizedEvent,
-            safePayloadJson,
-            clientIp,
-            req.headers[
-              "user-agent"
-            ],
-          ]
-        );
-
-      const recorded =
-        Boolean(
-          insertResult.rowCount
-        );
-
-      /* -----------------------------------------------------
-         ADAPTIVE CONTEXT
-      ----------------------------------------------------- */
-
-      if (recorded) {
-        try {
-          await updateSessionContext({
-            siteId:
-              req.site.site_id,
-
-            sessionId,
-
-            event:
-              normalizedEvent,
-
-            payload:
-              safePayloadObject,
-          });
-        } catch (error) {
-          /*
-           * Context intelligence must never
-           * break telemetry.
-           */
-          console.warn(
-            "[EVENT CONTEXT ERROR]",
-            {
-              siteId:
-                req.site.site_id,
-              event:
-                normalizedEvent,
-              message:
-                error.message,
-            }
-          );
-        }
-      }
-
-      /* -----------------------------------------------------
-         CHECKOUT RECOVERY
-      ----------------------------------------------------- */
-
-      const customerEmail =
-        normalizeEmail(
-          safePayloadObject.email
-        );
-
-      if (
-        recorded &&
-        normalizedEvent ===
-          "CHECKOUT_STARTED" &&
-        customerEmail
-      ) {
-        await db.query(
-          `
-            INSERT INTO recovery_queue (
-              site_id,
-              session_id,
-              customer_email,
-              cart_data,
-              incentive
-            )
-            VALUES (
-              $1,
-              $2,
-              $3,
-              $4,
-              $5
-            )
-            ON CONFLICT (
-              session_id,
-              customer_email
-            )
-            DO NOTHING
-          `,
-          [
-            req.site.site_id,
-            sessionId,
-            customerEmail,
-            safeCart,
-            "10% OFF",
-          ]
-        );
-      }
-
-      return res.json(
-        success({
-          event_id:
-            safeEventId,
-
-          recorded,
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[EVENT ERROR]",
-        {
-          requestId:
-            req.requestId,
-          siteId:
-            req.site?.site_id,
-          event:
-            req.body?.event,
-          error,
-        }
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "event_failed"
-          )
-        );
-    }
-  }
-);
+});
 
 /* =========================================================
    SCORE
 ========================================================= */
 
-app.post(
-  "/score",
-  async (req, res) => {
-    try {
-      const {
-        session_id,
-        cart_id,
-        cart_value,
-        payload,
-      } = req.body;
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
 
-      const sessionId =
-        normalizeString(
-          session_id,
-          200
-        );
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
 
-      if (!sessionId) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "missing_session_id"
-            )
-          );
-      }
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
 
-      const value =
-        validateNumber(
-          cart_value
-        );
+  const behavior = safePayload(
+    req.body?.behavior
+  );
 
-      if (
-        value === null
-      ) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "invalid_cart_value"
-            )
-          );
-      }
-
-      const cartId =
-        normalizeString(
-          cart_id,
-          200
-        ) || null;
-
-      const suppliedBehavior =
-        safePayload(
-          payload
-        );
-
-      /* -----------------------------------------------------
-         READ ADAPTIVE SESSION CONTEXT
-      ----------------------------------------------------- */
-
-      let sessionContext =
-        null;
-
-      try {
-        sessionContext =
-          await getSessionContext(
-            req.site.site_id,
-            sessionId
-          );
-      } catch (error) {
-        console.warn(
-          "[SCORE CONTEXT READ ERROR]",
-          error.message
-        );
-      }
-
-      /*
-       * The context engine is now part of the
-       * decision pipeline.
-       *
-       * We preserve merchant-provided behavior while
-       * exposing the actual observed session state.
-       */
-      const behavior = {
-        ...suppliedBehavior,
-
-        session_context:
-          sessionContext || null,
-      };
-
-      /* -----------------------------------------------------
-         BANDIT DECISION
-      ----------------------------------------------------- */
-
-      const action =
-        (
-          await pickAction({
-            site_id:
-              req.site.site_id,
-
-            session_id:
-              sessionId,
-
-            cart_value:
-              value,
-
-            behavior,
-          })
-        ) ||
-        "NONE";
-
-      const discountMap = {
-        NONE: 0,
-
-        INCENTIVE_LOW: 5,
-
-        INCENTIVE_MED: 10,
-
-        INCENTIVE_HIGH: 20,
-      };
-
-      const discount =
-        discountMap[action] ??
-        0;
-
-      const discountAmount =
-        value *
-        (
-          discount / 100
-        );
-
-      const expectedValue =
-        Math.max(
-          0,
-          value -
-            discountAmount
-        );
-
-      /* -----------------------------------------------------
-         DECISION PERSISTENCE
-      ----------------------------------------------------- */
-
-      const result =
-        await db.query(
-          `
-            INSERT INTO decisions (
-              site_id,
-              session_id,
-              cart_id,
-              action,
-              discount,
-              expected_value,
-              state
-            )
-            VALUES (
-              $1,
-              $2,
-              $3,
-              $4,
-              $5,
-              $6,
-              'SCORED'
-            )
-            RETURNING
-              id,
-              site_id,
-              session_id,
-              action,
-              discount,
-              expected_value,
-              state
-          `,
-          [
-            req.site.site_id,
-            sessionId,
-            cartId,
-            action,
-            discount,
-            expectedValue,
-          ]
-        );
-
-      const decision =
-        result.rows[0];
-
-      return res.json(
-        success({
-          decision_id:
-            decision.id,
-
-          action:
-
-            decision.action,
-
-          discount:
-            Number(
-              decision.discount
-            ),
-
-          discount_amount:
-            discountAmount,
-
-          expected_value:
-            Number(
-              decision.expected_value
-            ),
-
-          state:
-            decision.state,
-
-          context:
-            sessionContext,
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[SCORE ERROR]",
-        {
-          requestId:
-            req.requestId,
-          error,
-        }
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "score_failed"
-          )
-        );
-    }
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
   }
-);
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
 
 /* =========================================================
    ACTION
 ========================================================= */
 
-app.post(
-  "/action",
-  async (req, res) => {
-    try {
-      const decisionId =
-        normalizeString(
-          String(
-            req.body?.decision_id ??
-              ""
-          ),
-          100
-        );
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
 
-      if (!decisionId) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "missing_decision_id"
-            )
-          );
-      }
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
 
-      const result =
-        await db.query(
-          `
-            UPDATE decisions
-            SET
-              state = 'ACTIONED'
-            WHERE id = $1
-              AND site_id = $2
-              AND state = 'SCORED'
-          `,
-          [
-            decisionId,
-            req.site.site_id,
-          ]
-        );
-
-      if (
-        !result.rowCount
-      ) {
-        return res
-          .status(409)
-          .json(
-            failure(
-              "invalid_decision_state"
-            )
-          );
-      }
-
-      return res.json(
-        success({
-          actioned:
-            true,
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[ACTION ERROR]",
-        {
-          requestId:
-            req.requestId,
-          error,
-        }
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "action_failed"
-          )
-        );
-    }
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
   }
-);
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
 
 /* =========================================================
    OUTCOME
 ========================================================= */
 
-app.post(
-  "/outcome",
-  async (req, res) => {
-    try {
-      const decisionId =
-        normalizeString(
-          String(
-            req.body?.decision_id ??
-              ""
-          ),
-          100
-        );
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
 
-      if (!decisionId) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "missing_decision_id"
-            )
-          );
-      }
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
 
-      const converted =
-        normalizeBoolean(
-          req.body?.converted
-        );
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
 
-      const revenueValue =
-        validateNumber(
-          req.body?.revenue
-        );
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
 
-      if (
-        revenueValue === null
-      ) {
-        return res
-          .status(400)
-          .json(
-            failure(
-              "invalid_revenue"
-            )
-          );
-      }
-
-      /* -----------------------------------------------------
-         ATOMIC DECISION COMPLETION
-      ----------------------------------------------------- */
-
-      const result =
-        await db.query(
-          `
-            UPDATE decisions
-            SET
-              state = 'COMPLETED',
-              converted = $1,
-              revenue = $2,
-              completed_at = NOW()
-            WHERE id = $3
-              AND site_id = $4
-              AND state = 'ACTIONED'
-            RETURNING
-              id,
-              site_id,
-              session_id,
-              action,
-              converted,
-              revenue,
-              completed_at
-          `,
-          [
-            converted,
-            revenueValue,
-            decisionId,
-            req.site.site_id,
-          ]
-        );
-
-      if (
-        !result.rowCount
-      ) {
-        const existing =
-          await db.query(
-            `
-              SELECT
-                id,
-                state
-              FROM decisions
-              WHERE id = $1
-                AND site_id = $2
-              LIMIT 1
-            `,
-            [
-              decisionId,
-              req.site.site_id,
-            ]
-          );
-
-        if (
-          !existing.rowCount
-        ) {
-          return res
-            .status(404)
-            .json(
-              failure(
-                "not_found"
-              )
-            );
-        }
-
-        return res
-          .status(409)
-          .json(
-            failure(
-              "invalid_decision_state"
-            )
-          );
-      }
-
-      const completedDecision =
-        result.rows[0];
-
-      /* -----------------------------------------------------
-         BANDIT LEARNING
-      ----------------------------------------------------- */
-
-      await updateBandit(
-        req.site.site_id,
-        completedDecision.action,
-        completedDecision.converted
-      );
-
-      /* -----------------------------------------------------
-         ADAPTIVE SESSION CONTEXT
-      ----------------------------------------------------- */
-
-      /*
-       * If the merchant sends PURCHASE through the event
-       * pipeline, the context engine will already receive it.
-       *
-       * The outcome endpoint itself still updates the
-       * decision system independently.
-       */
-
-      return res.json(
-        success({
-          updated:
-            true,
-
-          decision: {
-            id:
-              completedDecision.id,
-
-            action:
-              completedDecision.action,
-
-            converted:
-              Boolean(
-                completedDecision.converted
-              ),
-
-            revenue:
-              Number(
-                completedDecision.revenue ||
-                  0
-              ),
-
-            completedAt:
-              completedDecision.completed_at,
-          },
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[OUTCOME ERROR]",
-        {
-          requestId:
-            req.requestId,
-          error,
-        }
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "outcome_failed"
-          )
-        );
-    }
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
   }
-);
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
 
 /* =========================================================
    METRICS
 ========================================================= */
 
-app.get(
-  "/metrics",
-  async (req, res) => {
-    try {
-      const result =
-        await db.query(
-          `
-            SELECT
-              COUNT(*)::int AS total,
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
 
-              COUNT(*) FILTER (
-                WHERE converted = true
-              )::int AS conversions,
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
 
-              COALESCE(
-                SUM(revenue) FILTER (
-                  WHERE converted = true
-                ),
-                0
-              ) AS revenue
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
 
-            FROM decisions
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
 
-            WHERE site_id = $1
-              AND state = 'COMPLETED'
-          `,
-          [
-            req.site.site_id,
-          ]
-        );
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
 
-      const row =
-        result.rows[0];
+    const row = result.rows[0];
 
-      return res.json(
-        success({
-          total:
-            Number(
-              row.total || 0
-            ),
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(
+        row.conversions || 0
+      ),
+      revenue: Number(row.revenue || 0),
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
 
-          conversions:
-            Number(
-              row.conversions || 0
-            ),
-
-          revenue:
-            Number(
-              row.revenue || 0
-            ),
-        })
-      );
-    } catch (error) {
-      console.error(
-        "[METRICS ERROR]",
-        {
-          requestId:
-            req.requestId,
-          error,
-        }
-      );
-
-      return res
-        .status(500)
-        .json(
-          failure(
-            "metrics_failed"
-          )
-        );
-    }
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
   }
-);
+});
 
 /* =========================================================
    RECOVERY CRON
@@ -3910,231 +2324,197 @@ app.get(
 cron.schedule(
   "*/15 * * * *",
   async () => {
-    if (
-      !db ||
-      typeof db.connect !==
-        "function"
-    ) {
-      return;
-    }
-
-    let client;
+    const client = await db.connect();
 
     try {
-      /* -----------------------------------------------------
-         RESET STALE PROCESSING JOBS
-      ----------------------------------------------------- */
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
 
-      await db.query(
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
         `
-          UPDATE recovery_queue
-          SET
-            status = 'PENDING'
-          WHERE status = 'PROCESSING'
-            AND created_at <
-              NOW() - INTERVAL '30 minutes'
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
         `
       );
 
-      /* -----------------------------------------------------
-         CLAIM BATCH
-      ----------------------------------------------------- */
-
-      client =
-        await db.connect();
-
-      await client.query(
-        "BEGIN"
-      );
-
-      const batch =
+      for (const job of jobs.rows) {
         await client.query(
           `
             UPDATE recovery_queue
             SET
-              status = 'PROCESSING'
-            WHERE id IN (
-              SELECT id
-              FROM recovery_queue
-              WHERE status = 'PENDING'
-                AND created_at >= NOW()
-                  - INTERVAL '7 days'
-              ORDER BY created_at ASC
-              FOR UPDATE SKIP LOCKED
-              LIMIT 20
-            )
-            RETURNING *
-          `
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
         );
+      }
 
-      await client.query(
-        "COMMIT"
-      );
+      await client.query("COMMIT");
 
-      /* -----------------------------------------------------
-         PROCESS CLAIMED JOBS
-      ----------------------------------------------------- */
-
-      for (
-        const item of
-          batch.rows
-      ) {
+      for (const job of jobs.rows) {
         try {
-          /* -----------------------------------------------
-             CHECK EXISTING CONVERSION
-          ----------------------------------------------- */
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
 
-          const conversionCheck =
-            await db.query(
-              `
-                SELECT
-                  id
-                FROM decisions
-                WHERE site_id = $1
-                  AND session_id = $2
-                  AND converted = true
-                  AND state = 'COMPLETED'
-                LIMIT 1
-              `,
-              [
-                item.site_id,
-                item.session_id,
-              ]
-            );
-
-          if (
-            conversionCheck.rowCount
-          ) {
+          if (converted.rowCount) {
             await db.query(
               `
                 UPDATE recovery_queue
                 SET
                   status = 'COMPLETED',
-                  processed_at = NOW()
+                  updated_at = NOW()
                 WHERE id = $1
-                  AND status = 'PROCESSING'
               `,
-              [
-                item.id,
-              ]
+              [job.id]
             );
 
             continue;
           }
 
-          /* -----------------------------------------------
-             SEND RECOVERY EMAIL
-          ----------------------------------------------- */
-
-          await sendRecoveryEmail({
-            to:
-              item.customer_email,
-
-            incentive:
-              item.incentive,
-
-            cart:
-              item.cart_data,
-          });
-
-          /* -----------------------------------------------
-             MARK SENT
-          ----------------------------------------------- */
-
-          const sentResult =
-            await db.query(
-              `
-                UPDATE recovery_queue
-                SET
-                  status = 'SENT',
-                  processed_at = NOW()
-                WHERE id = $1
-                  AND status = 'PROCESSING'
-              `,
-              [
-                item.id,
-              ]
-            );
-
-          if (
-            !sentResult.rowCount
-          ) {
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
             console.warn(
-              `[RECOVERY] Job ${item.id} was no longer PROCESSING after email send.`
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
             );
 
-            continue;
-          }
-
-          /* -----------------------------------------------
-             EMAIL LOG
-          ----------------------------------------------- */
-
-          await db.query(
-            `
-              INSERT INTO email_logs (
-                site_id,
-                email_type,
-                recipient,
-                subject,
-                status
-              )
-              VALUES (
-                $1,
-                'RECOVERY',
-                $2,
-                'Complete your checkout',
-                'SENT'
-              )
-            `,
-            [
-              item.site_id,
-              item.customer_email,
-            ]
-          );
-        } catch (error) {
-          console.error(
-            "[RECOVERY EMAIL ERROR]",
-            {
-              recoveryId:
-                item.id,
-              siteId:
-                item.site_id,
-              error,
-            }
-          );
-
-          try {
             await db.query(
               `
                 UPDATE recovery_queue
                 SET
                   status = 'FAILED',
-                  processed_at = NOW()
+                  updated_at = NOW()
                 WHERE id = $1
-                  AND status = 'PROCESSING'
               `,
-              [
-                item.id,
-              ]
+              [job.id]
             );
-          } catch (
-            updateError
-          ) {
-            console.error(
-              "[RECOVERY STATUS UPDATE ERROR]",
-              updateError
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
             );
           }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
         }
       }
     } catch (error) {
       try {
-        if (client) {
-          await client.query(
-            "ROLLBACK"
-          );
-        }
+        await client.query("ROLLBACK");
       } catch {}
 
       console.error(
@@ -4142,10 +2522,11 @@ cron.schedule(
         error
       );
     } finally {
-      if (client) {
-        client.release();
-      }
+      client.release();
     }
+  },
+  {
+    timezone: "UTC",
   }
 );
 
@@ -4156,177 +2537,122 @@ cron.schedule(
 cron.schedule(
   "0 8 * * *",
   async () => {
-    let lockClient;
+    const client = await db.connect();
 
     try {
-      lockClient =
-        await db.connect();
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
 
-      const lockResult =
-        await lockClient.query(
-          `
-            SELECT
-              pg_try_advisory_lock(
-                hashtext(
-                  'reden:cron:daily_report'
-                )
-              ) AS acquired
-          `
-        );
-
-      const acquired =
-        Boolean(
-          lockResult.rows[0]
-            ?.acquired
-        );
-
-      if (!acquired) {
-        lockClient.release();
-        lockClient = null;
-
+      if (!lockResult.rows[0]?.locked) {
         return;
       }
 
-      const merchants =
-        await lockClient.query(
-          `
-            SELECT
-              site_id,
-              name,
-              owner_email,
-              active
-            FROM sites
-            WHERE active = true
-          `
-        );
-
-      for (
-        const merchant of
-          merchants.rows
-      ) {
-        if (
-          !merchant.owner_email
-        ) {
-          continue;
-        }
-
-        try {
-          const stats =
-            await lockClient.query(
-              `
-                SELECT
-                  COUNT(*)::int AS total,
-
-                  COUNT(*) FILTER (
-                    WHERE converted = true
-                  )::int AS conversions,
-
-                  COALESCE(
-                    SUM(revenue) FILTER (
-                      WHERE converted = true
-                    ),
-                    0
-                  ) AS revenue
-
-                FROM decisions
-
-                WHERE site_id = $1
-                  AND state = 'COMPLETED'
-                  AND completed_at >= NOW()
-                    - INTERVAL '1 day'
-              `,
-              [
-                merchant.site_id,
-              ]
-            );
-
-          const metrics =
-            stats.rows[0];
-
-          await sendDailyReport({
-            to:
-              merchant.owner_email,
-
-            merchantName:
-              merchant.name,
-
-            metrics: {
-              total:
-                Number(
-                  metrics.total ||
-                    0
-                ),
-
-              conversions:
-                Number(
-                  metrics.conversions ||
-                    0
-                ),
-
-              revenue:
-                Number(
-                  metrics.revenue ||
-                    0
-                ),
-            },
-          });
-
-          await lockClient.query(
-            `
-              INSERT INTO email_logs (
-                site_id,
-                email_type,
-                recipient,
-                subject,
-                status
-              )
-              VALUES (
-                $1,
-                'DAILY_REPORT',
-                $2,
-                'Daily REDEN API Performance Report',
-                'SENT'
-              )
-            `,
-            [
-              merchant.site_id,
-              merchant.owner_email,
-            ]
-          );
-        } catch (merchantError) {
-          console.error(
-            `[DAILY REPORT] Failed for site ${merchant.site_id}:`,
-            merchantError
-          );
-        }
-      }
-
       try {
-        await lockClient.query(
-          `
-            SELECT
-              pg_advisory_unlock(
-                hashtext(
-                  'reden:cron:daily_report'
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
                 )
-              )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
           `
         );
-      } catch {}
+      }
     } catch (error) {
       console.error(
         "[DAILY REPORT CRON ERROR]",
         error
       );
     } finally {
-      if (lockClient) {
-        lockClient.release();
-      }
+      client.release();
     }
   },
   {
-    timezone:
-      "UTC",
+    timezone: "UTC",
   }
 );
 
@@ -4334,168 +2660,87 @@ cron.schedule(
    404
 ========================================================= */
 
-app.use(
-  (req, res) => {
-    return res
-      .status(404)
-      .json(
-        failure(
-          "not_found"
-        )
-      );
-  }
-);
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
 
 /* =========================================================
-   ERROR HANDLER
+   GLOBAL ERROR HANDLER
 ========================================================= */
 
-app.use(
-  (
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
     error,
-    req,
-    res,
-    next
-  ) => {
-    console.error(
-      "[UNHANDLED ERROR]",
-      {
-        requestId:
-          req.requestId,
-        error,
-      }
-    );
+  });
 
-    if (
-      res.headersSent
-    ) {
-      return next(error);
-    }
-
-    return res
-      .status(500)
-      .json(
-        failure(
-          "internal_error"
-        )
-      );
+  if (res.headersSent) {
+    return next(error);
   }
-);
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
 
 /* =========================================================
    SERVER
 ========================================================= */
 
-const server =
-  app.listen(
-    PORT,
-    () => {
-      console.log(
-        `REDEN API running on port ${PORT}`
-      );
-
-      console.log(
-        "[REDEN] Internal intelligence authentication: ENABLED"
-      );
-
-      console.log(
-        "[REDEN] Installation lookup: INTERNAL"
-      );
-
-      console.log(
-        "[REDEN] Installation verification: PUBLIC"
-      );
-
-      console.log(
-        "[REDEN] Dashboard intelligence: ENABLED"
-      );
-
-      console.log(
-        "[REDEN] Adaptive session context: ENABLED"
-      );
-
-      console.log(
-        "[REDEN] Bandit optimization: ENABLED"
-      );
-
-      console.log(
-        "[REDEN] Outcome learning: ENABLED"
-      );
-
-      console.log(
-        "[REDEN] Recovery processing: ENABLED"
-      );
-
-      console.log(
-        "[REDEN] Daily reports: ENABLED"
-      );
-
-      console.log(
-        "[REDEN] Paystack dependency: DISABLED"
-      );
-    }
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
   );
+});
 
 /* =========================================================
    GRACEFUL SHUTDOWN
 ========================================================= */
 
-let shuttingDown =
-  false;
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
 
-const shutdownHandler =
-  async (signal) => {
-    if (shuttingDown) {
-      return;
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
     }
 
-    shuttingDown =
-      true;
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
 
-    console.log(
-      `[${signal}] REDEN shutting down...`
-    );
+    process.exit(0);
+  });
 
-    server.close(
-      async () => {
-        try {
-          if (
-            db &&
-            typeof db.end ===
-              "function"
-          ) {
-            await db.end();
-          }
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
 
-          if (redis) {
-            await redis.quit();
-          }
-
-          process.exit(0);
-        } catch (error) {
-          console.error(
-            "[SHUTDOWN ERROR]",
-            error
-          );
-
-          process.exit(1);
-        }
-      }
-    );
-  };
-
-process.on(
-  "SIGINT",
-  () =>
-    shutdownHandler(
-      "SIGINT"
-    )
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
 );
 
-process.on(
-  "SIGTERM",
-  () =>
-    shutdownHandler(
-      "SIGTERM"
-    )
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
 );
