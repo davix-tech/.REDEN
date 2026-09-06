@@ -99,6 +99,32 @@ await db.query(`
 `);
 
 /*
+ * TRAFFIC ATTRIBUTION
+ *
+ * traffic_source and utm_campaign are written ONCE per
+ * session, the first time REDEN sees that session_id, and
+ * are never overwritten afterward. This is deliberate: a
+ * session that starts from a paid social ad and later
+ * triggers a direct-navigation event (e.g. a refresh) should
+ * still be attributed to the original paid social click, not
+ * relabeled as direct.
+ */
+await db.query(`
+  ALTER TABLE session_summaries
+  ADD COLUMN IF NOT EXISTS traffic_source VARCHAR(50);
+`);
+
+await db.query(`
+  ALTER TABLE session_summaries
+  ADD COLUMN IF NOT EXISTS utm_campaign VARCHAR(255);
+`);
+
+await db.query(`
+  CREATE INDEX IF NOT EXISTS idx_session_summaries_traffic_source
+  ON session_summaries (site_id, traffic_source);
+`);
+
+/*
  * IMPORTANT:
  * Do not backfill purchased_at from updated_at.
  *
@@ -265,6 +291,25 @@ function isPublicAsset(req) {
 
 function isPublicRoute(req) {
   return isPublicAsset(req) || PUBLIC_CORS_PATHS.has(req.path);
+}
+
+/*
+ * isAuthExempt is DELIBERATELY narrower than isPublicRoute.
+ *
+ * isPublicRoute controls which routes get permissive CORS
+ * headers -- /event, /score, /action, /outcome NEED this
+ * because they're called cross-origin from arbitrary merchant
+ * storefronts.
+ *
+ * isAuthExempt controls which routes SKIP authentication
+ * entirely. Those four routes must NOT skip auth -- they
+ * still require a valid x-site-id/x-api-key pair. Reusing
+ * isPublicRoute for both previously caused every tracked
+ * event to bypass auth, leaving req.site unset and crashing
+ * every handler that reads req.site.site_id.
+ */
+function isAuthExempt(req) {
+  return isPublicAsset(req) || req.path === "/api/v1/verify";
 }
 
 app.use((req, res, next) => {
@@ -476,6 +521,85 @@ function generateSiteId() {
 
 function generateApiKey() {
   return `rd_${crypto.randomBytes(24).toString("hex")}`;
+}
+
+/* =========================================================
+   TRAFFIC ATTRIBUTION HELPERS
+========================================================= */
+
+const KNOWN_SOCIAL_HOSTS = [
+  "facebook.com",
+  "instagram.com",
+  "tiktok.com",
+  "twitter.com",
+  "x.com",
+  "linkedin.com",
+  "pinterest.com",
+  "snapchat.com",
+  "youtube.com",
+];
+
+const KNOWN_SEARCH_HOSTS = [
+  "google.",
+  "bing.com",
+  "yahoo.com",
+  "duckduckgo.com",
+  "baidu.com",
+  "yandex.",
+];
+
+function extractHost(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/*
+ * classifyTrafficSource is intentionally conservative:
+ * explicit UTM params always win over referrer-guessing,
+ * because a merchant running paid campaigns has already told
+ * us the channel -- we shouldn't override that with a guess.
+ *
+ * Only PAGE_VIEW / SESSION_START payloads are expected to
+ * carry referrer/utm data (the SDK captures this once, at
+ * session start), but this function is defensive against
+ * receiving it on any event.
+ */
+function classifyTrafficSource({ referrer, utmSource, utmMedium }) {
+  const source = normalizeString(utmSource, 100).toLowerCase();
+  const medium = normalizeString(utmMedium, 100).toLowerCase();
+
+  if (source) {
+    if (medium.includes("cpc") || medium.includes("paid")) {
+      return `paid_${source}`;
+    }
+
+    return source;
+  }
+
+  const ref = normalizeString(referrer, 500);
+
+  if (!ref) {
+    return "direct";
+  }
+
+  const host = extractHost(ref);
+
+  if (!host) {
+    return "direct";
+  }
+
+  if (KNOWN_SOCIAL_HOSTS.some((h) => host.includes(h))) {
+    return "social";
+  }
+
+  if (KNOWN_SEARCH_HOSTS.some((h) => host.includes(h))) {
+    return "organic_search";
+  }
+
+  return "referral";
 }
 
 /* =========================================================
@@ -715,6 +839,14 @@ function detectIntents(question) {
     intents.push("funnel");
   }
 
+  if (
+    /\b(channel|channels|source|sources|campaign|campaigns|ads|ad spend|marketing|attribution|utm|referral|social|organic|paid)\b/.test(
+      q
+    )
+  ) {
+    intents.push("attribution");
+  }
+
   return [...new Set(intents)];
 }
 
@@ -819,6 +951,34 @@ function composeAdvice(evidence) {
     );
   }
 
+  if (
+    evidence.attribution &&
+    evidence.attribution.length >= 2
+  ) {
+    const bestByAOV = [...evidence.attribution]
+      .filter((row) => row.purchases > 0)
+      .sort((a, b) => b.avgOrderValue - a.avgOrderValue)[0];
+
+    const worstByAOV = [...evidence.attribution]
+      .filter((row) => row.purchases > 0)
+      .sort((a, b) => a.avgOrderValue - b.avgOrderValue)[0];
+
+    if (
+      bestByAOV &&
+      worstByAOV &&
+      bestByAOV.trafficSource !== worstByAOV.trafficSource &&
+      bestByAOV.avgOrderValue > 0
+    ) {
+      recommendations.push(
+        `Sessions from ${bestByAOV.trafficSource} have the highest average order value today (${bestByAOV.avgOrderValue.toFixed(
+          2
+        )}), compared to ${worstByAOV.trafficSource} (${worstByAOV.avgOrderValue.toFixed(
+          2
+        )}). This is today's data only; confirm the pattern holds over a longer period before shifting ad budget.`
+      );
+    }
+  }
+
   if (!recommendations.length) {
     return "No evidence-based intervention is required from the available signals today.";
   }
@@ -848,6 +1008,36 @@ function composeOverview(evidence) {
 
 function composeFunnel(evidence) {
   return `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
+}
+
+function composeAttribution(evidence) {
+  if (!evidence.attribution || !evidence.attribution.length) {
+    return "No sessions with attribution data were recorded today.";
+  }
+
+  const rows = [...evidence.attribution].sort(
+    (a, b) => b.sessions - a.sessions
+  );
+
+  const MIN_SAMPLE = 5;
+
+  const lines = rows.map((row) => {
+    const lowSample = row.sessions < MIN_SAMPLE;
+
+    const base = `${row.trafficSource}: ${row.sessions} session${
+      row.sessions === 1 ? "" : "s"
+    }, ${row.purchases} purchase${
+      row.purchases === 1 ? "" : "s"
+    }, ${row.revenue.toFixed(2)} revenue, ${row.avgOrderValue.toFixed(
+      2
+    )} average order value`;
+
+    return lowSample
+      ? `${base} (small sample, treat as directional only)`
+      : base;
+  });
+
+  return `Today's traffic by source: ${lines.join("; ")}.`;
 }
 
 function composeIntent(intent, evidence, site) {
@@ -894,6 +1084,9 @@ function composeIntent(intent, evidence, site) {
     case "funnel":
       return composeFunnel(evidence);
 
+    case "attribution":
+      return composeAttribution(evidence);
+
     default:
       return null;
   }
@@ -910,7 +1103,7 @@ const ADMIN_ROUTES = new Set([
 
 async function authenticate(req, res, next) {
   try {
-    if (isPublicRoute(req)) {
+    if (isAuthExempt(req)) {
       return next();
     }
 
@@ -1027,7 +1220,7 @@ app.use(authenticate);
 
 app.use((req, res, next) => {
   if (
-    isPublicRoute(req) ||
+    isAuthExempt(req) ||
     req.authType === "admin"
   ) {
     return next();
@@ -1654,6 +1847,49 @@ app.post("/api/v1/intelligence", async (req, res) => {
       };
     }
 
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await db.query(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
     const evidence = {
       period: "today",
       localDate,
@@ -1700,6 +1936,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
       emails,
 
       bandit,
+
+      attribution,
 
       eventCounts,
     };
@@ -1882,6 +2120,45 @@ app.post("/event", async (req, res) => {
     payload.email || payload.customer_email
   );
 
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
   const client = await db.connect();
 
   try {
@@ -1930,6 +2207,29 @@ app.post("/event", async (req, res) => {
         event,
         payload: sanitizedPayload,
       });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
     }
 
     /*
