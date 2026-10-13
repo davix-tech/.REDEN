@@ -254,6 +254,16 @@ async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     `);
 
+    // Older production databases may predate discount_percent. The
+    // CHECKOUT_STARTED event transaction inserts this column, and the
+    // recovery cron reads it, so migrate existing tables as well as
+    // defining it in CREATE TABLE above.
+    await client.query(`
+      ALTER TABLE recovery_queue
+      ADD COLUMN IF NOT EXISTS discount_percent NUMERIC(5,2)
+      NOT NULL DEFAULT 10
+    `);
+
     /* =====================================================
        EMAIL LOGS
 
