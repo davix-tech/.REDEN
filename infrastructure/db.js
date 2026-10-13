@@ -246,6 +246,14 @@ async function initializeDatabase() {
       )
     `);
 
+    // CREATE TABLE IF NOT EXISTS does not add columns to an
+    // existing table. Older production schemas may lack updated_at,
+    // which the recovery cron uses to recover stale PROCESSING jobs.
+    await client.query(`
+      ALTER TABLE recovery_queue
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    `);
+
     /* =====================================================
        EMAIL LOGS
 
