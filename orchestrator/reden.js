@@ -908,6 +908,36 @@ function composeAdvice(evidence) {
     }
   }
 
+  const revenueBaseline = evidence.revenueBaseline;
+  if (revenueBaseline?.status === "below_baseline") {
+    recommendations.push(
+      `Same-time recorded storefront purchase revenue is materially below its comparable baseline (${Number(revenueBaseline.currentRevenue).toFixed(2)} versus ${Number(revenueBaseline.averageRevenue).toFixed(2)} across ${revenueBaseline.daysWithComparablePurchases} eligible purchase days). Compare purchase count and average order value, and verify order/payment tracking before changing prices or ad spend.`
+    );
+  } else if (
+    revenueBaseline?.status === "purchase_tracking_unconfirmed" ||
+    revenueBaseline?.status === "purchase_summary_mismatch"
+  ) {
+    recommendations.push(
+      "Revenue comparison is currently unreliable because purchase events and purchased-session summaries are missing or inconsistent. Verify a test purchase end to end before making a performance decision."
+    );
+  }
+
+  const funnelBaseline = evidence.funnelBaseline;
+  if (funnelBaseline?.status === "below_baseline" && funnelBaseline.current) {
+    const labels = {
+      productView: "product-page discovery",
+      addToCart: "add-to-cart",
+      checkout: "checkout",
+      purchase: "purchase completion",
+    };
+    const affectedStages = funnelBaseline.lowStages
+      .map((stage) => labels[stage] || stage)
+      .join(", ");
+    recommendations.push(
+      `Recorded session-level rates are materially below the comparable baseline at these stages: ${affectedStages}. Check the affected customer journey and verify event tracking before changing offers or spending.`
+    );
+  }
+
   if (!recommendations.length) {
     return "No existing rule has identified a strong intervention from today's signals. This does not establish that performance is healthy; compare against a reliable historical baseline and verify event tracking before deciding that no action is needed.";
   }
