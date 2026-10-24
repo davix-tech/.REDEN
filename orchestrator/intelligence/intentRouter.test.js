@@ -40,3 +40,8 @@ test("routes capability questions to a focused response", () => {
   assert.deepEqual(detectIntents("What can you do?"), ["capabilities"]);
   assert.deepEqual(detectIntents("How can you help me?"), ["capabilities"]);
 });
+
+test("keeps direct earnings questions focused when they include today", () => {
+  assert.deepEqual(detectIntents("How much did I earn today?"), ["revenue"]);
+  assert.deepEqual(detectIntents("How much have I earned today?"), ["revenue"]);
+});
