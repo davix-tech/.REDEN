@@ -864,9 +864,10 @@ function composeRevenue(evidence) {
 
 function composeTraffic(evidence) {
   const baseline = evidence.trafficBaseline;
+  const visits = Number(baseline?.currentSessions ?? 0);
 
   if (!baseline || baseline.status === "insufficient_history") {
-    return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions and ${evidence.totalEvents} events. I do not yet have enough reliable historical traffic data to determine whether this is unusually low.`;
+    return `Today REDEN recorded ${visits} visits (sessions with a PAGE_VIEW event) by ${baseline?.asOfLocalTime || "the current"} site-local time. I do not yet have enough reliable historical page-view data to determine whether this is unusually low.`;
   }
 
   const comparison = baseline.averageSessions > 0
@@ -874,10 +875,10 @@ function composeTraffic(evidence) {
     : null;
 
   if (baseline.status === "below_baseline") {
-    return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions by ${baseline.asOfLocalTime} site-local time, compared with an average of ${baseline.averageSessions.toFixed(1)} sessions by the same time across ${baseline.daysWithTraffic} of the previous 7 days with recorded traffic. That is ${comparison}% of the recent baseline, so traffic is materially below its usual level at this point in the day.`;
+    return `Today REDEN recorded ${visits} visits by ${baseline.asOfLocalTime} site-local time, compared with an average of ${baseline.averageSessions.toFixed(1)} visits by the same time across ${baseline.daysWithTraffic} of the previous 7 days with recorded page views. That is ${comparison}% of the recent baseline, so recorded visits are materially below their usual level at this point in the day.`;
   }
 
-  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions and ${evidence.totalEvents} events by ${baseline.asOfLocalTime}. This is not at least 50% below the average of ${baseline.averageSessions.toFixed(1)} sessions by the same time across ${baseline.daysWithTraffic} of the previous 7 days with recorded traffic.`;
+  return `Today REDEN recorded ${visits} visits by ${baseline.asOfLocalTime}. This is not at least 50% below the average of ${baseline.averageSessions.toFixed(1)} visits by the same time across ${baseline.daysWithTraffic} of the previous 7 days with recorded page views.`;
 }
 
 function composePurchases(evidence) {
@@ -940,7 +941,7 @@ function composeAdvice(evidence) {
 
   if (trafficBaseline?.status === "below_baseline") {
     recommendations.push(
-      `Traffic is materially below its recent same-time baseline: ${evidence.uniqueSessions} sessions so far versus an average of ${trafficBaseline.averageSessions.toFixed(1)} across ${trafficBaseline.daysWithTraffic} recent days with recorded traffic. First verify that the storefront is reachable and PAGE_VIEW tracking is working. If both are healthy, inspect traffic-source delivery, campaign status, and broken or outdated links. Recheck later today before increasing ad spend.`
+      `Recorded visits are materially below their recent same-time baseline: ${trafficBaseline.currentSessions} visits so far versus an average of ${trafficBaseline.averageSessions.toFixed(1)} across ${trafficBaseline.daysWithTraffic} recent days with recorded PAGE_VIEW events. First verify that the storefront is reachable and PAGE_VIEW tracking is working. If both are healthy, inspect traffic-source delivery, campaign status, and broken or outdated links. Recheck later today before increasing ad spend.`
     );
   } else if (trafficBaseline?.status === "insufficient_history") {
     recommendations.push(
@@ -1028,7 +1029,7 @@ function composeOverview(evidence) {
   let trafficContext = "";
 
   if (baseline?.status === "below_baseline") {
-    trafficContext = ` Traffic is materially below its recent same-time baseline: ${evidence.uniqueSessions} sessions so far versus an average of ${baseline.averageSessions.toFixed(1)} across ${baseline.daysWithTraffic} of the previous 7 days with recorded traffic. I recommend first checking storefront availability and PAGE_VIEW tracking, then reviewing traffic sources and campaign status if tracking is healthy.`;
+    trafficContext = ` Recorded visits are materially below their recent same-time baseline: ${baseline.currentSessions} visits so far versus an average of ${baseline.averageSessions.toFixed(1)} across ${baseline.daysWithTraffic} of the previous 7 days with recorded PAGE_VIEW events. I recommend first checking storefront availability and PAGE_VIEW tracking, then reviewing traffic sources and campaign status if tracking is healthy.`;
   } else if (baseline?.status === "insufficient_history") {
     trafficContext = " REDEN does not yet have enough reliable historical traffic to determine whether today's visits are unusually low.";
   }
@@ -1712,6 +1713,21 @@ app.post("/api/v1/intelligence", async (req, res) => {
       sessionResult.rows[0]?.count || 0
     );
 
+    const trafficSessionResult = await db.query(
+      `
+        SELECT COUNT(DISTINCT session_id)::INTEGER AS count
+        FROM event_logs
+        WHERE site_id = $1
+          AND event = 'PAGE_VIEW'
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+    const trafficSessions = Number(
+      trafficSessionResult.rows[0]?.count || 0
+    );
+
     // Compare today's partial traffic with the same local-time cutoff
     // across the previous seven local calendar days.
     const localTimeParts = new Intl.DateTimeFormat("en-GB", {
@@ -1739,12 +1755,14 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const trafficBaseline = {
       status: "insufficient_history",
-      currentSessions: uniqueSessions,
+      currentSessions: trafficSessions,
       averageSessions: null,
       daysWithTraffic: 0,
       windowDays: 7,
       asOfLocalTime: localTime,
       comparisonThreshold: 0.5,
+      metric: "distinct_sessions_with_page_view",
+      baselineDays: [],
     };
 
     try {
@@ -1765,9 +1783,11 @@ app.post("/api/v1/intelligence", async (req, res) => {
         `
           SELECT
             (created_at AT TIME ZONE $2)::date::text AS local_date,
+            COUNT(*)::INTEGER AS page_view_events,
             COUNT(DISTINCT session_id)::INTEGER AS sessions
           FROM event_logs
           WHERE site_id = $1
+            AND event = 'PAGE_VIEW'
             AND created_at >= $3
             AND created_at < $4
             AND (created_at AT TIME ZONE $2)::time <= $5::time
@@ -1777,33 +1797,37 @@ app.post("/api/v1/intelligence", async (req, res) => {
         [siteId, timeZone, baselineStartUTC, startUTC, localTime]
       );
 
+      const recordedPageViewDays = new Set();
       for (const row of baselineResult.rows) {
-        if (baselineCounts.has(row.local_date)) {
-          baselineCounts.set(
-            row.local_date,
-            Number(row.sessions || 0)
-          );
+        if (baselineCounts.has(row.local_date) && Number(row.page_view_events) > 0) {
+          const sessions = Number(row.sessions || 0);
+          baselineCounts.set(row.local_date, sessions);
+          recordedPageViewDays.add(row.local_date);
         }
       }
 
-      const activeDayCounts = [...baselineCounts.values()].filter(
-        (count) => count > 0
-      );
-      const averageSessions = activeDayCounts.length
-        ? activeDayCounts.reduce((sum, count) => sum + count, 0) /
-          activeDayCounts.length
+      // A day without PAGE_VIEW records cannot distinguish zero real visits
+      // from broken/missing tracking, so it is excluded rather than treated
+      // as a confirmed zero-traffic day.
+      const eligibleDayCounts = [...recordedPageViewDays]
+        .map((date) => baselineCounts.get(date))
+        .filter((count) => Number.isFinite(count) && count > 0);
+      const averageSessions = eligibleDayCounts.length
+        ? eligibleDayCounts.reduce((sum, count) => sum + count, 0) /
+          eligibleDayCounts.length
         : null;
 
-      trafficBaseline.daysWithTraffic = activeDayCounts.length;
+      trafficBaseline.daysWithTraffic = eligibleDayCounts.length;
+      trafficBaseline.baselineDays = [...recordedPageViewDays].sort();
       trafficBaseline.averageSessions = averageSessions;
 
       if (
-        activeDayCounts.length >= 5 &&
+        eligibleDayCounts.length >= 5 &&
         Number.isFinite(averageSessions) &&
         averageSessions > 0
       ) {
         trafficBaseline.status =
-          uniqueSessions < averageSessions * trafficBaseline.comparisonThreshold
+          trafficBaseline.currentSessions < averageSessions * trafficBaseline.comparisonThreshold
             ? "below_baseline"
             : "not_markedly_below_baseline";
       }
