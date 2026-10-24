@@ -54,3 +54,9 @@ test("routes topic-specific decisions to knowledge-guided advice", () => {
 test("routes repeat-purchase improvement questions to knowledge-guided advice", () => {
   assert.deepEqual(detectIntents("How do I improve repeat purchases?"), ["advice"]);
 });
+
+test("routes open-ended earn-more questions to a growth plan", () => {
+  assert.deepEqual(detectIntents("How could we earn more?"), ["growth"]);
+  assert.deepEqual(detectIntents("How can we make more money?"), ["growth"]);
+  assert.deepEqual(detectIntents("How do I increase sales?"), ["growth"]);
+});
