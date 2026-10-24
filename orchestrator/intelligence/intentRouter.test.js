@@ -15,7 +15,7 @@ test("routes funnel questions to funnel analysis", () => {
 });
 
 test("routes revenue decline questions to revenue and diagnosis", () => {
-  assert.deepEqual(detectIntents("Why has revenue dropped?"), ["revenue", "diagnostic"]);
+  assert.deepEqual(detectIntents("Why has revenue dropped?"), ["diagnostic", "revenue"]);
 });
 
 test("returns no intent for an unrecognized question so the API can apply its fallback", () => {
