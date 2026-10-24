@@ -91,6 +91,15 @@ export function detectIntents(question) {
 
   const uniqueIntents = [...new Set(intents)];
 
+  // Simple earnings questions should return the requested revenue figure only.
+  // Words like "today" must not append an unrelated overview.
+  if (
+    /\\bhow much (did|have) i (make|made|earn|earned)\\b/.test(q) &&
+    !uniqueIntents.includes("diagnostic")
+  ) {
+    return ["revenue"];
+  }
+
   // A diagnostic question should receive the diagnosis first, not a generic
   // sales summary that can look like the answer to "why are sales down?".
   if (uniqueIntents.includes("diagnostic")) {
