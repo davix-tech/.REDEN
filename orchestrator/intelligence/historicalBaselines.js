@@ -1,0 +1,251 @@
+/**
+ * Historical same-time baselines for REDEN intelligence.
+ *
+ * These queries are read-only and tenant-scoped. Missing event streams are
+ * treated as unknown rather than confirmed zero activity. The baseline is
+ * advisory evidence, not a causal attribution model.
+ */
+
+const MIN_COMPARABLE_DAYS = 5;
+const LOW_BASELINE_RATIO = 0.5;
+
+function asNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function average(values) {
+  return values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null;
+}
+
+function dailyRate(day, numerator) {
+  return day.pageViewSessions > 0
+    ? day[numerator] / day.pageViewSessions
+    : null;
+}
+
+export async function loadHistoricalBaselines({
+  db,
+  siteId,
+  timeZone,
+  baselineStartUTC,
+  startUTC,
+  endUTC,
+  localDate,
+  localTime,
+}) {
+  const empty = {
+    revenueBaseline: {
+      status: "insufficient_history",
+      metric: "same_time_recorded_storefront_purchase_revenue",
+      currentRevenue: null,
+      averageRevenue: null,
+      daysWithComparablePurchases: 0,
+      windowDays: 7,
+      comparisonThreshold: LOW_BASELINE_RATIO,
+    },
+    funnelBaseline: {
+      status: "insufficient_history",
+      metric: "distinct_page_view_sessions_by_stage",
+      current: null,
+      averages: null,
+      daysWithTraffic: 0,
+      windowDays: 7,
+      comparisonThreshold: LOW_BASELINE_RATIO,
+      lowStages: [],
+    },
+  };
+
+  const eventDaysResult = await db.query(
+    `
+      WITH session_flags AS (
+        SELECT
+          (created_at AT TIME ZONE $2)::date::text AS local_date,
+          session_id,
+          BOOL_OR(event = 'PAGE_VIEW') AS page_view,
+          BOOL_OR(event = 'PRODUCT_VIEW') AS product_view,
+          BOOL_OR(event = 'ADD_TO_CART') AS add_to_cart,
+          BOOL_OR(event = 'CHECKOUT_STARTED') AS checkout_started,
+          BOOL_OR(event = 'PURCHASE') AS purchase
+        FROM event_logs
+        WHERE site_id = $1
+          AND created_at >= $3
+          AND created_at < $4
+          AND (created_at AT TIME ZONE $2)::time <= $5::time
+        GROUP BY (created_at AT TIME ZONE $2)::date, session_id
+      )
+      SELECT
+        local_date,
+        COUNT(*) FILTER (WHERE page_view AND session_id IS NOT NULL)::INTEGER AS page_view_sessions,
+        COUNT(*) FILTER (WHERE page_view AND product_view AND session_id IS NOT NULL)::INTEGER AS product_view_sessions,
+        COUNT(*) FILTER (WHERE page_view AND add_to_cart AND session_id IS NOT NULL)::INTEGER AS add_to_cart_sessions,
+        COUNT(*) FILTER (WHERE page_view AND checkout_started AND session_id IS NOT NULL)::INTEGER AS checkout_sessions,
+        COUNT(*) FILTER (WHERE page_view AND purchase AND session_id IS NOT NULL)::INTEGER AS purchase_sessions,
+        COUNT(*) FILTER (WHERE purchase AND session_id IS NOT NULL)::INTEGER AS purchase_event_sessions
+      FROM session_flags
+      GROUP BY local_date
+      ORDER BY local_date
+    `,
+    [siteId, timeZone, baselineStartUTC, endUTC, localTime]
+  );
+
+  const revenueDaysResult = await db.query(
+    `
+      SELECT
+        (purchased_at AT TIME ZONE $2)::date::text AS local_date,
+        COALESCE(SUM(revenue), 0)::NUMERIC AS revenue,
+        COUNT(*) FILTER (WHERE purchased = TRUE)::INTEGER AS purchased_sessions
+      FROM session_summaries
+      WHERE site_id = $1
+        AND purchased = TRUE
+        AND purchased_at >= $3
+        AND purchased_at < $4
+        AND (purchased_at AT TIME ZONE $2)::time <= $5::time
+      GROUP BY (purchased_at AT TIME ZONE $2)::date
+      ORDER BY local_date
+    `,
+    [siteId, timeZone, baselineStartUTC, endUTC, localTime]
+  );
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const [stage, key] of [
+    ["productView", "productViewSessions"],
+    ["addToCart", "addToCartSessions"],
+    ["checkout", "checkoutSessions"],
+    ["purchase", "purchaseSessions"],
+  ]) {
+    // A day with no recorded stage events may have broken instrumentation.
+    // Exclude it from that stage's baseline instead of assuming a true zero.
+    const observedStageDays = historicalTrafficDays.filter((day) => day[key] > 0);
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, key))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const [stage, key] of [
+    ["productView", "productViewSessions"],
+    ["addToCart", "addToCartSessions"],
+    ["checkout", "checkoutSessions"],
+    ["purchase", "purchaseSessions"],
+  ]) {
+    currentRates[stage] = dailyRate(current, key);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+  };
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[{
+          productView: "productViewSessions",
+          addToCart: "addToCartSessions",
+          checkout: "checkoutSessions",
+          purchase: "purchaseSessions",
+        }[stage]];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
