@@ -20,6 +20,7 @@ import {
   sendRecoveryEmail,
   sendDailyReport,
 } from "./notification/emailEngine.js";
+import { diagnoseSales } from "./intelligence/diagnostics.js";
 
 dotenv.config();
 
@@ -785,6 +786,14 @@ function detectIntents(question) {
     intents.push("sales");
   }
 
+  // "Why are sales down?" is a diagnostic request, not just a sales-count query.
+  if (
+    /\b(why|cause|reason|what changed|down|declin\w*|drop\w*|fall\w*|decreas\w*|less)\b/.test(q) &&
+    /\b(sales|revenue|income|purchase|purchases|orders|conversion|turnover)\b/.test(q)
+  ) {
+    intents.push("diagnostic");
+  }
+
   if (
     /\b(cart|checkout|checkouts|basket|abandon)\b/.test(q)
   ) {
@@ -1011,7 +1020,7 @@ function composeAdvice(evidence) {
   }
 
   if (!recommendations.length) {
-    return "No evidence-based intervention is required from the available signals today.";
+    return "No existing rule has identified a strong intervention from today's signals. This does not establish that performance is healthy; compare against a reliable historical baseline and verify event tracking before deciding that no action is needed.";
   }
 
   return recommendations.join(" ");
@@ -1099,6 +1108,9 @@ function composeIntent(intent, evidence, site) {
 
     case "sales":
       return composeSales(evidence);
+
+    case "diagnostic":
+      return diagnoseSales(evidence);
 
     case "cart":
       return composeCart(evidence);
