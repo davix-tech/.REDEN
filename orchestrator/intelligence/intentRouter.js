@@ -109,7 +109,7 @@ export function detectIntents(question) {
   // not a competing raw metric section such as bandit state.
   if (
     uniqueIntents.includes("advice") &&
-    /\b(profit|profitable|profitability|margin|discount|pricing|promotion|repeat purchase|retention|loyalty|churn|marketing|campaign|advertising|tracking|data quality)\b/.test(q) &&
+    /\b(profit|profitable|profitability|margins?|discounts?|pricing|promotions?|repeat purchases?|retention|loyalty|churn|marketing|campaigns?|advertising|tracking|data quality)\b/.test(q) &&
     !uniqueIntents.includes("diagnostic")
   ) {
     return ["advice"];
