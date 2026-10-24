@@ -89,5 +89,20 @@ export function detectIntents(question) {
     intents.push("attribution");
   }
 
-  return [...new Set(intents)];
+  const uniqueIntents = [...new Set(intents)];
+
+  // A diagnostic question should receive the diagnosis first, not a generic
+  // sales summary that can look like the answer to "why are sales down?".
+  if (uniqueIntents.includes("diagnostic")) {
+    return [
+      "diagnostic",
+      ...uniqueIntents.filter(
+        (intent) => intent !== "diagnostic" &&
+          intent !== "sales" &&
+          intent !== "overview"
+      ),
+    ];
+  }
+
+  return uniqueIntents;
 }
