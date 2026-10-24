@@ -23,7 +23,7 @@ export function detectIntents(question) {
 
   if (
     /\b(revenue|income|money|earnings|earned|earn|turnover)\b/.test(q) ||
-    /\bhow much (did|have) i (make|made|earn|earned)\b/.test(q) ||
+    new RegExp("how much (did|have) i (make|made|earn|earned)").test(q) &&
     /\b(how much|total) (money|sales|revenue)\b/.test(q) ||
     /\bsales revenue\b/.test(q)
   ) {
