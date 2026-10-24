@@ -20,6 +20,9 @@ import {
   sendRecoveryEmail,
   sendDailyReport,
 } from "./notification/emailEngine.js";
+import { diagnoseSales } from "./intelligence/diagnostics.js";
+import { detectIntents } from "./intelligence/intentRouter.js";
+import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 
 dotenv.config();
 
@@ -734,132 +737,27 @@ function getSiteDayBounds(timeZone, referenceDate = new Date()) {
    INTELLIGENCE HELPERS
 ========================================================= */
 
-function normalizeQuestion(question) {
-  return normalizeString(question, 2_000)
-    .toLowerCase()
-    .replace(/[^\w\s$%.-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function detectIntents(question) {
-  const q = normalizeQuestion(question);
-
-  const intents = [];
-
-  if (
-    /\b(who|identity|name|merchant|store|business|company)\b/.test(
-      q
-    )
-  ) {
-    intents.push("identity");
-  }
-
-  if (
-    /\b(revenue|income|money|earnings|earned|turnover)\b/.test(q)
-  ) {
-    intents.push("revenue");
-  }
-
-  if (
-    /\b(visitor|visitors|traffic|sessions|users|people)\b/.test(q)
-  ) {
-    intents.push("traffic");
-  }
-
-  if (
-    /\b(purchase|purchases|bought|orders|order|sales volume)\b/.test(
-      q
-    )
-  ) {
-    intents.push("purchases");
-  }
-
-  if (
-    /\b(conversion|conversions|convert|converted|rate)\b/.test(q)
-  ) {
-    intents.push("conversion");
-  }
-
-  if (/\b(sales|sold|selling)\b/.test(q)) {
-    intents.push("sales");
-  }
-
-  if (
-    /\b(cart|checkout|checkouts|basket|abandon)\b/.test(q)
-  ) {
-    intents.push("cart");
-  }
-
-  if (
-    /\b(recovery|recover|recovered|recovery email)\b/.test(q)
-  ) {
-    intents.push("recovery");
-  }
-
-  if (
-    /\b(email|emails|mail|messages)\b/.test(q)
-  ) {
-    intents.push("email");
-  }
-
-  if (
-    /\b(product|products|interest|interested|viewed)\b/.test(q)
-  ) {
-    intents.push("product_interest");
-  }
-
-  if (
-    /\b(bandit|experiment|exploration|exploit|incentive|discount|offer|action)\b/.test(
-      q
-    )
-  ) {
-    intents.push("bandit");
-  }
-
-  if (
-    /\b(advice|recommend|recommendation|suggest|suggestion|what should|how can|improve|improvement)\b/.test(
-      q
-    )
-  ) {
-    intents.push("advice");
-  }
-
-  if (
-    /\b(overview|summary|performance|performing|doing|today)\b/.test(
-      q
-    )
-  ) {
-    intents.push("overview");
-  }
-
-  if (
-    /\b(funnel|journey|flow|stage|stages)\b/.test(q)
-  ) {
-    intents.push("funnel");
-  }
-
-  if (
-    /\b(channel|channels|source|sources|campaign|campaigns|ads|ad spend|marketing|attribution|utm|referral|social|organic|paid)\b/.test(
-      q
-    )
-  ) {
-    intents.push("attribution");
-  }
-
-  return [...new Set(intents)];
-}
-
 function composeIdentity(site) {
   return `${site.name} is the connected merchant site in REDEN.`;
 }
 
 function composeRevenue(evidence) {
-  return `Storefront purchase revenue recorded today is ${evidence.purchaseRevenue.toFixed(
-    2
-  )}. REDEN-attributed decision revenue is ${evidence.decisionRevenue.toFixed(
-    2
-  )}.`;
+  const amount = Number(evidence.purchaseRevenue || 0).toFixed(2);
+  const decisionRevenue = Number(evidence.decisionRevenue || 0).toFixed(2);
+  const baseline = evidence.revenueBaseline;
+  let comparison = "";
+
+  if (baseline?.status === "below_baseline") {
+    comparison = ` Same-time recorded storefront purchase revenue is materially below the recent comparable baseline: ${Number(baseline.currentRevenue).toFixed(2)} versus an average of ${Number(baseline.averageRevenue).toFixed(2)} across ${baseline.daysWithComparablePurchases} comparable purchase days. This is a revenue comparison, not a verified cause or net-profit figure.`;
+  } else if (baseline?.status === "purchase_tracking_unconfirmed") {
+    comparison = " A reliable same-time revenue comparison is unavailable because no PURCHASE event was recorded in the current window; this does not prove that real-world sales were zero.";
+  } else if (baseline?.status === "purchase_summary_mismatch") {
+    comparison = " Purchase events are present, but the matching purchased-session revenue summary is missing, so the historical revenue comparison is not reliable.";
+  } else if (baseline?.status === "insufficient_history") {
+    comparison = " REDEN does not yet have enough comparable purchase days with verified tracking to establish a reliable revenue baseline.";
+  }
+
+  return `Storefront purchase revenue recorded for today is ${amount}. This is tracked storefront purchase revenue, not verified net profit or confirmed settled proceeds; the store currency is not available in the current intelligence response. REDEN-attributed decision revenue is ${decisionRevenue}, a separate metric that only reflects completed REDEN decisions.${comparison}`;
 }
 
 function composeTraffic(evidence) {
@@ -1010,8 +908,38 @@ function composeAdvice(evidence) {
     }
   }
 
+  const revenueBaseline = evidence.revenueBaseline;
+  if (revenueBaseline?.status === "below_baseline") {
+    recommendations.push(
+      `Same-time recorded storefront purchase revenue is materially below its comparable baseline (${Number(revenueBaseline.currentRevenue).toFixed(2)} versus ${Number(revenueBaseline.averageRevenue).toFixed(2)} across ${revenueBaseline.daysWithComparablePurchases} eligible purchase days). Compare purchase count and average order value, and verify order/payment tracking before changing prices or ad spend.`
+    );
+  } else if (
+    revenueBaseline?.status === "purchase_tracking_unconfirmed" ||
+    revenueBaseline?.status === "purchase_summary_mismatch"
+  ) {
+    recommendations.push(
+      "Revenue comparison is currently unreliable because purchase events and purchased-session summaries are missing or inconsistent. Verify a test purchase end to end before making a performance decision."
+    );
+  }
+
+  const funnelBaseline = evidence.funnelBaseline;
+  if (funnelBaseline?.status === "below_baseline" && funnelBaseline.current) {
+    const labels = {
+      productView: "product-page discovery",
+      addToCart: "add-to-cart",
+      checkout: "checkout",
+      purchase: "purchase completion",
+    };
+    const affectedStages = funnelBaseline.lowStages
+      .map((stage) => labels[stage] || stage)
+      .join(", ");
+    recommendations.push(
+      `Recorded session-level rates are materially below the comparable baseline at these stages: ${affectedStages}. Check the affected customer journey and verify event tracking before changing offers or spending.`
+    );
+  }
+
   if (!recommendations.length) {
-    return "No evidence-based intervention is required from the available signals today.";
+    return "No existing rule has identified a strong intervention from today's signals. This does not establish that performance is healthy; compare against a reliable historical baseline and verify event tracking before deciding that no action is needed.";
   }
 
   return recommendations.join(" ");
@@ -1047,7 +975,29 @@ function composeOverview(evidence) {
 }
 
 function composeFunnel(evidence) {
-  return `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
+  const summary = `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
+  const baseline = evidence.funnelBaseline;
+
+  if (!baseline || baseline.status === "insufficient_history") {
+    return `${summary} REDEN does not yet have five eligible historical days with recorded page-view sessions for a reliable same-time funnel comparison.`;
+  }
+
+  if (baseline.status === "below_baseline" && baseline.current) {
+    const labels = {
+      productView: "product-view",
+      addToCart: "add-to-cart",
+      checkout: "checkout",
+      purchase: "purchase",
+    };
+    const details = baseline.lowStages.map((stage) => {
+      const currentRate = Number(baseline.current.rates?.[stage]) * 100;
+      const averageRate = Number(baseline.averages?.[stage]) * 100;
+      return `${labels[stage]} session rate is ${currentRate.toFixed(1)}% versus a same-time historical average of ${averageRate.toFixed(1)}%.`;
+    });
+    return `${summary} Recorded funnel rates are materially below their baseline: ${details.join(" ")} Treat these as tracking signals to investigate, not proof of a specific cause.`;
+  }
+
+  return `${summary} The available recorded session-level rates are not materially below the baseline under REDEN's current threshold. This does not rule out other causes of a sales decline.`;
 }
 
 function composeAttribution(evidence) {
@@ -1099,6 +1049,9 @@ function composeIntent(intent, evidence, site) {
 
     case "sales":
       return composeSales(evidence);
+
+    case "diagnostic":
+      return diagnoseSales(evidence);
 
     case "cart":
       return composeCart(evidence);
@@ -1850,6 +1803,60 @@ app.post("/api/v1/intelligence", async (req, res) => {
       );
     }
 
+    let historicalBaselines = {
+      revenueBaseline: {
+        status: "insufficient_history",
+        metric: "same_time_recorded_storefront_purchase_revenue",
+        currentRevenue: null,
+        averageRevenue: null,
+        daysWithComparablePurchases: 0,
+        windowDays: 7,
+        comparisonThreshold: 0.5,
+      },
+      funnelBaseline: {
+        status: "insufficient_history",
+        metric: "distinct_page_view_sessions_by_stage",
+        current: null,
+        averages: null,
+        daysWithTraffic: 0,
+        windowDays: 7,
+        comparisonThreshold: 0.5,
+        lowStages: [],
+      },
+    };
+
+    try {
+      const firstHistoricalDate = new Date(
+        Date.UTC(year, month - 1, day - 7)
+      );
+      const historicalStartUTC = zonedDateTimeToUtc(
+        firstHistoricalDate.getUTCFullYear(),
+        firstHistoricalDate.getUTCMonth() + 1,
+        firstHistoricalDate.getUTCDate(),
+        0,
+        0,
+        0,
+        timeZone
+      );
+
+      historicalBaselines = await loadHistoricalBaselines({
+        db,
+        siteId,
+        timeZone,
+        baselineStartUTC: historicalStartUTC,
+        startUTC,
+        endUTC,
+        localDate,
+        localTime,
+      });
+    } catch (historicalBaselineError) {
+      // Historical diagnostics must never make the core intelligence request fail.
+      console.error(
+        "[INTELLIGENCE HISTORICAL BASELINE ERROR]",
+        historicalBaselineError
+      );
+    }
+
     const decisionResult = await db.query(
       `
         SELECT
@@ -2073,6 +2080,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
       uniqueSessions,
       trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
       totalEvents: Object.values(eventCounts).reduce(
         (sum, count) => sum + Number(count || 0),
         0
