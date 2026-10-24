@@ -743,21 +743,7 @@ function composeIdentity(site) {
 
 function composeRevenue(evidence) {
   const amount = Number(evidence.purchaseRevenue || 0).toFixed(2);
-  const decisionRevenue = Number(evidence.decisionRevenue || 0).toFixed(2);
-  const baseline = evidence.revenueBaseline;
-  let comparison = "";
-
-  if (baseline?.status === "below_baseline") {
-    comparison = ` Same-time recorded storefront purchase revenue is materially below the recent comparable baseline: ${Number(baseline.currentRevenue).toFixed(2)} versus an average of ${Number(baseline.averageRevenue).toFixed(2)} across ${baseline.daysWithComparablePurchases} comparable purchase days. This is a revenue comparison, not a verified cause or net-profit figure.`;
-  } else if (baseline?.status === "purchase_tracking_unconfirmed") {
-    comparison = " A reliable same-time revenue comparison is unavailable because no PURCHASE event was recorded in the current window; this does not prove that real-world sales were zero.";
-  } else if (baseline?.status === "purchase_summary_mismatch") {
-    comparison = " Purchase events are present, but the matching purchased-session revenue summary is missing, so the historical revenue comparison is not reliable.";
-  } else if (baseline?.status === "insufficient_history") {
-    comparison = " REDEN does not yet have enough comparable purchase days with verified tracking to establish a reliable revenue baseline.";
-  }
-
-  return `Storefront purchase revenue recorded for today is ${amount}. This is tracked storefront purchase revenue, not verified net profit or confirmed settled proceeds; the store currency is not available in the current intelligence response. REDEN-attributed decision revenue is ${decisionRevenue}, a separate metric that only reflects completed REDEN decisions.${comparison}`;
+  return `Your store recorded ${amount} in storefront purchase revenue today. This is recorded revenue, not verified profit. The store currency is not available in the current intelligence response.`;
 }
 
 function composeTraffic(evidence) {
