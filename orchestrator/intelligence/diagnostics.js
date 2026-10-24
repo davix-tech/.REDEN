@@ -55,6 +55,51 @@ export function diagnoseSales(evidence) {
     );
   }
 
+  const revenueBaseline = evidence.revenueBaseline;
+  if (revenueBaseline?.status === "below_baseline") {
+    hypotheses.push(
+      `Same-time recorded storefront purchase revenue is materially below the recent comparable baseline (${Number(revenueBaseline.currentRevenue).toFixed(2)} versus an average of ${Number(revenueBaseline.averageRevenue).toFixed(2)} across ${revenueBaseline.daysWithComparablePurchases} comparable purchase days). This is a measured change in recorded revenue, not proof of its cause.`
+    );
+    actions.push(
+      "Compare purchase count and average order value with the same historical window, then verify order and payment-event tracking before changing pricing or marketing."
+    );
+  } else if (revenueBaseline?.status === "purchase_tracking_unconfirmed") {
+    hypotheses.push(
+      "A same-time revenue decline cannot be confirmed because no PURCHASE event is recorded in the current comparison window. That may mean no purchase was recorded or purchase tracking is missing; it is not enough to conclude revenue was zero."
+    );
+    actions.push(
+      "Run a controlled test purchase and confirm both the PURCHASE event and the corresponding purchased session are recorded."
+    );
+  } else if (revenueBaseline?.status === "purchase_summary_mismatch") {
+    hypotheses.push(
+      "Purchase events are present but the corresponding purchased-session revenue summary is missing or inconsistent, so the revenue comparison is not reliable."
+    );
+    actions.push(
+      "Check purchase-event delivery and session_summaries purchase reconciliation before interpreting revenue movement."
+    );
+  }
+
+  const funnelBaseline = evidence.funnelBaseline;
+  if (funnelBaseline?.status === "below_baseline" && funnelBaseline.current) {
+    const stageLabels = {
+      productView: "product-view",
+      addToCart: "add-to-cart",
+      checkout: "checkout",
+      purchase: "purchase",
+    };
+    const stageDetails = funnelBaseline.lowStages.map((stage) => {
+      const currentRate = funnelBaseline.current.rates?.[stage];
+      const averageRate = funnelBaseline.averages?.[stage];
+      return `${stageLabels[stage] || stage} sessions are ${(Number(currentRate) * 100).toFixed(1)}% of page-view sessions versus a recent same-time average of ${(Number(averageRate) * 100).toFixed(1)}%.`;
+    });
+    hypotheses.push(
+      `Recorded funnel rates are materially below their comparable baseline: ${stageDetails.join(" ")} These are session-level tracking signals, not proof of a single underlying cause.`
+    );
+    actions.push(
+      "Check the affected page or checkout flow and verify the corresponding event fires correctly before changing offers or spending."
+    );
+  }
+
   const uniqueActions = [...new Set(actions)];
   const uncertainty = baseline?.status === "below_baseline" ||
     baseline?.status === "not_markedly_below_baseline"
