@@ -45,3 +45,12 @@ test("keeps direct earnings questions focused when they include today", () => {
   assert.deepEqual(detectIntents("How much did I earn today?"), ["revenue"]);
   assert.deepEqual(detectIntents("How much have I earned today?"), ["revenue"]);
 });
+
+test("routes topic-specific decisions to knowledge-guided advice", () => {
+  assert.deepEqual(detectIntents("Should I give customers a discount?"), ["advice"]);
+  assert.deepEqual(detectIntents("How can I make my store more profitable?"), ["advice"]);
+});
+
+test("routes repeat-purchase improvement questions to knowledge-guided advice", () => {
+  assert.deepEqual(detectIntents("How do I improve repeat purchases?"), ["advice"]);
+});

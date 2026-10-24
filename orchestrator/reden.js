@@ -23,6 +23,7 @@ import {
 import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
 import { composeConversationResponse } from "./intelligence/responsePolicy.js";
+import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 
 dotenv.config();
@@ -1062,7 +1063,7 @@ function composeIntent(intent, evidence, site, question = "") {
       return composeBandit(evidence);
 
     case "advice":
-      return composeAdvice(evidence);
+      return composeKnowledgeGuidance(question, evidence) || composeAdvice(evidence);
 
     case "overview":
       return composeOverview(evidence);
