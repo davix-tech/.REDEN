@@ -4,7 +4,8 @@
   "type": "module",
   "main": "orchestrator/reden.js",
   "scripts": {
-    "start": "node orchestrator/reden.js"
+    "start": "node orchestrator/reden.js",
+    "test": "node --test orchestrator/intelligence/*.test.js"
   },
   "engines": {
     "node": ">=18"
