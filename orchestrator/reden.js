@@ -864,10 +864,15 @@ function composeRevenue(evidence) {
 
 function composeTraffic(evidence) {
   const baseline = evidence.trafficBaseline;
-  const visits = Number(baseline?.currentSessions ?? 0);
+  const visits = baseline?.currentSessions;
+  const visitCount = Number(visits);
+
+  if (baseline?.status === "insufficient_history" && visits == null) {
+    return "I could not reliably read PAGE_VIEW session counts for the current period, so I cannot assess today's visits or compare them with the historical baseline yet. Check event tracking and try again.";
+  }
 
   if (!baseline || baseline.status === "insufficient_history") {
-    return `Today REDEN recorded ${visits} visits (sessions with a PAGE_VIEW event) by ${baseline?.asOfLocalTime || "the current"} site-local time. I do not yet have enough reliable historical page-view data to determine whether this is unusually low.`;
+    return `Today REDEN recorded ${visitCount} visits (sessions with a PAGE_VIEW event) by ${baseline?.asOfLocalTime || "the current"} site-local time. I do not yet have enough reliable historical page-view data to determine whether this is unusually low.`;
   }
 
   const comparison = baseline.averageSessions > 0
@@ -1742,7 +1747,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const trafficBaseline = {
       status: "insufficient_history",
-      currentSessions: 0,
+      currentSessions: null,
       averageSessions: null,
       daysWithTraffic: 0,
       windowDays: 7,
