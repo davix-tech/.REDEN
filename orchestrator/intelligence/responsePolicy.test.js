@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { composeCommerceKnowledge, composeConversationResponse, getResponsePolicy } from "./responsePolicy.js";
+import { composeConversationResponse, getResponsePolicy } from "./responsePolicy.js";
+import { composeCommerceKnowledge } from "./commerceKnowledge.js";
 
 test("greeting response is natural and does not expose an analytics dump", () => {
   const answer = composeConversationResponse("greeting");
