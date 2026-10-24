@@ -757,7 +757,10 @@ function detectIntents(question) {
   }
 
   if (
-    /\b(revenue|income|money|earnings|earned|turnover)\b/.test(q)
+    /\b(revenue|income|money|earnings|earned|earn|turnover)\b/.test(q) ||
+    /\bhow much (did|have) i (make|made|earn|earned)\b/.test(q) ||
+    /\b(how much|total) (money|sales|revenue)\b/.test(q) ||
+    /\bsales revenue\b/.test(q)
   ) {
     intents.push("revenue");
   }
@@ -864,11 +867,11 @@ function composeIdentity(site) {
 }
 
 function composeRevenue(evidence) {
-  return `Storefront purchase revenue recorded today is ${evidence.purchaseRevenue.toFixed(
+  return `Storefront purchase revenue recorded for today is ${evidence.purchaseRevenue.toFixed(
     2
-  )}. REDEN-attributed decision revenue is ${evidence.decisionRevenue.toFixed(
+  )}. This is tracked storefront purchase revenue, not verified net profit or confirmed settled proceeds; the store currency is not available in the current intelligence response. REDEN-attributed decision revenue is ${evidence.decisionRevenue.toFixed(
     2
-  )}.`;
+  )}, a separate metric that only reflects completed REDEN decisions.`;
 }
 
 function composeTraffic(evidence) {
