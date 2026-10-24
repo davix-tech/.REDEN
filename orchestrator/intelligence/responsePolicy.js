@@ -13,7 +13,7 @@ export function composeConversationResponse(intent, question = "") {
 
   switch (intent) {
     case "greeting":
-      return "Hi. I’m REDEN, PRETHIM’s commerce-intelligence assistant. I can help explain e-commerce concepts and investigate your store’s recorded sales, traffic, conversion, checkout, recovery, and possible next steps.";
+      return "Hi. I’m REDEN, PRETHIM’s commerce intelligence assistant. I can help explain e-commerce concepts and investigate your store’s recorded sales, traffic, conversion, checkout, recovery, and possible next steps.";
 
     case "gratitude":
       return "You’re welcome. What would you like to understand or improve next?";
@@ -26,7 +26,7 @@ export function composeConversationResponse(intent, question = "") {
       return composeCommerceKnowledge(question);
 
     case "general_help":
-      return "I’m REDEN, PRETHIM’s commerce-intelligence assistant. I’m not confident I can answer that reliably from the information available to me right now. I can answer common e-commerce questions and help with your store’s recorded sales, traffic, conversion, checkout, recovery, and practical next steps; I’ll say what I can’t verify rather than guess.";
+      return "I’m REDEN, PRETHIM’s commerce intelligence assistant. I’m not confident I can answer that reliably from the information available to me right now. I can answer common e-commerce questions and help with your store’s recorded sales, traffic, conversion, checkout, recovery, and practical next steps; I’ll say what I can’t verify rather than guess.";
 
     default:
       return "I couldn’t determine a reliable response for that request. " + policy.response_shapes.out_of_scope + " (Knowledge version: " + REDEN_KNOWLEDGE_VERSION + ".)";
