@@ -94,7 +94,7 @@ export function detectIntents(question) {
   // Simple earnings questions should return the requested revenue figure only.
   // Words like "today" must not append an unrelated overview.
   if (
-    /\\bhow much (did|have) i (make|made|earn|earned)\\b/.test(q) &&
+    /\bhow much (did|have) i (make|made|earn|earned)\b/.test(q) &&
     !uniqueIntents.includes("diagnostic")
   ) {
     return ["revenue"];
