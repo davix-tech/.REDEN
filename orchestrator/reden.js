@@ -22,6 +22,7 @@ import {
 } from "./notification/emailEngine.js";
 import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
+import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 
 dotenv.config();
 
@@ -1739,6 +1740,60 @@ app.post("/api/v1/intelligence", async (req, res) => {
       );
     }
 
+    let historicalBaselines = {
+      revenueBaseline: {
+        status: "insufficient_history",
+        metric: "same_time_recorded_storefront_purchase_revenue",
+        currentRevenue: null,
+        averageRevenue: null,
+        daysWithComparablePurchases: 0,
+        windowDays: 7,
+        comparisonThreshold: 0.5,
+      },
+      funnelBaseline: {
+        status: "insufficient_history",
+        metric: "distinct_page_view_sessions_by_stage",
+        current: null,
+        averages: null,
+        daysWithTraffic: 0,
+        windowDays: 7,
+        comparisonThreshold: 0.5,
+        lowStages: [],
+      },
+    };
+
+    try {
+      const firstHistoricalDate = new Date(
+        Date.UTC(year, month - 1, day - 7)
+      );
+      const historicalStartUTC = zonedDateTimeToUtc(
+        firstHistoricalDate.getUTCFullYear(),
+        firstHistoricalDate.getUTCMonth() + 1,
+        firstHistoricalDate.getUTCDate(),
+        0,
+        0,
+        0,
+        timeZone
+      );
+
+      historicalBaselines = await loadHistoricalBaselines({
+        db,
+        siteId,
+        timeZone,
+        baselineStartUTC: historicalStartUTC,
+        startUTC,
+        endUTC,
+        localDate,
+        localTime,
+      });
+    } catch (historicalBaselineError) {
+      // Historical diagnostics must never make the core intelligence request fail.
+      console.error(
+        "[INTELLIGENCE HISTORICAL BASELINE ERROR]",
+        historicalBaselineError
+      );
+    }
+
     const decisionResult = await db.query(
       `
         SELECT
@@ -1962,6 +2017,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
       uniqueSessions,
       trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
       totalEvents: Object.values(eventCounts).reduce(
         (sum, count) => sum + Number(count || 0),
         0
