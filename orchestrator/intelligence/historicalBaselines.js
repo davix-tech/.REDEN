@@ -20,10 +20,29 @@ function average(values) {
     : null;
 }
 
-function dailyRate(day, numerator) {
-  return day.pageViewSessions > 0
-    ? day[numerator] / day.pageViewSessions
-    : null;
+const FUNNEL_STAGE_METRICS = {
+  productView: {
+    numerator: "productViewSessions",
+    denominator: "pageViewSessions",
+  },
+  addToCart: {
+    numerator: "addToCartSessions",
+    denominator: "productViewSessions",
+  },
+  checkout: {
+    numerator: "checkoutSessions",
+    denominator: "addToCartSessions",
+  },
+  purchase: {
+    numerator: "purchaseSessions",
+    denominator: "checkoutSessions",
+  },
+};
+
+function dailyRate(day, stage) {
+  const metric = FUNNEL_STAGE_METRICS[stage];
+  const denominator = day[metric.denominator];
+  return denominator > 0 ? day[metric.numerator] / denominator : null;
 }
 
 export async function loadHistoricalBaselines({
@@ -48,7 +67,7 @@ export async function loadHistoricalBaselines({
     },
     funnelBaseline: {
       status: "insufficient_history",
-      metric: "distinct_page_view_sessions_by_stage",
+      metric: "conditional_session_funnel_rates",
       current: null,
       averages: null,
       daysWithTraffic: 0,
@@ -166,31 +185,25 @@ export async function loadHistoricalBaselines({
 
   const funnelAverages = {};
   const funnelDaysByStage = {};
-  for (const [stage, key] of [
-    ["productView", "productViewSessions"],
-    ["addToCart", "addToCartSessions"],
-    ["checkout", "checkoutSessions"],
-    ["purchase", "purchaseSessions"],
-  ]) {
-    // A day with no recorded stage events may have broken instrumentation.
-    // Exclude it from that stage's baseline instead of assuming a true zero.
-    const observedStageDays = historicalTrafficDays.filter((day) => day[key] > 0);
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
     funnelDaysByStage[stage] = observedStageDays.length;
     funnelAverages[stage] = average(
       observedStageDays
-        .map((day) => dailyRate(day, key))
+        .map((day) => dailyRate(day, stage))
         .filter((rate) => rate !== null)
     );
   }
 
   const currentRates = {};
-  for (const [stage, key] of [
-    ["productView", "productViewSessions"],
-    ["addToCart", "addToCartSessions"],
-    ["checkout", "checkoutSessions"],
-    ["purchase", "purchaseSessions"],
-  ]) {
-    currentRates[stage] = dailyRate(current, key);
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
   }
 
   const funnelBaseline = {
@@ -213,15 +226,12 @@ export async function loadHistoricalBaselines({
     funnelBaseline.lowStages = Object.entries(funnelAverages)
       .filter(([stage, baselineRate]) => {
         const currentRate = currentRates[stage];
-        const currentStageCount = current[{
-          productView: "productViewSessions",
-          addToCart: "addToCartSessions",
-          checkout: "checkoutSessions",
-          purchase: "purchaseSessions",
-        }[stage]];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
         // A zero count can indicate missing instrumentation. Do not label it
         // a confirmed conversion decline without an independent tracking check.
         return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
           currentStageCount > 0 &&
           baselineRate > 0 &&
           funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
