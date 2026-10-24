@@ -1025,6 +1025,8 @@ function composeIntent(intent, evidence, site, question = "") {
     case "gratitude":
     case "capabilities":
     case "general_help":
+    case "reden_identity":
+    case "commerce_knowledge":
       return composeConversationResponse(intent, question);
 
     case "identity":
