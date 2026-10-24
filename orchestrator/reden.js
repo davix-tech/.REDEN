@@ -742,11 +742,22 @@ function composeIdentity(site) {
 }
 
 function composeRevenue(evidence) {
-  return `Storefront purchase revenue recorded for today is ${evidence.purchaseRevenue.toFixed(
-    2
-  )}. This is tracked storefront purchase revenue, not verified net profit or confirmed settled proceeds; the store currency is not available in the current intelligence response. REDEN-attributed decision revenue is ${evidence.decisionRevenue.toFixed(
-    2
-  )}, a separate metric that only reflects completed REDEN decisions.`;
+  const amount = Number(evidence.purchaseRevenue || 0).toFixed(2);
+  const decisionRevenue = Number(evidence.decisionRevenue || 0).toFixed(2);
+  const baseline = evidence.revenueBaseline;
+  let comparison = "";
+
+  if (baseline?.status === "below_baseline") {
+    comparison = ` Same-time recorded storefront purchase revenue is materially below the recent comparable baseline: ${Number(baseline.currentRevenue).toFixed(2)} versus an average of ${Number(baseline.averageRevenue).toFixed(2)} across ${baseline.daysWithComparablePurchases} comparable purchase days. This is a revenue comparison, not a verified cause or net-profit figure.`;
+  } else if (baseline?.status === "purchase_tracking_unconfirmed") {
+    comparison = " A reliable same-time revenue comparison is unavailable because no PURCHASE event was recorded in the current window; this does not prove that real-world sales were zero.";
+  } else if (baseline?.status === "purchase_summary_mismatch") {
+    comparison = " Purchase events are present, but the matching purchased-session revenue summary is missing, so the historical revenue comparison is not reliable.";
+  } else if (baseline?.status === "insufficient_history") {
+    comparison = " REDEN does not yet have enough comparable purchase days with verified tracking to establish a reliable revenue baseline.";
+  }
+
+  return `Storefront purchase revenue recorded for today is ${amount}. This is tracked storefront purchase revenue, not verified net profit or confirmed settled proceeds; the store currency is not available in the current intelligence response. REDEN-attributed decision revenue is ${decisionRevenue}, a separate metric that only reflects completed REDEN decisions.${comparison}`;
 }
 
 function composeTraffic(evidence) {
@@ -934,7 +945,29 @@ function composeOverview(evidence) {
 }
 
 function composeFunnel(evidence) {
-  return `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
+  const summary = `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
+  const baseline = evidence.funnelBaseline;
+
+  if (!baseline || baseline.status === "insufficient_history") {
+    return `${summary} REDEN does not yet have five eligible historical days with recorded page-view sessions for a reliable same-time funnel comparison.`;
+  }
+
+  if (baseline.status === "below_baseline" && baseline.current) {
+    const labels = {
+      productView: "product-view",
+      addToCart: "add-to-cart",
+      checkout: "checkout",
+      purchase: "purchase",
+    };
+    const details = baseline.lowStages.map((stage) => {
+      const currentRate = Number(baseline.current.rates?.[stage]) * 100;
+      const averageRate = Number(baseline.averages?.[stage]) * 100;
+      return `${labels[stage]} session rate is ${currentRate.toFixed(1)}% versus a same-time historical average of ${averageRate.toFixed(1)}%.`;
+    });
+    return `${summary} Recorded funnel rates are materially below their baseline: ${details.join(" ")} Treat these as tracking signals to investigate, not proof of a specific cause.`;
+  }
+
+  return `${summary} The available recorded session-level rates are not materially below the baseline under REDEN's current threshold. This does not rule out other causes of a sales decline.`;
 }
 
 function composeAttribution(evidence) {
