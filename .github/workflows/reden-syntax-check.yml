@@ -25,5 +25,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Validate REDEN server syntax
-        run: node --check orchestrator/reden.js
+      - name: Validate REDEN server and intelligence module syntax
+        run: |
+          node --check orchestrator/reden.js
+          node --check orchestrator/intelligence/knowledgeBase.js
+          node --check orchestrator/intelligence/diagnostics.js
