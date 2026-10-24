@@ -125,7 +125,7 @@ test("does not classify zero stage counts as confirmed funnel declines", async (
 
 test("funnel rates use the immediately preceding stage as the denominator", async () => {
   const historical = Array.from({ length: 5 }, (_, i) => eventDay(
-    \`2026-10-\${String(19 + i).padStart(2, "0")}\`,
+    `2026-10-${String(19 + i).padStart(2, "0")}`,
     20,
     {
       product_view_sessions: 10,
@@ -161,7 +161,7 @@ test("funnel rates use the immediately preceding stage as the denominator", asyn
 
 test("historical zero stage rates are included when the preceding stage has traffic", async () => {
   const historical = Array.from({ length: 5 }, (_, i) => eventDay(
-    \`2026-10-\${String(19 + i).padStart(2, "0")}\`,
+    `2026-10-${String(19 + i).padStart(2, "0")}`,
     20,
     i === 0
       ? {
