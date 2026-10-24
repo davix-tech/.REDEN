@@ -22,6 +22,7 @@ import {
 } from "./notification/emailEngine.js";
 import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
+import { composeConversationResponse } from "./intelligence/responsePolicy.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 
 dotenv.config();
@@ -1030,8 +1031,14 @@ function composeAttribution(evidence) {
   return `Today's traffic by source: ${lines.join("; ")}.`;
 }
 
-function composeIntent(intent, evidence, site) {
+function composeIntent(intent, evidence, site, question = "") {
   switch (intent) {
+    case "greeting":
+    case "gratitude":
+    case "capabilities":
+    case "general_help":
+      return composeConversationResponse(intent, question);
+
     case "identity":
       return composeIdentity(site);
 
@@ -2128,7 +2135,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
     let intents = detectIntents(question);
 
     if (!intents.length) {
-      intents = ["overview"];
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
     }
 
     const sections = [];
@@ -2137,7 +2145,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
       const section = composeIntent(
         intent,
         evidence,
-        site
+        site,
+        question
       );
 
       if (section) {
