@@ -19,14 +19,14 @@ export function composeConversationResponse(intent, question = "") {
       return "You’re welcome. What would you like to understand or improve next?";
 
     case "capabilities":
-      return "I can answer basic questions about REDEN and e-commerce, summarise recorded store activity, investigate supported funnel signals, review recovery and decision activity, and suggest evidence-based next steps. I’ll distinguish measured facts from hypotheses. Automated actions and store-specific conclusions depend on working integrations and reliable data.";
+      return "I can answer basic questions about REDEN and e-commerce, summarise recorded store activity, investigate supported funnel signals, review recovery and decision activity, and suggest evidence-based next steps. I’ll distinguish measured facts from hypotheses, and I won’t call revenue profit. Automated actions and store-specific conclusions depend on working integrations and reliable data.";
 
     case "reden_identity":
     case "commerce_knowledge":
       return composeCommerceKnowledge(question);
 
     case "general_help":
-      return "I’m REDEN, PRETHIM’s commerce-intelligence assistant. I can answer some common e-commerce questions and help with your store’s recorded sales, traffic, conversion, checkout, recovery, and practical next steps. For questions outside my reviewed knowledge or connected data, I’ll say what I can’t verify rather than guess.";
+      return "I’m REDEN, PRETHIM’s commerce-intelligence assistant. I’m not confident I can answer that reliably from the information available to me right now. I can answer common e-commerce questions and help with your store’s recorded sales, traffic, conversion, checkout, recovery, and practical next steps; I’ll say what I can’t verify rather than guess.";
 
     default:
       return "I couldn’t determine a reliable response for that request. " + policy.response_shapes.out_of_scope + " (Knowledge version: " + REDEN_KNOWLEDGE_VERSION + ".)";
