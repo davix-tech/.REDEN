@@ -87,7 +87,7 @@ export function detectIntents(question) {
     intents.push("bandit");
   }
 
-  if (/\b(advice|recommend|recommendation|suggest|suggestion|what should|how can|improve|improvement)\b/.test(q)) {
+  if (/\b(advice|recommend|recommendation|suggest|suggestion|what should|should i|how can|how do i|is it worth|improve|improvement)\b/.test(q)) {
     intents.push("advice");
   }
 
@@ -104,6 +104,16 @@ export function detectIntents(question) {
   }
 
   const uniqueIntents = [...new Set(intents)];
+
+  // Topic-specific decision questions should receive the knowledge-guided answer,
+  // not a competing raw metric section such as bandit state.
+  if (
+    uniqueIntents.includes("advice") &&
+    /\b(profit|profitable|profitability|margin|discount|pricing|promotion|repeat purchase|retention|loyalty|churn|marketing|campaign|advertising|tracking|data quality)\b/.test(q) &&
+    !uniqueIntents.includes("diagnostic")
+  ) {
+    return ["advice"];
+  }
 
   // A direct earnings question should not inherit the "today" overview intent.
   if (
