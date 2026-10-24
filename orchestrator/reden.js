@@ -1024,11 +1024,20 @@ function composeOverview(evidence) {
           2
         )}%`;
 
+  const baseline = evidence.trafficBaseline;
+  let trafficContext = "";
+
+  if (baseline?.status === "below_baseline") {
+    trafficContext = ` Traffic is materially below its recent same-time baseline: ${evidence.uniqueSessions} sessions so far versus an average of ${baseline.averageSessions.toFixed(1)} across ${baseline.daysWithTraffic} of the previous 7 days with recorded traffic. I recommend first checking storefront availability and PAGE_VIEW tracking, then reviewing traffic sources and campaign status if tracking is healthy.`;
+  } else if (baseline?.status === "insufficient_history") {
+    trafficContext = " REDEN does not yet have enough reliable historical traffic to determine whether today's visits are unusually low.";
+  }
+
   return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions, ${evidence.totalEvents} events, ${evidence.purchases} purchase events, and ${evidence.purchaseRevenue.toFixed(
     2
   )} in storefront purchase revenue. It also completed ${
     evidence.decisions
-  } decisions with ${evidence.conversions} conversions, giving ${conversionText}.`;
+  } decisions with ${evidence.conversions} conversions, giving ${conversionText}.${trafficContext}`;
 }
 
 function composeFunnel(evidence) {
