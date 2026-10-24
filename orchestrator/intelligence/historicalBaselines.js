@@ -93,17 +93,37 @@ export async function loadHistoricalBaselines({
 
   const revenueDaysResult = await db.query(
     `
+      WITH purchase_sessions AS (
+        SELECT
+          site_id,
+          session_id,
+          (created_at AT TIME ZONE $2)::date AS purchase_local_date
+        FROM event_logs
+        WHERE site_id = $1
+          AND event = 'PURCHASE'
+          AND created_at >= $3
+          AND created_at < $4
+          AND (created_at AT TIME ZONE $2)::time <= $5::time
+        GROUP BY
+          site_id,
+          session_id,
+          (created_at AT TIME ZONE $2)::date
+      )
       SELECT
-        (purchased_at AT TIME ZONE $2)::date::text AS local_date,
-        COALESCE(SUM(revenue), 0)::NUMERIC AS revenue,
-        COUNT(*) FILTER (WHERE purchased = TRUE)::INTEGER AS purchased_sessions
-      FROM session_summaries
-      WHERE site_id = $1
-        AND purchased = TRUE
-        AND purchased_at >= $3
-        AND purchased_at < $4
-        AND (purchased_at AT TIME ZONE $2)::time <= $5::time
-      GROUP BY (purchased_at AT TIME ZONE $2)::date
+        (ss.purchased_at AT TIME ZONE $2)::date::text AS local_date,
+        COALESCE(SUM(ss.revenue), 0)::NUMERIC AS revenue,
+        COUNT(*) FILTER (WHERE ss.purchased = TRUE)::INTEGER AS purchased_sessions
+      FROM session_summaries ss
+      JOIN purchase_sessions ps
+        ON ps.site_id = ss.site_id
+        AND ps.session_id = ss.session_id
+        AND ps.purchase_local_date = (ss.purchased_at AT TIME ZONE $2)::date
+      WHERE ss.site_id = $1
+        AND ss.purchased = TRUE
+        AND ss.purchased_at >= $3
+        AND ss.purchased_at < $4
+        AND (ss.purchased_at AT TIME ZONE $2)::time <= $5::time
+      GROUP BY (ss.purchased_at AT TIME ZONE $2)::date
       ORDER BY local_date
     `,
     [siteId, timeZone, baselineStartUTC, endUTC, localTime]
