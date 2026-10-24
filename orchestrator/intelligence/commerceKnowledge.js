@@ -51,6 +51,16 @@ export const ECOMMERCE_KNOWLEDGE = [
     answer: "A discount may persuade some shoppers to buy, but it reduces the amount earned per order and may reward customers who would have bought anyway. Check contribution margin first, target only where evidence supports it, and compare results against a baseline or holdout."
   },
   {
+    id: "reden-name",
+    patterns: [/\\b(what is your name|what s your name|who are you)\\b/i],
+    answer: "My name is REDEN. I’m PRETHIM’s commerce-intelligence assistant, designed to help merchants understand store performance and decide what to investigate or improve next."
+  },
+  {
+    id: "reden-maker",
+    patterns: [/\\b(who built you|who created you|which company (built|created) you)\\b/i],
+    answer: "I’m being developed by PRETHIM, a technology company focused on using APIs and intelligent software systems to solve everyday technology problems."
+  },
+  {
     id: "reden-product",
     patterns: [/\bwhat is reden\b/i, /\bwhat s reden\b/i, /\btell me about reden\b/i, /\bwhat is commerce orchestration\b/i],
     answer: "REDEN is PRETHIM's e-commerce product. It is being built to turn storefront behaviour into evidence-based decisions, appropriate automated actions, and measured outcomes. Its code includes a storefront-event pipeline and an evolving commerce-intelligence layer; not every planned automation or adaptive capability has been verified as production-ready."
