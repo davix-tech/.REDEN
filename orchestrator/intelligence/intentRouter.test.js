@@ -25,3 +25,8 @@ test("returns no intent for an unrecognized question so the API can apply its fa
 test("normalizes punctuation and repeated whitespace", () => {
   assert.deepEqual(detectIntents("  HOW MUCH DID I MAKE?!  "), ["revenue"]);
 });
+
+
+test("keeps a simple earnings question focused when it includes today", () => {
+  assert.deepEqual(detectIntents("How much did I earn today?"), ["revenue"]);
+});
