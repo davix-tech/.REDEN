@@ -32,7 +32,7 @@ const PORT = Number(process.env.PORT || 3000);
 const ADMIN_SECRET =
   process.env.REDEN_ADMIN_SECRET || process.env.ADMIN_SECRET;
 
-const PUBLIC_DIR = path.join(__dirname, "public");
+const PUBLIC_DIR = path.resolve(__dirname, "..", "public");
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is required");
