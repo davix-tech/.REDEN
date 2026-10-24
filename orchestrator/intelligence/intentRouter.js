@@ -22,6 +22,11 @@ export function detectIntents(question) {
     return ["reden_identity"];
   }
 
+  // Route REDEN value questions to its decision-layer explanation, not a metrics dump.
+  if (/\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\b/.test(q)) {
+    return ["capabilities"];
+  }
+
   // Route common e-commerce definitions to reviewed product knowledge.
   if (/\b(what is|what does|explain|define|meaning of|how does)\b/.test(q) &&
       /\b(conversion rate|purchase intent|abandoned cart|average order value|aov|ecommerce funnel|sales funnel|revenue|profit|reden|commerce orchestration|discount)\b/.test(q)) {
