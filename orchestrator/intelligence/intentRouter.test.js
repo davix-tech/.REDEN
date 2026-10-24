@@ -60,3 +60,19 @@ test("routes open-ended earn-more questions to a growth plan", () => {
   assert.deepEqual(detectIntents("How can we make more money?"), ["growth"]);
   assert.deepEqual(detectIntents("How do I increase sales?"), ["growth"]);
 });
+
+
+test("routes REDEN identity questions separately from merchant-store identity", () => {
+  assert.deepEqual(detectIntents("What is your name?"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("Who are you?"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("What is REDEN?"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("Who built you?"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("What is my store called?"), ["identity"]);
+});
+
+test("routes basic e-commerce definitions to reviewed knowledge", () => {
+  assert.deepEqual(detectIntents("What is conversion rate?"), ["commerce_knowledge"]);
+  assert.deepEqual(detectIntents("Explain purchase intent"), ["commerce_knowledge"]);
+  assert.deepEqual(detectIntents("What is an abandoned cart?"), ["commerce_knowledge"]);
+  assert.deepEqual(detectIntents("What is average order value?"), ["commerce_knowledge"]);
+});

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { composeConversationResponse, getResponsePolicy } from "./responsePolicy.js";
+import { composeCommerceKnowledge } from "./commerceKnowledge.js";
 
 test("greeting response is natural and does not expose an analytics dump", () => {
   const answer = composeConversationResponse("greeting");
@@ -27,4 +28,18 @@ test("response policy exposes versioned, structured principles", () => {
   assert.ok(policy.knowledgeVersion);
   assert.ok(policy.principles.length >= 5);
   assert.ok(policy.responseShapes.diagnosis);
+});
+
+
+test("REDEN answers its own name and product identity", () => {
+  assert.match(composeConversationResponse("reden_identity", "What is your name?"), /My name is REDEN/);
+  assert.match(composeConversationResponse("reden_identity", "What is REDEN?"), /PRETHIM's e-commerce product/);
+  assert.match(composeConversationResponse("reden_identity", "Who built you?"), /PRETHIM/);
+});
+
+test("commerce knowledge answers common definitions without inventing store facts", () => {
+  assert.match(composeCommerceKnowledge("What is conversion rate?"), /proportion of a defined group/);
+  assert.match(composeCommerceKnowledge("What is an abandoned cart?"), /do not prove an abandonment count/);
+  assert.match(composeCommerceKnowledge("What is profit?"), /Revenue is money recorded from sales/);
+  assert.match(composeCommerceKnowledge("What is a thing outside my knowledge?"), /don’t have enough information/);
 });
