@@ -15,6 +15,20 @@ function normalizeQuestion(question) {
 
 export function detectIntents(question) {
   const q = normalizeQuestion(question);
+
+  // Conversational turns should not fall through to a merchant analytics report.
+  if (/^(hi|hello|hey|good morning|good afternoon|good evening|howdy|hiya)$/.test(q)) {
+    return ["greeting"];
+  }
+
+  if (/^(thanks|thank you|thanks a lot|thank you very much|appreciate it)$/.test(q)) {
+    return ["gratitude"];
+  }
+
+  if (/\b(what can you do|what do you do|how can you help|what can you help with|what are you capable of|help me use reden)\b/.test(q)) {
+    return ["capabilities"];
+  }
+
   const intents = [];
 
   if (/\b(who|identity|name|merchant|store|business|company)\b/.test(q)) {
