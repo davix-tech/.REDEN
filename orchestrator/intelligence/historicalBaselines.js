@@ -67,7 +67,7 @@ export async function loadHistoricalBaselines({
     },
     funnelBaseline: {
       status: "insufficient_history",
-      metric: "distinct_page_view_sessions_by_stage",
+      metric: "conditional_session_funnel_rates",
       current: null,
       averages: null,
       daysWithTraffic: 0,
