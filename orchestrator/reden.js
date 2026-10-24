@@ -863,7 +863,21 @@ function composeRevenue(evidence) {
 }
 
 function composeTraffic(evidence) {
-  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions and ${evidence.totalEvents} events.`;
+  const baseline = evidence.trafficBaseline;
+
+  if (!baseline || baseline.status === "insufficient_history") {
+    return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions and ${evidence.totalEvents} events. I do not yet have enough reliable historical traffic data to determine whether this is unusually low.`;
+  }
+
+  const comparison = baseline.averageSessions > 0
+    ? Math.round((baseline.currentSessions / baseline.averageSessions) * 100)
+    : null;
+
+  if (baseline.status === "below_baseline") {
+    return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions by ${baseline.asOfLocalTime} site-local time, compared with an average of ${baseline.averageSessions.toFixed(1)} sessions by the same time across ${baseline.daysWithTraffic} of the previous 7 days with recorded traffic. That is ${comparison}% of the recent baseline, so traffic is materially below its usual level at this point in the day.`;
+  }
+
+  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions and ${evidence.totalEvents} events by ${baseline.asOfLocalTime}. This is not at least 50% below the average of ${baseline.averageSessions.toFixed(1)} sessions by the same time across ${baseline.daysWithTraffic} of the previous 7 days with recorded traffic.`;
 }
 
 function composePurchases(evidence) {
@@ -922,6 +936,17 @@ function composeBandit(evidence) {
 
 function composeAdvice(evidence) {
   const recommendations = [];
+  const trafficBaseline = evidence.trafficBaseline;
+
+  if (trafficBaseline?.status === "below_baseline") {
+    recommendations.push(
+      `Traffic is materially below its recent same-time baseline: ${evidence.uniqueSessions} sessions so far versus an average of ${trafficBaseline.averageSessions.toFixed(1)} across ${trafficBaseline.daysWithTraffic} recent days with recorded traffic. First verify that the storefront is reachable and PAGE_VIEW tracking is working. If both are healthy, inspect traffic-source delivery, campaign status, and broken or outdated links. Recheck later today before increasing ad spend.`
+    );
+  } else if (trafficBaseline?.status === "insufficient_history") {
+    recommendations.push(
+      "I cannot reliably label today's traffic as unusually low yet because fewer than five of the previous seven days have usable recorded traffic. Verify PAGE_VIEW tracking and allow more data to accumulate before making a traffic-spend decision."
+    );
+  }
 
   if (
     evidence.checkoutStarted > 0 &&
@@ -1635,12 +1660,13 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const site = siteResult.rows[0];
 
+    const referenceNow = new Date();
     const {
       startUTC,
       endUTC,
       localDate,
       timeZone,
-    } = getSiteDayBounds(site.timezone);
+    } = getSiteDayBounds(site.timezone, referenceNow);
 
     const eventResult = await db.query(
       `
@@ -1676,6 +1702,110 @@ app.post("/api/v1/intelligence", async (req, res) => {
     const uniqueSessions = Number(
       sessionResult.rows[0]?.count || 0
     );
+
+    // Compare today's partial traffic with the same local-time cutoff
+    // across the previous seven local calendar days.
+    const localTimeParts = new Intl.DateTimeFormat("en-GB", {
+      timeZone,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(referenceNow);
+    const localTimeValues = {};
+    for (const part of localTimeParts) {
+      if (part.type !== "literal") {
+        localTimeValues[part.type] = part.value;
+      }
+    }
+    const localTime =
+      `${localTimeValues.hour}:${localTimeValues.minute}:${localTimeValues.second}`;
+
+    const [year, month, day] = localDate.split("-").map(Number);
+    const baselineCounts = new Map();
+    for (let daysAgo = 1; daysAgo <= 7; daysAgo += 1) {
+      const date = new Date(Date.UTC(year, month - 1, day - daysAgo));
+      baselineCounts.set(date.toISOString().slice(0, 10), 0);
+    }
+
+    const trafficBaseline = {
+      status: "insufficient_history",
+      currentSessions: uniqueSessions,
+      averageSessions: null,
+      daysWithTraffic: 0,
+      windowDays: 7,
+      asOfLocalTime: localTime,
+      comparisonThreshold: 0.5,
+    };
+
+    try {
+      const firstBaselineDate = new Date(
+        Date.UTC(year, month - 1, day - 7)
+      );
+      const baselineStartUTC = zonedDateTimeToUtc(
+        firstBaselineDate.getUTCFullYear(),
+        firstBaselineDate.getUTCMonth() + 1,
+        firstBaselineDate.getUTCDate(),
+        0,
+        0,
+        0,
+        timeZone
+      );
+
+      const baselineResult = await db.query(
+        `
+          SELECT
+            (created_at AT TIME ZONE $2)::date::text AS local_date,
+            COUNT(DISTINCT session_id)::INTEGER AS sessions
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= $3
+            AND created_at < $4
+            AND (created_at AT TIME ZONE $2)::time <= $5::time
+          GROUP BY (created_at AT TIME ZONE $2)::date
+          ORDER BY local_date DESC
+        `,
+        [siteId, timeZone, baselineStartUTC, startUTC, localTime]
+      );
+
+      for (const row of baselineResult.rows) {
+        if (baselineCounts.has(row.local_date)) {
+          baselineCounts.set(
+            row.local_date,
+            Number(row.sessions || 0)
+          );
+        }
+      }
+
+      const activeDayCounts = [...baselineCounts.values()].filter(
+        (count) => count > 0
+      );
+      const averageSessions = activeDayCounts.length
+        ? activeDayCounts.reduce((sum, count) => sum + count, 0) /
+          activeDayCounts.length
+        : null;
+
+      trafficBaseline.daysWithTraffic = activeDayCounts.length;
+      trafficBaseline.averageSessions = averageSessions;
+
+      if (
+        activeDayCounts.length >= 5 &&
+        Number.isFinite(averageSessions) &&
+        averageSessions > 0
+      ) {
+        trafficBaseline.status =
+          uniqueSessions < averageSessions * trafficBaseline.comparisonThreshold
+            ? "below_baseline"
+            : "not_markedly_below_baseline";
+      }
+    } catch (baselineError) {
+      // The baseline is an enhancement, not a reason to break the existing
+      // intelligence endpoint. Keep the answer usable and disclose uncertainty.
+      console.error(
+        "[INTELLIGENCE TRAFFIC BASELINE ERROR]",
+        baselineError
+      );
+    }
 
     const decisionResult = await db.query(
       `
@@ -1899,6 +2029,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
       periodEnd: endUTC.toISOString(),
 
       uniqueSessions,
+      trafficBaseline,
       totalEvents: Object.values(eventCounts).reduce(
         (sum, count) => sum + Number(count || 0),
         0
