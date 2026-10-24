@@ -1,0 +1,29 @@
+name: REDEN syntax check
+
+on:
+  pull_request:
+    paths:
+      - "orchestrator/**/*.js"
+      - "package.json"
+      - ".github/workflows/reden-syntax-check.yml"
+  push:
+    branches:
+      - main
+      - reden-traffic-baseline
+    paths:
+      - "orchestrator/**/*.js"
+      - "package.json"
+      - ".github/workflows/reden-syntax-check.yml"
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate REDEN server syntax
+        run: node --check orchestrator/reden.js
