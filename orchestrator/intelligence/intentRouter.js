@@ -17,6 +17,20 @@ export function detectIntents(question) {
   const q = normalizeQuestion(question);
 
   // Conversational turns should not fall through to a merchant analytics report.
+  // REDEN identity is distinct from the connected merchant store identity.
+  if (/\b(what is your name|what s your name|who are you|what is reden|what s reden|tell me about reden|who built you|who created you|which company (built|created) you)\b/.test(q)) {
+    return ["reden_identity"];
+  }
+
+  // Route common e-commerce definitions to reviewed product knowledge.
+  if (/\b(what is|what does|explain|define|meaning of|how does)\b/.test(q) &&
+      /\b(conversion rate|purchase intent|abandoned cart|average order value|aov|ecommerce funnel|sales funnel|revenue|profit|reden|commerce orchestration|discount)\b/.test(q)) {
+    return ["commerce_knowledge"];
+  }
+
+  if (/\b(what is my store called|what is my store name|what is this store called|which store is connected)\b/.test(q)) {
+    return ["identity"];
+  }
   if (/^(hi|hello|hey|good morning|good afternoon|good evening|howdy|hiya)$/.test(q)) {
     return ["greeting"];
   }
