@@ -6,8 +6,8 @@ test("routes plain-language earnings question to revenue only", () => {
   assert.deepEqual(detectIntents("How much did I make?"), ["revenue"]);
 });
 
-test("routes a sales decline question to both summary and diagnosis", () => {
-  assert.deepEqual(detectIntents("Why are sales down?"), ["sales", "diagnostic"]);
+test("prioritizes diagnosis instead of returning only a generic sales summary", () => {
+  assert.deepEqual(detectIntents("Why are sales down?"), ["diagnostic"]);
 });
 
 test("routes funnel questions to funnel analysis", () => {
