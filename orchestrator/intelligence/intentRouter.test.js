@@ -25,3 +25,18 @@ test("returns no intent for an unrecognized question so the API can apply its fa
 test("normalizes punctuation and repeated whitespace", () => {
   assert.deepEqual(detectIntents("  HOW MUCH DID I MAKE?!  "), ["revenue"]);
 });
+
+test("routes greetings away from merchant analytics", () => {
+  assert.deepEqual(detectIntents("Hello!"), ["greeting"]);
+  assert.deepEqual(detectIntents("Good morning"), ["greeting"]);
+});
+
+test("routes gratitude away from merchant analytics", () => {
+  assert.deepEqual(detectIntents("Thanks"), ["gratitude"]);
+  assert.deepEqual(detectIntents("Thank you very much"), ["gratitude"]);
+});
+
+test("routes capability questions to a focused response", () => {
+  assert.deepEqual(detectIntents("What can you do?"), ["capabilities"]);
+  assert.deepEqual(detectIntents("How can you help me?"), ["capabilities"]);
+});
