@@ -1713,20 +1713,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
       sessionResult.rows[0]?.count || 0
     );
 
-    const trafficSessionResult = await db.query(
-      `
-        SELECT COUNT(DISTINCT session_id)::INTEGER AS count
-        FROM event_logs
-        WHERE site_id = $1
-          AND event = 'PAGE_VIEW'
-          AND created_at >= $2
-          AND created_at < $3
-      `,
-      [siteId, startUTC, endUTC]
-    );
-    const trafficSessions = Number(
-      trafficSessionResult.rows[0]?.count || 0
-    );
+    let trafficSessions = 0;
 
     // Compare today's partial traffic with the same local-time cutoff
     // across the previous seven local calendar days.
@@ -1755,7 +1742,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const trafficBaseline = {
       status: "insufficient_history",
-      currentSessions: trafficSessions,
+      currentSessions: 0,
       averageSessions: null,
       daysWithTraffic: 0,
       windowDays: 7,
@@ -1766,6 +1753,24 @@ app.post("/api/v1/intelligence", async (req, res) => {
     };
 
     try {
+      // This query is inside the guarded baseline block so a traffic-baseline
+      // failure never breaks the merchant's existing intelligence response.
+      const trafficSessionResult = await db.query(
+        `
+          SELECT COUNT(DISTINCT session_id)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND event = 'PAGE_VIEW'
+            AND created_at >= $2
+            AND created_at < $3
+        `,
+        [siteId, startUTC, endUTC]
+      );
+      trafficSessions = Number(
+        trafficSessionResult.rows[0]?.count || 0
+      );
+      trafficBaseline.currentSessions = trafficSessions;
+
       const firstBaselineDate = new Date(
         Date.UTC(year, month - 1, day - 7)
       );
