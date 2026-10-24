@@ -24,6 +24,7 @@ import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
 import { composeConversationResponse } from "./intelligence/responsePolicy.js";
 import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
+import { composeGrowthAdvice } from "./intelligence/growthAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 
 dotenv.config();
@@ -1064,6 +1065,9 @@ function composeIntent(intent, evidence, site, question = "") {
 
     case "advice":
       return composeKnowledgeGuidance(question, evidence) || composeAdvice(evidence);
+
+    case "growth":
+      return composeGrowthAdvice(evidence);
 
     case "overview":
       return composeOverview(evidence);

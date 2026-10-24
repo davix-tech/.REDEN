@@ -29,6 +29,16 @@ export function detectIntents(question) {
     return ["capabilities"];
   }
 
+  // Growth questions need a prioritized action plan, not a list of metrics.
+  if (
+    /\bhow (can|could|do) (we|i) (earn|make|generate) more\b/.test(q) ||
+    /\b(how to|ways to|help me) (increase|grow|boost) (sales|revenue|orders|profit)\b/.test(q) ||
+    /\b(increase|grow|boost) (my |our |store )?(sales|revenue|orders|profit)\b/.test(q) ||
+    /\bget more sales\b/.test(q)
+  ) {
+    return ["growth"];
+  }
+
   const intents = [];
 
   if (/\b(who|identity|name|merchant|store|business|company)\b/.test(q)) {
