@@ -145,14 +145,19 @@ export async function loadHistoricalBaselines({
   );
 
   const funnelAverages = {};
+  const funnelDaysByStage = {};
   for (const [stage, key] of [
     ["productView", "productViewSessions"],
     ["addToCart", "addToCartSessions"],
     ["checkout", "checkoutSessions"],
     ["purchase", "purchaseSessions"],
   ]) {
+    // A day with no recorded stage events may have broken instrumentation.
+    // Exclude it from that stage's baseline instead of assuming a true zero.
+    const observedStageDays = historicalTrafficDays.filter((day) => day[key] > 0);
+    funnelDaysByStage[stage] = observedStageDays.length;
     funnelAverages[stage] = average(
-      historicalTrafficDays
+      observedStageDays
         .map((day) => dailyRate(day, key))
         .filter((rate) => rate !== null)
     );
@@ -179,6 +184,7 @@ export async function loadHistoricalBaselines({
       rates: currentRates,
     },
     averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
     daysWithTraffic: historicalTrafficDays.length,
   };
 
@@ -198,6 +204,7 @@ export async function loadHistoricalBaselines({
         return current.pageViewSessions >= 5 &&
           currentStageCount > 0 &&
           baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
           currentRate < baselineRate * LOW_BASELINE_RATIO;
       })
       .map(([stage]) => stage);
