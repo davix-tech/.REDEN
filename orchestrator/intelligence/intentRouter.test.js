@@ -29,4 +29,5 @@ test("normalizes punctuation and repeated whitespace", () => {
 
 test("keeps a simple earnings question focused when it includes today", () => {
   assert.deepEqual(detectIntents("How much did I earn today?"), ["revenue"]);
+  assert.deepEqual(detectIntents("How much have I earned today?"), ["revenue"]);
 });
