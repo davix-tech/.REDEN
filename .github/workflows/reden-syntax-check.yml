@@ -31,5 +31,6 @@ jobs:
           node --check orchestrator/intelligence/knowledgeBase.js
           node --check orchestrator/intelligence/diagnostics.js
           node --check orchestrator/intelligence/intentRouter.js
+          node --check orchestrator/intelligence/historicalBaselines.js
       - name: Run intelligence unit tests
         run: npm test
