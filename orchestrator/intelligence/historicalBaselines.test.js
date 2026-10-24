@@ -4,12 +4,15 @@ import { loadHistoricalBaselines } from "./historicalBaselines.js";
 
 function mockDb({ eventDays, revenueDays }) {
   let call = 0;
+  const queries = [];
   return {
-    async query() {
+    async query(sql) {
+      queries.push(sql);
       call += 1;
       return { rows: call === 1 ? eventDays : revenueDays };
     },
     get callCount() { return call; },
+    get queries() { return queries; },
   };
 }
 
@@ -42,6 +45,8 @@ test("baseline queries are tenant-scoped and require two read-only queries", asy
   const db = mockDb({ eventDays: [], revenueDays: [] });
   const result = await loadHistoricalBaselines({ db, ...input });
   assert.equal(db.callCount, 2);
+  assert.match(db.queries[1], /JOIN purchase_sessions ps/i);
+  assert.match(db.queries[1], /ps\.session_id = ss\.session_id/i);
   assert.equal(result.revenueBaseline.status, "purchase_tracking_unconfirmed");
   assert.equal(result.funnelBaseline.status, "insufficient_history");
 });
