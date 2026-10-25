@@ -50,3 +50,24 @@ test("growth advice prioritizes a measured funnel regression over same-day heuri
   assert.match(answer, /25.0% versus a comparable baseline of 60.0%/);
   assert.match(answer, /payment errors/);
 });
+
+
+test("growth advice prioritizes a measured funnel regression over same-day heuristics", () => {
+  const answer = composeGrowthAdvice({
+    uniqueSessions: 100,
+    productViews: 50,
+    addToCart: 10,
+    checkoutStarted: 8,
+    purchases: 2,
+    purchaseRevenue: 500,
+    funnelBaseline: {
+      status: "below_baseline",
+      lowStages: ["checkout", "addToCart"],
+      current: { rates: { checkout: 0.25, addToCart: 0.2 } },
+      averages: { checkout: 0.6, addToCart: 0.35 }
+    }
+  });
+  assert.match(answer, /investigate checkout completion/i);
+  assert.match(answer, /25.0% versus a comparable baseline of 60.0%/);
+  assert.match(answer, /payment failures/);
+});
