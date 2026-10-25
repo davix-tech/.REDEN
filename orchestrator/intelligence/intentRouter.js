@@ -49,7 +49,8 @@ export function detectIntents(question) {
     /\bhow (can|could|do) (we|i) (earn|make|generate) more\b/.test(q) ||
     /\b(how to|ways to|help me) (increase|grow|boost) (sales|revenue|orders|profit)\b/.test(q) ||
     /\b(increase|grow|boost) (my |our |store )?(sales|revenue|orders|profit)\b/.test(q) ||
-    /\bget more sales\b/.test(q)
+    /\bget more sales\b/.test(q) ||
+    /\bhow can reden help (me|us|my store|our store) (increase|grow|boost) (sales|revenue|orders|profit)\b/.test(q)
   ) {
     return ["growth"];
   }
