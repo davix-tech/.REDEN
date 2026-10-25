@@ -22,11 +22,6 @@ export function detectIntents(question) {
     return ["reden_identity"];
   }
 
-  // REDEN capability and differentiation questions need a product-level answer,
-  // not an analytics report or a generic email/recovery feature list.
-  if (/\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\b/.test(q)) {
-    return ["capabilities"];
-  }
 
   // Route common e-commerce definitions to reviewed product knowledge.
   if (/\b(what is|what does|explain|define|meaning of|how does)\b/.test(q) &&
@@ -49,6 +44,22 @@ export function detectIntents(question) {
     return ["capabilities"];
   }
 
+  // Growth questions need a prioritized action plan, not a list of metrics.
+  if (
+    /\bhow (can|could|do) (we|i) (earn|make|generate) more\b/.test(q) ||
+    /\b(how to|ways to|help me) (increase|grow|boost) (sales|revenue|orders|profit)\b/.test(q) ||
+    /\b(increase|grow|boost) (my |our |store )?(sales|revenue|orders|profit)\b/.test(q) ||
+    /\bget more sales\b/.test(q)
+  ) {
+    return ["growth"];
+  }
+
+
+  // REDEN capability and differentiation questions need a product-level answer,
+  // not an analytics report or a generic email/recovery feature list.
+  if (/\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\b/.test(q)) {
+    return ["capabilities"];
+  }
   // Growth questions need a prioritized action plan, not a list of metrics.
   if (
     /\bhow (can|could|do) (we|i) (earn|make|generate) more\b/.test(q) ||
