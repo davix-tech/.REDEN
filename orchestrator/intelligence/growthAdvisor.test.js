@@ -69,5 +69,5 @@ test("growth advice prioritizes a measured funnel regression over same-day heuri
   });
   assert.match(answer, /investigate checkout completion/i);
   assert.match(answer, /25.0% versus a comparable baseline of 60.0%/);
-  assert.match(answer, /payment failures/);
+  assert.match(answer, /payment errors/);
 });
