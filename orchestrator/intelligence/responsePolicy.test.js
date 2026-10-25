@@ -43,3 +43,11 @@ test("commerce knowledge answers common definitions without inventing store fact
   assert.match(composeCommerceKnowledge("What is profit?"), /Revenue is money recorded from sales/);
   assert.match(composeCommerceKnowledge("What is a thing outside my knowledge?"), /don’t have enough information/);
 });
+
+
+test("capability answer describes REDEN as a decision layer and states execution limits", () => {
+  const answer = composeConversationResponse("capabilities");
+  assert.match(answer, /decision layer/i);
+  assert.match(answer, /not merely send another recovery email/i);
+  assert.match(answer, /automatically executed/i);
+});
