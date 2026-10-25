@@ -83,3 +83,10 @@ test("routes REDEN product-value questions to capabilities, not merchant metrics
   assert.deepEqual(detectIntents("How is REDEN different from a cart recovery tool?"), ["capabilities"]);
   assert.deepEqual(detectIntents("Why use REDEN instead of another email sending tool?"), ["capabilities"]);
 });
+
+
+test("routes specific REDEN sales-growth questions to a growth plan, not generic capabilities", () => {
+  assert.deepEqual(detectIntents("How can REDEN help me increase sales?"), ["growth"]);
+  assert.deepEqual(detectIntents("How can REDEN help our store grow revenue?"), ["growth"]);
+  assert.deepEqual(detectIntents("What can REDEN help me do?"), ["capabilities"]);
+});
