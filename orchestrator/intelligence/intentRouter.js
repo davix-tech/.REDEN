@@ -16,6 +16,11 @@ function normalizeQuestion(question) {
 export function detectIntents(question) {
   const q = normalizeQuestion(question);
 
+  // Product-value questions should explain REDEN's decision layer, not trigger metrics.
+  if (/\\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\\b/.test(q)) {
+    return ["capabilities"];
+  }
+
   // Conversational turns should not fall through to a merchant analytics report.
   // REDEN identity is distinct from the connected merchant store identity.
   if (/\b(what is your name|what s your name|who are you|what is reden|what s reden|tell me about reden|who built you|who created you|which company (built|created) you)\b/.test(q)) {
