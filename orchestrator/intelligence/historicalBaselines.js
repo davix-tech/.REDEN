@@ -219,7 +219,25 @@ export async function loadHistoricalBaselines({
     averages: funnelAverages,
     daysByStage: funnelDaysByStage,
     daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
   };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
 
   if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
     funnelBaseline.status = "available";

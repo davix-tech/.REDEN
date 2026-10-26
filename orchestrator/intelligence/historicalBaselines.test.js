@@ -120,6 +120,10 @@ test("does not classify zero stage counts as confirmed funnel declines", async (
   });
   assert.equal(result.funnelBaseline.status, "available");
   assert.deepEqual(result.funnelBaseline.lowStages, []);
+  assert.deepEqual(
+    result.funnelBaseline.trackingValidationStages,
+    ["productView"]
+  );
 });
 
 

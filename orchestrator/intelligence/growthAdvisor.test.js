@@ -71,3 +71,22 @@ test("growth advice prioritizes a measured funnel regression over same-day heuri
   assert.match(answer, /25.0% versus a comparable baseline of 60.0%/);
   assert.match(answer, /payment errors/);
 });
+
+
+test("growth advice asks to validate ambiguous zero-event stages before recommending commercial changes", () => {
+  const answer = composeGrowthAdvice({
+    uniqueSessions: 20,
+    productViews: 0,
+    addToCart: 0,
+    checkoutStarted: 0,
+    purchases: 0,
+    funnelBaseline: {
+      status: "available",
+      trackingValidationStages: ["productView", "addToCart", "checkout", "purchase"],
+      lowStages: []
+    }
+  });
+  assert.match(answer, /validate event tracking before diagnosing lost sales/i);
+  assert.match(answer, /genuine funnel break or an event-integration problem/i);
+  assert.match(answer, /before changing pricing, discounts, or ad spend/i);
+});

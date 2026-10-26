@@ -5,6 +5,18 @@
 
 function composeBaselinePriority(evidence) {
   const funnel = evidence.funnelBaseline;
+  if (funnel?.trackingValidationStages?.length) {
+    const labels = {
+      productView: "product-view",
+      addToCart: "add-to-cart",
+      checkout: "checkout-start",
+      purchase: "purchase",
+    };
+    const stages = funnel.trackingValidationStages
+      .map((stage) => labels[stage] || stage)
+      .join(", ");
+    return "**First priority — validate event tracking before diagnosing lost sales.** REDEN recorded enough upstream activity to expect downstream events, but recorded zero events at: " + stages + ". This could be a genuine funnel break or an event-integration problem. Run a controlled test journey and verify each event reaches REDEN before changing pricing, discounts, or ad spend.";
+  }
   if (funnel?.status === "below_baseline" && funnel.current && funnel.lowStages?.length) {
     const stageOrder = ["purchase", "checkout", "addToCart", "productView"];
     const stage = stageOrder.find((candidate) => funnel.lowStages.includes(candidate));
