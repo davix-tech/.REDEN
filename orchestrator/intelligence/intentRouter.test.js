@@ -112,3 +112,24 @@ test("routes specific REDEN sales-growth requests to the growth advisor", () => 
   assert.deepEqual(detectIntents("How can REDEN help our store grow revenue?"), ["growth"]);
   assert.deepEqual(detectIntents("What can REDEN help me do?"), ["capabilities"]);
 });
+
+
+test("routes current purchase-intent opportunities to the dedicated handler", () => {
+  assert.deepEqual(detectIntents("Which visitors are showing strong purchase intent right now?"), ["intent_opportunities"]);
+  assert.deepEqual(detectIntents("Which lost revenue opportunities are realistically recoverable?"), ["intent_opportunities"]);
+});
+
+test("routes incrementality and intervention-effectiveness questions to the dedicated handler", () => {
+  assert.deepEqual(detectIntents("Are REDEN's interventions actually generating extra sales?"), ["intervention_effectiveness"]);
+  assert.deepEqual(detectIntents("Which discounts are driving incremental sales?"), ["intervention_effectiveness"]);
+  assert.deepEqual(detectIntents("Would this customer have bought anyway?"), ["intervention_effectiveness"]);
+});
+
+test("routes next-best-action questions to evidence-aware prioritization", () => {
+  assert.deepEqual(detectIntents("What is the best next action for my store?"), ["merchant_priority"]);
+  assert.deepEqual(detectIntents("What single most valuable action should I take this week?"), ["merchant_priority"]);
+});
+
+test("keeps the purchase-intent definition in reviewed commerce knowledge", () => {
+  assert.deepEqual(detectIntents("What is purchase intent?"), ["commerce_knowledge"]);
+});
