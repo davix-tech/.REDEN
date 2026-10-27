@@ -98,3 +98,10 @@ test("routes merchant loss and priority questions to diagnosis before generic me
   assert.deepEqual(detectIntents("What should I fix first?"), ["diagnostic"]);
   assert.deepEqual(detectIntents("Where should we focus?"), ["diagnostic"]);
 });
+
+
+test("routes REDEN value questions to the capability explanation", () => {
+  assert.deepEqual(detectIntents("What can REDEN help me do?"), ["capabilities"]);
+  assert.deepEqual(detectIntents("How is REDEN different from a cart recovery tool?"), ["capabilities"]);
+  assert.deepEqual(detectIntents("Why use REDEN instead of another email sending tool?"), ["capabilities"]);
+});
