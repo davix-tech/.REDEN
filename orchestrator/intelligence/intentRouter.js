@@ -16,6 +16,12 @@ function normalizeQuestion(question) {
 export function detectIntents(question) {
   const q = normalizeQuestion(question);
 
+  // Specific merchant growth requests must reach the growth advisor before the
+  // broader product-value matcher below captures the phrase "how can REDEN help".
+  if (/\bhow can reden help (me|us|my store|our store) (increase|grow|boost) (sales|revenue|orders|profit)\b/.test(q)) {
+    return ["growth"];
+  }
+
   // Product-value questions should explain REDEN's decision layer, not trigger metrics.
   if (/\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\b/.test(q)) {
     return ["capabilities"];
