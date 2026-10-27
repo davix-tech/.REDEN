@@ -153,6 +153,31 @@ export async function updateSessionContext({
             END,
 
           last_seen_at = NOW(),
+
+          /*
+           * Keep the session-level intent proxy current for intelligence
+           * queries. This is a deterministic behavioural score, not a
+           * calibrated probability of purchase.
+           */
+          intent_score = LEAST(
+            1,
+            (
+              (session_summaries.page_views + EXCLUDED.page_views) * 0.02 +
+              (session_summaries.product_views + EXCLUDED.product_views) * 0.08 +
+              (session_summaries.cart_additions + EXCLUDED.cart_additions) * 0.20 +
+              CASE
+                WHEN session_summaries.checkout_started OR EXCLUDED.checkout_started
+                THEN 0.30
+                ELSE 0
+              END +
+              CASE
+                WHEN session_summaries.purchased OR EXCLUDED.purchased
+                THEN 0.50
+                ELSE 0
+              END
+            )
+          ),
+
           updated_at = NOW()
       `,
       [
