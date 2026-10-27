@@ -17,7 +17,7 @@ export function detectIntents(question) {
   const q = normalizeQuestion(question);
 
   // Product-value questions should explain REDEN's decision layer, not trigger metrics.
-  if (/\\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\\b/.test(q)) {
+  if (/\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\b/.test(q)) {
     return ["capabilities"];
   }
 
@@ -25,12 +25,6 @@ export function detectIntents(question) {
   // REDEN identity is distinct from the connected merchant store identity.
   if (/\b(what is your name|what s your name|who are you|what is reden|what s reden|tell me about reden|who built you|who created you|which company (built|created) you)\b/.test(q)) {
     return ["reden_identity"];
-  }
-
-  // REDEN capability and differentiation questions need a product-level answer,
-  // not an analytics report or a generic email/recovery feature list.
-  if (/\b(what can reden (do|help me do)|how can reden help|how does reden help|what is reden useful for|why use reden|how is reden different|what makes reden different|instead of (a |another )?(cart recovery|email marketing|email sending) tool)\b/.test(q)) {
-    return ["capabilities"];
   }
 
   // Route common e-commerce definitions to reviewed product knowledge.
