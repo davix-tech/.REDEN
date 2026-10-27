@@ -38,6 +38,27 @@ export function detectIntents(question) {
     return ["capabilities"];
   }
 
+  // High-value merchant questions should reach evidence-aware intelligence handlers
+  // before broad keyword routing adds unrelated metric summaries.
+  if (
+    /\b(high[- ]intent|likely to buy|likely to purchase|recoverable revenue|lost revenue opportunities|which visitors|hesitating buyer|shoppers? showing strong interest)\b/.test(q) &&
+    !/^(what is|what does|explain|define|meaning of)\b/.test(q)
+  ) {
+    return ["intent_opportunities"];
+  }
+
+  if (
+    /\b(incremental|would have bought anyway|would have purchased anyway|would (this |the )?customer have bought anyway|would (this |the )?customer have purchased anyway|extra sales|actually producing sales|actually generating sales|intervention effectiveness|did reden.*(work|cause|generate)|are (reden|your) interventions|discounts? (actually )?(driving|creating) incremental)\b/.test(q)
+  ) {
+    return ["intervention_effectiveness"];
+  }
+
+  if (
+    /\b(what should i do next|what should we do next|single (most )?valuable action|most valuable thing i could change|what deserves my attention|what should i focus on next|what should i do first|what is the best next action|what would you fix first)\b/.test(q)
+  ) {
+    return ["merchant_priority"];
+  }
+
   // Route common e-commerce definitions to reviewed product knowledge.
   if (/\b(what is|what does|explain|define|meaning of|how does)\b/.test(q) &&
       /\b(conversion rate|purchase intent|abandoned cart|average order value|aov|ecommerce funnel|sales funnel|revenue|profit|reden|commerce orchestration|discount)\b/.test(q)) {

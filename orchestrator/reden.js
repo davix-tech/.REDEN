@@ -26,6 +26,7 @@ import { composeConversationResponse } from "./intelligence/responsePolicy.js";
 import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
 import { composeGrowthAdvice } from "./intelligence/growthAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
+import { composeMerchantIntelligence } from "./intelligence/merchantIntelligence.js";
 
 dotenv.config();
 
@@ -1080,6 +1081,11 @@ function composeIntent(intent, evidence, site, question = "") {
     case "attribution":
       return composeAttribution(evidence);
 
+    case "intent_opportunities":
+    case "intervention_effectiveness":
+    case "merchant_priority":
+      return composeMerchantIntelligence(intent, evidence);
+
     default:
       return null;
   }
@@ -1996,6 +2002,105 @@ app.post("/api/v1/intelligence", async (req, res) => {
       failed: Number(emailRow.failed || 0),
     };
 
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await db.query(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
     const banditResult = await db.query(
       `
         SELECT *
@@ -2121,6 +2226,9 @@ app.post("/api/v1/intelligence", async (req, res) => {
       bandit,
 
       attribution,
+
+      intentSummary,
+      interventionOutcomes,
 
       eventCounts,
     };
