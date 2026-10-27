@@ -49,13 +49,13 @@ export function detectIntents(question) {
   }
 
   // Merchant problem-finding questions should start with diagnosis, not a generic sales summary.
-  if (/\\b(where am i|where are we|what is|what s|what's|why am i|why are we)\\b/.test(q) &&
-      /\\b(losing|lose|lost|leaking|leak|stopping|blocking|hurting|killing)\\b/.test(q) &&
-      /\\b(sales|revenue|orders|conversions|customers)\\b/.test(q)) {
+  if (/\b(where am i|where are we|what is|what s|what's|why am i|why are we)\b/.test(q) &&
+      /\b(losing|lose|lost|leaking|leak|stopping|blocking|hurting|killing)\b/.test(q) &&
+      /\b(sales|revenue|orders|conversions|customers)\b/.test(q)) {
     return ["diagnostic"];
   }
 
-  if (/\\b(what should i fix first|what should we fix first|where should i focus|where should we focus|biggest sales problem|biggest problem with my store)\\b/.test(q)) {
+  if (/\b(what should i fix first|what should we fix first|where should i focus|where should we focus|biggest sales problem|biggest problem with my store)\b/.test(q)) {
     return ["diagnostic"];
   }
 
