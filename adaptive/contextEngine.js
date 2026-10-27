@@ -50,6 +50,7 @@ export async function updateSessionContext({
 
           cart_value,
           revenue,
+          intent_score,
 
           purchased_at,
 
@@ -71,6 +72,14 @@ export async function updateSessionContext({
 
           $8,
           $9,
+          LEAST(
+            1,
+            ($3 * 0.02) +
+            ($4 * 0.08) +
+            ($5 * 0.20) +
+            CASE WHEN $6 THEN 0.30 ELSE 0 END +
+            CASE WHEN $7 THEN 0.50 ELSE 0 END
+          ),
 
           CASE WHEN $7 THEN NOW() ELSE NULL END,
 
