@@ -6,7 +6,7 @@
  * explicitly conditional; merchant-specific conclusions must come from
  * the evidence assembled by the intelligence pipeline.
  */
-export const REDEN_KNOWLEDGE_VERSION = "2026-10-24.2";
+export const REDEN_KNOWLEDGE_VERSION = "2026-10-28.1";
 
 export const REDEN_KNOWLEDGE = {
   sales_diagnosis: {
@@ -171,6 +171,26 @@ export const REDEN_KNOWLEDGE = {
       "Recommend the smallest useful next action.",
       "State the success metric and review window.",
       "Report incremental revenue or profit only when the comparison supports it."
+    ]
+  },
+  merchant_intelligence: {
+    title: "Merchant intelligence and next-best action",
+    domain: "decision_intelligence",
+    principles: [
+      "Treat behavioural intent scores as ranking signals, not calibrated probabilities that an individual will purchase.",
+      "Prioritize opportunities by observed behaviour, recency, eligibility, expected benefit, intervention cost, downside risk, and confidence; do not equate cart value with recoverable revenue.",
+      "Distinguish a recorded event, a behavioural inference, a forecast, and a causal conclusion in every answer.",
+      "Compare interventions using eligible populations and recorded outcomes; action-level conversion rates are descriptive and do not prove incremental lift.",
+      "Do not recommend a discount by default. Consider no intervention, useful information, reassurance, or a reminder when those actions are supported and eligible.",
+      "When the evidence is insufficient, say what is missing and recommend the smallest safe verification step instead of inventing a cause or ranking.",
+      "Proactive findings must include a reporting window, evidence, uncertainty, and a measurable next check."
+    ],
+    required_answer_contract: [
+      "Answer the merchant's actual question first.",
+      "State the reporting window and the evidence used.",
+      "Label observations, inferences, forecasts, and causal claims distinctly.",
+      "Recommend one prioritized action, including when no action is justified.",
+      "State the success measure and what additional evidence would change the recommendation."
     ]
   },
   conversation_policy: {
