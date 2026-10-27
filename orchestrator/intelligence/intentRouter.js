@@ -48,7 +48,7 @@ export function detectIntents(question) {
   }
 
   if (
-    /\b(incremental|would have bought anyway|would have purchased anyway|extra sales|actually producing sales|actually generating sales|intervention effectiveness|did reden.*(work|cause|generate)|are (reden|your) interventions|discounts? (actually )?(driving|creating) incremental)\b/.test(q)
+    /\b(incremental|would have bought anyway|would have purchased anyway|would (this |the )?customer have bought anyway|would (this |the )?customer have purchased anyway|extra sales|actually producing sales|actually generating sales|intervention effectiveness|did reden.*(work|cause|generate)|are (reden|your) interventions|discounts? (actually )?(driving|creating) incremental)\b/.test(q)
   ) {
     return ["intervention_effectiveness"];
   }
