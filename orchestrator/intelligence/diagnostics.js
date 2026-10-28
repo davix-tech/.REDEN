@@ -1,48 +1,119 @@
-import { REDEN_KNOWLEDGE } from "./knowledgeBase.js";
-
 function numberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
 
 function money(value) {
   const number = numberOrNull(value);
-  return number === null ? null : number.toLocaleString("en-NG", { maximumFractionDigits: 2 });
+  return number === null
+    ? null
+    : number.toLocaleString("en-NG", { maximumFractionDigits: 2 });
 }
 
-/** Give merchants a concise, evidence-led diagnosis and practical next step. */
-export function diagnoseSales(evidence) {
-  const baseline = evidence.trafficBaseline;
-  const revenueBaseline = evidence.revenueBaseline;
-  const funnelBaseline = evidence.funnelBaseline;
-  const purchases = Math.max(0, Number(evidence.purchases) || 0);
+function count(value) {
+  const number = numberOrNull(value);
+  return number === null ? 0 : Math.max(0, number);
+}
+
+const STAGES = {
+  productView: {
+    label: "product-page discovery",
+    action: "Check landing-page relevance, navigation, product availability and PRODUCT_VIEW tracking.",
+  },
+  addToCart: {
+    label: "product-to-cart progression",
+    action: "Review product price, stock, delivery costs, product information and trust signals; verify ADD_TO_CART tracking.",
+  },
+  checkout: {
+    label: "cart-to-checkout progression",
+    action: "Check cart usability, shipping costs and delivery details, then verify CHECKOUT_STARTED tracking.",
+  },
+  purchase: {
+    label: "checkout-to-purchase completion",
+    action: "Test mobile checkout, payment failures, shipping fees and purchase-event delivery.",
+  },
+};
+
+const DOWNSTREAM_FIRST = ["purchase", "checkout", "addToCart", "productView"];
+
+function stageLabel(stage) {
+  return STAGES[stage]?.label || String(stage || "shopping journey");
+}
+
+function formatStageRate(funnel, stage) {
+  const current = numberOrNull(funnel?.current?.rates?.[stage]);
+  const baseline = numberOrNull(funnel?.averages?.[stage]);
+  if (current === null || baseline === null) return "";
+  return ` The recorded rate is ${(current * 100).toFixed(1)}% versus ${(baseline * 100).toFixed(1)}% in comparable periods.`;
+}
+
+/**
+ * Diagnose the most actionable supported sales signal. This is a concise
+ * deterministic business diagnosis, not a causal attribution claim.
+ */
+export function diagnoseSales(evidence = {}) {
+  const traffic = evidence.trafficBaseline || {};
+  const revenueBaseline = evidence.revenueBaseline || {};
+  const funnel = evidence.funnelBaseline || {};
+  const purchases = count(evidence.purchases);
   const revenue = money(evidence.purchaseRevenue);
+  const recordedRevenue = revenue === null ? "" : ` Recorded purchase revenue is ${revenue}.`;
 
-  if (baseline && baseline.status === "below_baseline") {
-    return "Fewer people are visiting your store than usual (" + baseline.currentSessions + " visits so far versus a typical " + Number(baseline.averageSessions).toFixed(0) + "). That means fewer potential buyers. Review your ad delivery and traffic sources, then consider a targeted campaign to attract qualified shoppers. If traffic recovers but purchases do not, we should investigate product pages and checkout.";
+  // Missing downstream events can mean either a real journey break or broken
+  // instrumentation. Validate before recommending commercial changes.
+  if (Array.isArray(funnel.trackingValidationStages) && funnel.trackingValidationStages.length) {
+    const stage = DOWNSTREAM_FIRST.find((candidate) => funnel.trackingValidationStages.includes(candidate))
+      || funnel.trackingValidationStages[0];
+    return `REDEN sees upstream visits but no recorded ${stageLabel(stage)} events. This could be a real drop-off or missing tracking. ${STAGES[stage]?.action || "Run a test journey and verify the event reaches REDEN."} Do this before changing ads, prices or discounts.`;
   }
 
-  if (funnelBaseline && funnelBaseline.status === "below_baseline" && funnelBaseline.lowStages && funnelBaseline.lowStages.length) {
-    const labels = { productView: "product views", addToCart: "add-to-cart activity", checkout: "checkout completion", purchase: "purchases" };
-    const stage = funnelBaseline.lowStages[0];
-    return "The clearest warning sign is " + (labels[stage] || stage) + ": it is below your usual level. More advertising may bring visitors, but it will not fix a weak conversion step. Check that part of the shopping journey first, then measure whether purchases improve.";
+  if (revenueBaseline.status === "purchase_summary_mismatch") {
+    return "Purchase events and purchased-session records do not agree, so the revenue comparison is not reliable. Run a test order and verify that the PURCHASE event and purchased session are both recorded before changing ads or offers.";
   }
 
-  if (revenueBaseline && revenueBaseline.status === "below_baseline") {
-    return "Sales revenue is below your usual level (" + money(revenueBaseline.currentRevenue) + " now versus " + money(revenueBaseline.averageRevenue) + " in comparable periods). Check whether purchase count or average order value has fallen. If visits are down too, review advertising; if visits are steady, focus on product pages and checkout.";
+  if (traffic.status === "below_baseline") {
+    const current = numberOrNull(traffic.currentSessions);
+    const average = numberOrNull(traffic.averageSessions);
+    const comparison = current !== null && average !== null
+      ? ` (${current} visits so far versus a same-time average of ${average.toFixed(0)} across ${count(traffic.daysWithTraffic)} recent days)`
+      : "";
+    const funnelStage = DOWNSTREAM_FIRST.find((stage) => Array.isArray(funnel.lowStages) && funnel.lowStages.includes(stage));
+    const conversionNote = funnelStage
+      ? ` REDEN also flags ${stageLabel(funnelStage)}; investigate that step if visits recover but purchases do not.`
+      : " First confirm the storefront is reachable and PAGE_VIEW tracking works.";
+    return `Fewer people are visiting your store than usual${comparison}, so fewer potential buyers are entering the funnel. Check ad delivery, traffic sources and broken links; if tracking is healthy, test a targeted campaign for qualified shoppers.${conversionNote}`;
   }
 
-  if ((revenueBaseline && revenueBaseline.status === "purchase_tracking_unconfirmed") || purchases === 0) {
-    return "No purchase has been recorded in the current comparison window. Customers may not be buying, or purchase tracking may be missing orders. Verify tracking with a test order; if it works, check visits, add-to-cart activity and checkout before increasing ad spend.";
+  if (Array.isArray(funnel.lowStages) && funnel.lowStages.length) {
+    const stage = DOWNSTREAM_FIRST.find((candidate) => funnel.lowStages.includes(candidate))
+      || funnel.lowStages[0];
+    return `The clearest warning sign is ${stageLabel(stage)}.${formatStageRate(funnel, stage)} ${STAGES[stage]?.action || "Inspect this step of the shopping journey and verify its event tracking."} More advertising will not fix a weak conversion step.`;
   }
 
-  if (baseline && baseline.status === "not_markedly_below_baseline") {
-    return "Your store recorded " + purchases + " purchase" + (purchases === 1 ? "" : "s") + " today" + (revenue === null ? "" : " and " + revenue + " in purchase revenue") + ". Visits are not clearly below normal, so more advertising may not be the first fix. Check product-page interest, add-to-cart activity and checkout completion to find where shoppers may be dropping off.";
+  if (revenueBaseline.status === "below_baseline") {
+    const current = money(revenueBaseline.currentRevenue);
+    const average = money(revenueBaseline.averageRevenue);
+    const comparison = current !== null && average !== null
+      ? ` (${current} recorded so far versus ${average} in comparable periods)`
+      : "";
+    return `Recorded purchase revenue is below its usual level${comparison}.${recordedRevenue} Compare purchase count and average order value, then verify payment and purchase tracking. If visits are also down, review acquisition; if visits are steady, investigate product pages and checkout.`;
+  }
+
+  if (revenueBaseline.status === "purchase_tracking_unconfirmed" || purchases === 0) {
+    return "REDEN has no confirmed purchase event for this period. That could mean no orders or missing purchase tracking. Run a test order first; if tracking works, check visits, add-to-cart activity and checkout to find where shoppers stop before increasing ad spend.";
+  }
+
+  if (traffic.status === "not_markedly_below_baseline") {
+    if (purchases <= 1) {
+      return `Only ${purchases} purchase${purchases === 1 ? "" : "s"} ${purchases === 1 ? "has" : "have"} been recorded so far.${recordedRevenue} Visits are not clearly below normal, so do not default to more advertising. Check product interest, add-to-cart activity and checkout completion; I cannot confirm a decline without a comparable purchase baseline.`;
+    }
+    return `REDEN recorded ${purchases} purchases so far.${recordedRevenue} Visits are not clearly below normal, so more advertising may not be the first fix. Check product-page interest, add-to-cart activity and checkout completion for the next bottleneck.`;
   }
 
   if (purchases <= 1) {
-    return "Only " + purchases + " purchase" + (purchases === 1 ? "" : "s") + " " + (purchases === 1 ? "has" : "have") + " been recorded today" + (revenue === null ? "" : " (" + revenue + " in revenue)") + ", so sales activity looks low. I would try a targeted campaign to bring in more qualified shoppers. Before increasing spend heavily, check traffic: if people are visiting but not buying, improve the product page or checkout instead. I cannot confirm this is below your usual level without historical comparison."; 
+    return `Only ${purchases} purchase${purchases === 1 ? "" : "s"} ${purchases === 1 ? "has" : "have"} been recorded so far.${recordedRevenue} I cannot confirm this is below your usual level without comparable history. Verify purchase tracking, then compare traffic and the product-to-cart and checkout steps before deciding whether to invest more in advertising.`;
   }
 
-  return "Your store recorded " + purchases + " purchases today" + (revenue === null ? "" : " and " + revenue + " in purchase revenue") + ". I cannot confirm a decline without comparable historical data. Check whether visits are down or shoppers are leaving during product selection or checkout; that will tell us whether to focus on advertising or conversion.";
+  return `REDEN recorded ${purchases} purchases so far.${recordedRevenue} I cannot confirm a sales decline without comparable historical data. Compare traffic first: if visits are down, investigate acquisition; if visits are steady, inspect product-page, cart and checkout conversion.`;
 }
