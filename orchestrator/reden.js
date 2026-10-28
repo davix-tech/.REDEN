@@ -2907,15 +2907,13 @@ app.get("/metrics", async (req, res) => {
     const row = result.rows[0] || {};
     let events = {};
     let totalEvents = 0;
-    let uniqueEventSessions = 0;
 
     try {
       const eventResult = await db.query(
         `
           SELECT
             event,
-            COUNT(*)::INTEGER AS count,
-            COUNT(DISTINCT session_id)::INTEGER AS sessions
+            COUNT(*)::INTEGER AS count
           FROM event_logs
           WHERE site_id = $1
             AND created_at >= NOW() - INTERVAL '30 days'
@@ -2928,10 +2926,6 @@ app.get("/metrics", async (req, res) => {
         const count = Number(eventRow.count || 0);
         events[eventRow.event] = count;
         totalEvents += count;
-        uniqueEventSessions = Math.max(
-          uniqueEventSessions,
-          Number(eventRow.sessions || 0)
-        );
       }
     } catch (eventError) {
       console.error("[METRICS EVENT QUERY ERROR]", {
@@ -2946,7 +2940,6 @@ app.get("/metrics", async (req, res) => {
       revenue: Number(row.revenue || 0),
       events,
       totalEvents,
-      uniqueSessions: uniqueEventSessions,
       eventsWindow: "last_30_days",
     });
   } catch (error) {
