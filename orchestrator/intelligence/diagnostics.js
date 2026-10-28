@@ -5,115 +5,44 @@ function numberOrNull(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-/**
- * Produces a cautious, evidence-linked sales diagnosis.
- * This does not claim a cause when the available evidence cannot establish one.
- */
+function money(value) {
+  const number = numberOrNull(value);
+  return number === null ? null : number.toLocaleString("en-NG", { maximumFractionDigits: 2 });
+}
+
+/** Give merchants a concise, evidence-led diagnosis and practical next step. */
 export function diagnoseSales(evidence) {
-  const knowledge = REDEN_KNOWLEDGE.sales_diagnosis;
   const baseline = evidence.trafficBaseline;
-  const observations = [
-    `Today REDEN recorded ${evidence.purchases} purchase event(s) and ${numberOrNull(evidence.purchaseRevenue)?.toFixed(2) ?? "an unavailable amount"} in storefront purchase revenue.`
-  ];
-  const hypotheses = [];
-  const actions = [];
-
-  if (baseline?.status === "below_baseline") {
-    hypotheses.push(
-      `Recorded traffic is materially below its same-time baseline (${baseline.currentSessions} sessions so far versus a historical average of ${baseline.averageSessions.toFixed(1)} across ${baseline.daysWithTraffic} eligible days). This may be contributing to lower sales, but it does not by itself prove the cause.`
-    );
-    actions.push(
-      "First verify storefront availability and PAGE_VIEW tracking. If both are healthy, inspect traffic sources and campaign delivery before changing spend."
-    );
-  } else if (baseline?.status === "not_markedly_below_baseline") {
-    hypotheses.push(
-      "Recorded PAGE_VIEW sessions are not materially below the available same-time baseline. That makes a large traffic drop less evident in the current data; product interest, cart activity, checkout completion, and order value still need comparable historical baselines."
-    );
-  } else {
-    hypotheses.push(
-      "I cannot yet confirm why sales are down: REDEN needs a reliable comparable-period revenue and purchase baseline, and its current traffic history is insufficient to establish whether visits have fallen."
-    );
-    actions.push(
-      "Verify PAGE_VIEW and PURCHASE tracking, then compare revenue, purchase count, and funnel-stage rates with the same local-time window on recent days."
-    );
-  }
-
-  if (evidence.checkoutStarted > 0 && evidence.purchases > 0 &&
-      evidence.checkoutStarted > evidence.purchases * 2) {
-    hypotheses.push(
-      `There are ${evidence.checkoutStarted} checkout-start events versus ${evidence.purchases} purchase event(s). This is an event-count gap, not a confirmed count of abandoned checkouts.`
-    );
-    actions.push(
-      "Test checkout and payment completion, and confirm that successful orders reliably emit PURCHASE events."
-    );
-  } else if (evidence.checkoutStarted > 0 && evidence.purchases === 0) {
-    hypotheses.push(
-      "Checkout starts are recorded without a purchase event today. This could reflect checkout friction or missing purchase tracking; the current evidence cannot distinguish them."
-    );
-    actions.push(
-      "Run a test purchase and verify payment completion and PURCHASE-event delivery before diagnosing a conversion failure."
-    );
-  }
-
   const revenueBaseline = evidence.revenueBaseline;
-  if (revenueBaseline?.status === "below_baseline") {
-    hypotheses.push(
-      `Same-time recorded storefront purchase revenue is materially below the recent comparable baseline (${Number(revenueBaseline.currentRevenue).toFixed(2)} versus an average of ${Number(revenueBaseline.averageRevenue).toFixed(2)} across ${revenueBaseline.daysWithComparablePurchases} comparable purchase days). This is a measured change in recorded revenue, not proof of its cause.`
-    );
-    actions.push(
-      "Compare purchase count and average order value with the same historical window, then verify order and payment-event tracking before changing pricing or marketing."
-    );
-  } else if (revenueBaseline?.status === "purchase_tracking_unconfirmed") {
-    hypotheses.push(
-      "A same-time revenue decline cannot be confirmed because no PURCHASE event is recorded in the current comparison window. That may mean no purchase was recorded or purchase tracking is missing; it is not enough to conclude revenue was zero."
-    );
-    actions.push(
-      "Run a controlled test purchase and confirm both the PURCHASE event and the corresponding purchased session are recorded."
-    );
-  } else if (revenueBaseline?.status === "purchase_summary_mismatch") {
-    hypotheses.push(
-      "Purchase events are present but the corresponding purchased-session revenue summary is missing or inconsistent, so the revenue comparison is not reliable."
-    );
-    actions.push(
-      "Check purchase-event delivery and session_summaries purchase reconciliation before interpreting revenue movement."
-    );
-  }
-
   const funnelBaseline = evidence.funnelBaseline;
-  if (funnelBaseline?.status === "below_baseline" && funnelBaseline.current) {
-    const stageLabels = {
-      productView: "product-view",
-      addToCart: "add-to-cart",
-      checkout: "checkout",
-      purchase: "purchase",
-    };
-    const stageDetails = funnelBaseline.lowStages.map((stage) => {
-      const currentRate = funnelBaseline.current.rates?.[stage];
-      const averageRate = funnelBaseline.averages?.[stage];
-      return `${stageLabels[stage] || stage} sessions are ${(Number(currentRate) * 100).toFixed(1)}% of page-view sessions versus a recent same-time average of ${(Number(averageRate) * 100).toFixed(1)}%.`;
-    });
-    hypotheses.push(
-      `Recorded funnel rates are materially below their comparable baseline: ${stageDetails.join(" ")} These are session-level tracking signals, not proof of a single underlying cause.`
-    );
-    actions.push(
-      "Check the affected page or checkout flow and verify the corresponding event fires correctly before changing offers or spending."
-    );
+  const purchases = Math.max(0, Number(evidence.purchases) || 0);
+  const revenue = money(evidence.purchaseRevenue);
+
+  if (baseline && baseline.status === "below_baseline") {
+    return "Fewer people are visiting your store than usual (" + baseline.currentSessions + " visits so far versus a typical " + Number(baseline.averageSessions).toFixed(0) + "). That means fewer potential buyers. Review your ad delivery and traffic sources, then consider a targeted campaign to attract qualified shoppers. If traffic recovers but purchases do not, we should investigate product pages and checkout.";
   }
 
-  const uniqueActions = [...new Set(actions)];
-  const uncertainty = baseline?.status === "below_baseline" ||
-    baseline?.status === "not_markedly_below_baseline"
-    ? ""
-    : " A confirmed cause requires historical revenue and funnel comparisons; those comparisons are not yet available in this response.";
+  if (funnelBaseline && funnelBaseline.status === "below_baseline" && funnelBaseline.lowStages && funnelBaseline.lowStages.length) {
+    const labels = { productView: "product views", addToCart: "add-to-cart activity", checkout: "checkout completion", purchase: "purchases" };
+    const stage = funnelBaseline.lowStages[0];
+    return "The clearest warning sign is " + (labels[stage] || stage) + ": it is below your usual level. More advertising may bring visitors, but it will not fix a weak conversion step. Check that part of the shopping journey first, then measure whether purchases improve.";
+  }
 
-  return [
-    "Sales diagnosis (evidence-led):",
-    ...observations,
-    ...hypotheses.map((item) => `- ${item}`),
-    uniqueActions.length
-      ? `Recommended checks: ${uniqueActions.join(" ")}`
-      : "Recommended next step: compare today's product-view, add-to-cart, checkout, purchase, and revenue metrics with a comparable historical period before choosing an intervention.",
-    uncertainty,
-    `Reasoning framework: ${knowledge.reasoning_rules[0]}`
-  ].filter(Boolean).join(" ");
+  if (revenueBaseline && revenueBaseline.status === "below_baseline") {
+    return "Sales revenue is below your usual level (" + money(revenueBaseline.currentRevenue) + " now versus " + money(revenueBaseline.averageRevenue) + " in comparable periods). Check whether purchase count or average order value has fallen. If visits are down too, review advertising; if visits are steady, focus on product pages and checkout.";
+  }
+
+  if ((revenueBaseline && revenueBaseline.status === "purchase_tracking_unconfirmed") || purchases === 0) {
+    return "No purchase has been recorded in the current comparison window. Customers may not be buying, or purchase tracking may be missing orders. Verify tracking with a test order; if it works, check visits, add-to-cart activity and checkout before increasing ad spend.";
+  }
+
+  if (baseline && baseline.status === "not_markedly_below_baseline") {
+    return "Your store recorded " + purchases + " purchase" + (purchases === 1 ? "" : "s") + " today" + (revenue === null ? "" : " and " + revenue + " in purchase revenue") + ". Visits are not clearly below normal, so more advertising may not be the first fix. Check product-page interest, add-to-cart activity and checkout completion to find where shoppers may be dropping off.";
+  }
+
+  if (purchases <= 1) {
+    return "Only " + purchases + " purchase" + (purchases === 1 ? "" : "s") + " " + (purchases === 1 ? "has" : "have") + " been recorded today" + (revenue === null ? "" : " (" + revenue + " in revenue)") + ", so sales activity looks low. I would try a targeted campaign to bring in more qualified shoppers. Before increasing spend heavily, check traffic: if people are visiting but not buying, improve the product page or checkout instead. I cannot confirm this is below your usual level without historical comparison."; 
+  }
+
+  return "Your store recorded " + purchases + " purchases today" + (revenue === null ? "" : " and " + revenue + " in purchase revenue") + ". I cannot confirm a decline without comparable historical data. Check whether visits are down or shoppers are leaving during product selection or checkout; that will tell us whether to focus on advertising or conversion.";
 }
