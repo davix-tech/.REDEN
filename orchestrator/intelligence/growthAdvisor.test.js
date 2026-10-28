@@ -46,7 +46,7 @@ test("growth advice prioritizes a measured funnel regression over same-day heuri
       averages: { checkout: 0.6, addToCart: 0.35 }
     }
   });
-  assert.match(answer, /investigate checkout completion/i);
+  assert.match(answer, /cart-to-checkout progression/i);
   assert.match(answer, /25.0% versus a comparable baseline of 60.0%/);
   assert.match(answer, /payment errors/);
 });
@@ -67,7 +67,7 @@ test("growth advice prioritizes a measured funnel regression over same-day heuri
       averages: { checkout: 0.6, addToCart: 0.35 }
     }
   });
-  assert.match(answer, /investigate checkout completion/i);
+  assert.match(answer, /cart-to-checkout progression/i);
   assert.match(answer, /25.0% versus a comparable baseline of 60.0%/);
   assert.match(answer, /payment errors/);
 });
@@ -86,7 +86,7 @@ test("growth advice asks to validate ambiguous zero-event stages before recommen
       lowStages: []
     }
   });
-  assert.match(answer, /validate event tracking before diagnosing lost sales/i);
-  assert.match(answer, /genuine funnel break or an event-integration problem/i);
-  assert.match(answer, /before changing pricing, discounts, or ad spend/i);
+  assert.match(answer, /missing tracking/i);
+  assert.match(answer, /real drop-off or missing tracking/i);
+  assert.match(answer, /before changing ads, prices or discounts/i);
 });
