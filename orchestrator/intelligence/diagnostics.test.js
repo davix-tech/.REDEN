@@ -106,7 +106,7 @@ test("when traffic is steady, prioritizes conversion checks over advertising", (
 });
 
 test("does not claim that one purchase proves a decline or always recommends ads", () => {
-  const answer = diagnoseSales({ ...baseEvidence, purchases: 1, purchaseRevenue: 925000 });
+  const answer = diagnoseSales({ ...baseEvidence, purchases: 1, purchaseRevenue: 925000, trafficBaseline: { status: "not_markedly_below_baseline" } });
   assert.match(answer, /Only 1 purchase has been recorded/i);
   assert.match(answer, /cannot confirm a decline without a comparable purchase baseline/i);
   assert.match(answer, /Check product interest/i);
