@@ -52,7 +52,7 @@ function formatStageRate(funnel, stage) {
  * Diagnose the most actionable supported sales signal. This is a concise
  * deterministic business diagnosis, not a causal attribution claim.
  */
-export function diagnoseSales(evidence = {}) {
+export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
   const traffic = evidence.trafficBaseline || {};
   const revenueBaseline = evidence.revenueBaseline || {};
   const funnel = evidence.funnelBaseline || {};
@@ -108,8 +108,11 @@ export function diagnoseSales(evidence = {}) {
     if (purchases <= 1) {
       return `Only ${purchases} purchase${purchases === 1 ? "" : "s"} ${purchases === 1 ? "has" : "have"} been recorded so far.${recordedRevenue} Visits are not clearly below normal, so do not default to more advertising. Check product interest, add-to-cart activity and checkout completion; I cannot confirm a decline without a comparable purchase baseline.`;
     }
+    if (!allowFallback) return null;
     return `REDEN recorded ${purchases} purchases so far.${recordedRevenue} Visits are not clearly below normal, so more advertising may not be the first fix. Check product-page interest, add-to-cart activity and checkout completion for the next bottleneck.`;
   }
+
+  if (!allowFallback) return null;
 
   if (purchases <= 1) {
     return `Only ${purchases} purchase${purchases === 1 ? "" : "s"} ${purchases === 1 ? "has" : "have"} been recorded so far.${recordedRevenue} I cannot confirm this is below your usual level without comparable history. Verify purchase tracking, then compare traffic and the product-to-cart and checkout steps before deciding whether to invest more in advertising.`;
