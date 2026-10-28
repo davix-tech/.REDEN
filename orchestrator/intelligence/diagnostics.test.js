@@ -11,47 +11,55 @@ const baseEvidence = {
   funnelBaseline: { status: "insufficient_history" },
 };
 
-test("does not claim a cause when historical evidence is insufficient", () => {
+test("gives a concise practical recommendation when comparable evidence is insufficient", () => {
   const answer = diagnoseSales(baseEvidence);
-  assert.match(answer, /cannot yet confirm why sales are down/i);
-  assert.match(answer, /historical revenue and funnel comparisons/i);
-  assert.doesNotMatch(answer, /sales are down because/i);
+  assert.match(answer, /cannot confirm a decline without comparable historical data/i);
+  assert.match(answer, /advertising or conversion/i);
+  assert.ok(answer.length < 500, "merchant answer should stay concise");
 });
 
-test("reports revenue below baseline as an observation, not a cause", () => {
+test("recommends advertising review when traffic is below baseline", () => {
   const answer = diagnoseSales({
     ...baseEvidence,
-    revenueBaseline: {
-      status: "below_baseline",
-      currentRevenue: 120,
-      averageRevenue: 500,
-      daysWithComparablePurchases: 5,
-    },
+    trafficBaseline: { status: "below_baseline", currentSessions: 20, averageSessions: 80, daysWithTraffic: 5 },
   });
-  assert.match(answer, /materially below the recent comparable baseline/i);
-  assert.match(answer, /not proof of its cause/i);
+  assert.match(answer, /Fewer people are visiting your store than usual/i);
+  assert.match(answer, /targeted campaign/i);
 });
 
-test("recommends tracking verification when current purchase events are absent", () => {
+test("does not treat low funnel conversion as an advertising problem by default", () => {
+  const answer = diagnoseSales({
+    ...baseEvidence,
+    funnelBaseline: { status: "below_baseline", lowStages: ["addToCart"] },
+  });
+  assert.match(answer, /add-to-cart activity/i);
+  assert.match(answer, /More advertising may bring visitors, but it will not fix a weak conversion step/i);
+});
+
+test("reports revenue below baseline and suggests the next useful distinction", () => {
+  const answer = diagnoseSales({
+    ...baseEvidence,
+    revenueBaseline: { status: "below_baseline", currentRevenue: 120, averageRevenue: 500, daysWithComparablePurchases: 5 },
+  });
+  assert.match(answer, /Sales revenue is below your usual level/i);
+  assert.match(answer, /purchase count or average order value/i);
+});
+
+test("recommends tracking verification when purchase events are absent", () => {
   const answer = diagnoseSales({
     ...baseEvidence,
     purchases: 0,
     revenueBaseline: { status: "purchase_tracking_unconfirmed" },
   });
-  assert.match(answer, /no PURCHASE event is recorded/i);
-  assert.match(answer, /test purchase/i);
+  assert.match(answer, /No purchase has been recorded/i);
+  assert.match(answer, /Verify tracking with a test order/i);
 });
 
-test("describes weak funnel rates using session-level evidence", () => {
+test("when traffic is steady, prioritizes conversion checks over more advertising", () => {
   const answer = diagnoseSales({
     ...baseEvidence,
-    funnelBaseline: {
-      status: "below_baseline",
-      current: { rates: { addToCart: 0.1 } },
-      averages: { addToCart: 0.4 },
-      lowStages: ["addToCart"],
-    },
+    trafficBaseline: { status: "not_markedly_below_baseline" },
   });
-  assert.match(answer, /add-to-cart sessions are 10.0%/i);
-  assert.match(answer, /not proof of a single underlying cause/i);
+  assert.match(answer, /Visits are not clearly below normal/i);
+  assert.match(answer, /more advertising may not be the first fix/i);
 });
