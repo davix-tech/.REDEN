@@ -32,7 +32,7 @@ test("validates missing downstream instrumentation before recommending ads", () 
   const answer = diagnoseSales({
     ...baseEvidence,
     trafficBaseline: { status: "below_baseline", currentSessions: 20, averageSessions: 80, daysWithTraffic: 5 },
-    funnelBaseline: { trackingValidationStages: ["productView", "purchase"], lowStages: [] },
+    funnelBaseline: { trackingValidationStages: ["productView"], lowStages: [] },
   });
   assert.match(answer, /no recorded product-page discovery events/i);
   assert.match(answer, /missing tracking/i);
