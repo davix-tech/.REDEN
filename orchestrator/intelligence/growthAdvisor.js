@@ -1,50 +1,17 @@
+import { diagnoseSales } from "./diagnostics.js";
+
 /**
  * Prioritizes a practical next action for merchants asking how to grow sales.
- * Uses only supplied evidence; it does not infer causes or promise uplift.
+ * Sales diagnosis is shared with the diagnostic and merchant-priority intents.
  */
 
 function composeBaselinePriority(evidence) {
-  const funnel = evidence.funnelBaseline;
-  if (funnel?.trackingValidationStages?.length) {
-    const labels = {
-      productView: "product-view",
-      addToCart: "add-to-cart",
-      checkout: "checkout-start",
-      purchase: "purchase",
-    };
-    const stages = funnel.trackingValidationStages
-      .map((stage) => labels[stage] || stage)
-      .join(", ");
-    return "**First priority — validate event tracking before diagnosing lost sales.** REDEN recorded enough upstream activity to expect downstream events, but recorded zero events at: " + stages + ". This could be a genuine funnel break or an event-integration problem. Run a controlled test journey and verify each event reaches REDEN before changing pricing, discounts, or ad spend.";
-  }
-  if (funnel?.status === "below_baseline" && funnel.current && funnel.lowStages?.length) {
-    const stageOrder = ["purchase", "checkout", "addToCart", "productView"];
-    const stage = stageOrder.find((candidate) => funnel.lowStages.includes(candidate));
-    const labels = { purchase: "purchase completion", checkout: "checkout completion", addToCart: "product-page to cart progression", productView: "product discovery" };
-    const label = labels[stage] || "funnel progression";
-    const currentRate = Number(funnel.current.rates?.[stage]);
-    const averageRate = Number(funnel.averages?.[stage]);
-    const rates = Number.isFinite(currentRate) && Number.isFinite(averageRate)
-      ? " The recorded rate is " + (currentRate * 100).toFixed(1) + "% versus a comparable baseline of " + (averageRate * 100).toFixed(1) + "%."
-      : "";
-    const actions = {
-      purchase: "Test the full payment-to-purchase path, check payment failures and verify purchase-event delivery before changing marketing.",
-      checkout: "Test mobile checkout, shipping fees, delivery estimates, payment errors and guest checkout; confirm checkout and purchase events are correctly linked.",
-      addToCart: "Review product price, stock, shipping clarity, product information and trust signals; verify ADD_TO_CART tracking before changing offers.",
-      productView: "Check landing-page relevance, navigation, search, product availability and PRODUCT_VIEW tracking before spending more on acquisition."
-    };
-    return "**First priority — investigate " + label + ".** REDEN's comparable funnel baseline flags this stage as materially below its recent level." + rates + " " + (actions[stage] || "Validate the funnel events and compare a consistent time window.");
-  }
-  const traffic = evidence.trafficBaseline;
-  if (traffic?.status === "below_baseline") {
-    return "**First priority — verify traffic and tracking.** Recorded visits are " + traffic.currentSessions + " so far versus a same-time average of " + Number(traffic.averageSessions).toFixed(1) + " across " + traffic.daysWithTraffic + " eligible recent days. Confirm the storefront is reachable and PAGE_VIEW events are firing; if both are healthy, inspect campaign delivery and traffic sources before increasing ad spend.";
-  }
-  const revenue = evidence.revenueBaseline;
-  if (revenue?.status === "below_baseline") {
-    return "**First priority — identify the revenue driver.** Same-time recorded purchase revenue is " + Number(revenue.currentRevenue).toFixed(2) + " versus a comparable average of " + Number(revenue.averageRevenue).toFixed(2) + " across " + revenue.daysWithComparablePurchases + " eligible purchase days. Compare order count and average order value, then verify purchase/payment tracking before changing price or ad spend.";
-  }
-  return null;
+  const diagnosis = diagnoseSales(evidence, { allowFallback: false });
+  return diagnosis
+    ? "**First priority — act on the strongest supported signal.** " + diagnosis
+    : null;
 }
+
 export function composeGrowthAdvice(evidence = {}) {
   const sessions = Number(evidence.uniqueSessions || 0);
   const productViews = Number(evidence.productViews || 0);
