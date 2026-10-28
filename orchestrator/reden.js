@@ -27,6 +27,7 @@ import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
 import { composeGrowthAdvice } from "./intelligence/growthAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 import { composeMerchantIntelligence } from "./intelligence/merchantIntelligence.js";
+import { applyIntelligenceAnswerContract } from "./intelligence/answerContract.js";
 
 dotenv.config();
 
@@ -2261,6 +2262,12 @@ app.post("/api/v1/intelligence", async (req, res) => {
       answer =
         "I could not produce an evidence-backed answer from the available REDEN data.";
     }
+
+    answer = applyIntelligenceAnswerContract(
+      answer,
+      intents,
+      evidence
+    );
 
     const latencyMs = Date.now() - startedAt;
 
