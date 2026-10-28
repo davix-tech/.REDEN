@@ -2904,14 +2904,50 @@ app.get("/metrics", async (req, res) => {
       [siteId]
     );
 
-    const row = result.rows[0];
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+    let uniqueEventSessions = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count,
+            COUNT(DISTINCT session_id)::INTEGER AS sessions
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+        uniqueEventSessions = Math.max(
+          uniqueEventSessions,
+          Number(eventRow.sessions || 0)
+        );
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
 
     return success(res, {
       decisions: Number(row.decisions || 0),
-      conversions: Number(
-        row.conversions || 0
-      ),
+      conversions: Number(row.conversions || 0),
       revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      uniqueSessions: uniqueEventSessions,
+      eventsWindow: "last_30_days",
     });
   } catch (error) {
     console.error("[METRICS ERROR]", error);
