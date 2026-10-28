@@ -72,7 +72,7 @@ export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
     return "Purchase events and purchased-session records do not agree, so the revenue comparison is not reliable. Run a test order and verify that the PURCHASE event and purchased session are both recorded before changing ads or offers.";
   }
 
-  if (revenueBaseline.status === "purchase_tracking_unconfirmed" || purchases === 0) {
+  if (revenueBaseline.status === "purchase_tracking_unconfirmed") {
     return "REDEN has no confirmed purchase event for this period. That could mean no orders or missing purchase tracking. Run a test order first; if tracking works, check visits, add-to-cart activity and checkout to find where shoppers stop before increasing ad spend.";
   }
 
