@@ -63,3 +63,12 @@ test("when traffic is steady, prioritizes conversion checks over more advertisin
   assert.match(answer, /Visits are not clearly below normal/i);
   assert.match(answer, /more advertising may not be the first fix/i);
 });
+
+
+test("turns a single recorded purchase into a concise growth recommendation without claiming a proven decline", () => {
+  const answer = diagnoseSales({ ...baseEvidence, purchases: 1, purchaseRevenue: 925000 });
+  assert.match(answer, /Only 1 purchase has been recorded today/i);
+  assert.match(answer, /targeted campaign/i);
+  assert.match(answer, /cannot confirm this is below your usual level/i);
+  assert.ok(answer.length < 500, "merchant answer should stay concise");
+});
