@@ -775,7 +775,7 @@ function composeTraffic(evidence) {
 }
 
 function composePurchases(evidence) {
-  return `Today REDEN recorded ${evidence.purchases} purchase events across ${evidence.purchasedSessions} purchased sessions, with storefront purchase revenue of ${evidence.purchaseRevenue.toFixed(
+  return `Today REDEN recorded ${evidence.purchases} purchase events across ${evidence.purchasedSessions} purchased sessions, with storefront purchase revenue of ${Number(evidence.purchaseRevenue ?? 0).toFixed(
     2
   )}.`;
 }
