@@ -72,6 +72,10 @@ export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
     return "Purchase events and purchased-session records do not agree, so the revenue comparison is not reliable. Run a test order and verify that the PURCHASE event and purchased session are both recorded before changing ads or offers.";
   }
 
+  if (revenueBaseline.status === "purchase_tracking_unconfirmed" || purchases === 0) {
+    return "REDEN has no confirmed purchase event for this period. That could mean no orders or missing purchase tracking. Run a test order first; if tracking works, check visits, add-to-cart activity and checkout to find where shoppers stop before increasing ad spend.";
+  }
+
   if (traffic.status === "below_baseline") {
     const current = numberOrNull(traffic.currentSessions);
     const average = numberOrNull(traffic.averageSessions);
@@ -98,10 +102,6 @@ export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
       ? ` (${current} recorded so far versus ${average} in comparable periods)`
       : "";
     return `Recorded purchase revenue is below its usual level${comparison}.${recordedRevenue} Compare purchase count and average order value, then verify payment and purchase tracking. If visits are also down, review acquisition; if visits are steady, investigate product pages and checkout.`;
-  }
-
-  if (revenueBaseline.status === "purchase_tracking_unconfirmed" || purchases === 0) {
-    return "REDEN has no confirmed purchase event for this period. That could mean no orders or missing purchase tracking. Run a test order first; if tracking works, check visits, add-to-cart activity and checkout to find where shoppers stop before increasing ad spend.";
   }
 
   if (traffic.status === "not_markedly_below_baseline") {
