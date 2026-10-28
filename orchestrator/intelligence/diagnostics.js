@@ -40,5 +40,9 @@ export function diagnoseSales(evidence) {
     return "Your store recorded " + purchases + " purchase" + (purchases === 1 ? "" : "s") + " today" + (revenue === null ? "" : " and " + revenue + " in purchase revenue") + ". Visits are not clearly below normal, so more advertising may not be the first fix. Check product-page interest, add-to-cart activity and checkout completion to find where shoppers may be dropping off.";
   }
 
-  return "Your store recorded " + purchases + " purchase" + (purchases === 1 ? "" : "s") + " today" + (revenue === null ? "" : " and " + revenue + " in purchase revenue") + ". I cannot confirm a decline without comparable historical data. Check whether visits are down or shoppers are leaving during product selection or checkout; that will tell us whether to focus on advertising or conversion.";
+  if (purchases <= 1) {
+    return "Only " + purchases + " purchase" + (purchases === 1 ? "" : "s") + " " + (purchases === 1 ? "has" : "have") + " been recorded today" + (revenue === null ? "" : " (" + revenue + " in revenue)") + ", so sales activity looks low. I would try a targeted campaign to bring in more qualified shoppers. Before increasing spend heavily, check traffic: if people are visiting but not buying, improve the product page or checkout instead. I cannot confirm this is below your usual level without historical comparison."; 
+  }
+
+  return "Your store recorded " + purchases + " purchases today" + (revenue === null ? "" : " and " + revenue + " in purchase revenue") + ". I cannot confirm a decline without comparable historical data. Check whether visits are down or shoppers are leaving during product selection or checkout; that will tell us whether to focus on advertising or conversion.";
 }
