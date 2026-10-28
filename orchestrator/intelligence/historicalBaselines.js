@@ -83,11 +83,11 @@ export async function loadHistoricalBaselines({
         SELECT
           (created_at AT TIME ZONE $2)::date::text AS local_date,
           session_id,
-          BOOL_OR(event = 'PAGE_VIEW') AS page_view,
-          BOOL_OR(event = 'PRODUCT_VIEW') AS product_view,
-          BOOL_OR(event = 'ADD_TO_CART') AS add_to_cart,
-          BOOL_OR(event = 'CHECKOUT_STARTED') AS checkout_started,
-          BOOL_OR(event = 'PURCHASE') AS purchase
+          MIN(created_at) FILTER (WHERE event = 'PAGE_VIEW') AS page_view_at,
+          MIN(created_at) FILTER (WHERE event = 'PRODUCT_VIEW') AS product_view_at,
+          MIN(created_at) FILTER (WHERE event = 'ADD_TO_CART') AS add_to_cart_at,
+          MIN(created_at) FILTER (WHERE event = 'CHECKOUT_STARTED') AS checkout_started_at,
+          MIN(created_at) FILTER (WHERE event = 'PURCHASE') AS purchase_at
         FROM event_logs
         WHERE site_id = $1
           AND created_at >= $3
@@ -97,12 +97,38 @@ export async function loadHistoricalBaselines({
       )
       SELECT
         local_date,
-        COUNT(*) FILTER (WHERE page_view AND session_id IS NOT NULL)::INTEGER AS page_view_sessions,
-        COUNT(*) FILTER (WHERE page_view AND product_view AND session_id IS NOT NULL)::INTEGER AS product_view_sessions,
-        COUNT(*) FILTER (WHERE page_view AND add_to_cart AND session_id IS NOT NULL)::INTEGER AS add_to_cart_sessions,
-        COUNT(*) FILTER (WHERE page_view AND checkout_started AND session_id IS NOT NULL)::INTEGER AS checkout_sessions,
-        COUNT(*) FILTER (WHERE page_view AND purchase AND session_id IS NOT NULL)::INTEGER AS purchase_sessions,
-        COUNT(*) FILTER (WHERE purchase AND session_id IS NOT NULL)::INTEGER AS purchase_event_sessions
+        COUNT(*) FILTER (
+          WHERE page_view_at IS NOT NULL AND session_id IS NOT NULL
+        )::INTEGER AS page_view_sessions,
+        COUNT(*) FILTER (
+          WHERE page_view_at IS NOT NULL
+            AND product_view_at >= page_view_at
+            AND session_id IS NOT NULL
+        )::INTEGER AS product_view_sessions,
+        COUNT(*) FILTER (
+          WHERE page_view_at IS NOT NULL
+            AND product_view_at >= page_view_at
+            AND add_to_cart_at >= product_view_at
+            AND session_id IS NOT NULL
+        )::INTEGER AS add_to_cart_sessions,
+        COUNT(*) FILTER (
+          WHERE page_view_at IS NOT NULL
+            AND product_view_at >= page_view_at
+            AND add_to_cart_at >= product_view_at
+            AND checkout_started_at >= add_to_cart_at
+            AND session_id IS NOT NULL
+        )::INTEGER AS checkout_sessions,
+        COUNT(*) FILTER (
+          WHERE page_view_at IS NOT NULL
+            AND product_view_at >= page_view_at
+            AND add_to_cart_at >= product_view_at
+            AND checkout_started_at >= add_to_cart_at
+            AND purchase_at >= checkout_started_at
+            AND session_id IS NOT NULL
+        )::INTEGER AS purchase_sessions,
+        COUNT(*) FILTER (
+          WHERE purchase_at IS NOT NULL AND session_id IS NOT NULL
+        )::INTEGER AS purchase_event_sessions
       FROM session_flags
       GROUP BY local_date
       ORDER BY local_date

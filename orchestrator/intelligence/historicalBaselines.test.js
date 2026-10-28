@@ -45,6 +45,10 @@ test("baseline queries are tenant-scoped and require two read-only queries", asy
   const db = mockDb({ eventDays: [], revenueDays: [] });
   const result = await loadHistoricalBaselines({ db, ...input });
   assert.equal(db.callCount, 2);
+  assert.match(db.queries[0], /product_view_at >= page_view_at/i);
+  assert.match(db.queries[0], /add_to_cart_at >= product_view_at/i);
+  assert.match(db.queries[0], /checkout_started_at >= add_to_cart_at/i);
+  assert.match(db.queries[0], /purchase_at >= checkout_started_at/i);
   assert.match(db.queries[1], /JOIN purchase_sessions ps/i);
   assert.match(db.queries[1], /ps\.session_id = ss\.session_id/i);
   assert.equal(result.revenueBaseline.status, "purchase_tracking_unconfirmed");

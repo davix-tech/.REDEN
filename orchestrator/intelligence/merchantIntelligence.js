@@ -1,3 +1,5 @@
+import { diagnoseSales } from "./diagnostics.js";
+
 /**
  * Evidence-backed merchant intelligence for REDEN.
  *
@@ -79,28 +81,9 @@ export function composeMerchantIntelligence(intent, evidence = {}) {
   }
 
   if (intent === "merchant_priority") {
-    const funnel = evidence.funnelBaseline;
-    if (funnel?.trackingValidationStages?.length) {
-      return `**First priority: validate tracking at ${funnel.trackingValidationStages.join(", ")}.** The recorded funnel has meaningful upstream activity but zero events at these stage(s). That could be a real journey break or missing instrumentation. Run a test purchase and verify event delivery before changing prices, discounts, or advertising.`;
-    }
-
-    if (funnel?.status === "below_baseline" && funnel.lowStages?.length) {
-      const stage = funnel.lowStages[0];
-      const labels = {
-        productView: "product discovery",
-        addToCart: "product-to-cart progression",
-        checkout: "cart-to-checkout progression",
-        purchase: "checkout-to-purchase completion",
-      };
-      return `**First priority: investigate ${labels[stage] || stage}.** REDEN's comparable session-level baseline flags this stage as materially below its recent level. This is a diagnostic signal, not proof of a specific cause. Verify event tracking, inspect the affected journey, and measure the same rate after the smallest reversible fix.`;
-    }
-
-    if (evidence.trafficBaseline?.status === "below_baseline") {
-      return "**First priority: verify storefront availability and traffic tracking.** Recorded visits are materially below the same-time baseline. If the storefront and PAGE_VIEW events are healthy, inspect traffic sources and campaign delivery before increasing spend.";
-    }
-
-    if (evidence.revenueBaseline?.status === "below_baseline") {
-      return "**First priority: identify whether the revenue change comes from order count or order value.** Recorded storefront purchase revenue is materially below its comparable baseline. Check purchase tracking, purchase count and average order value before changing pricing or advertising.";
+    const diagnosis = diagnoseSales(evidence, { allowFallback: false });
+    if (diagnosis) {
+      return `**First priority:** ${diagnosis}`;
     }
 
     if (evidence.intentSummary && number(evidence.intentSummary.highIntentUnpurchased) > 0) {

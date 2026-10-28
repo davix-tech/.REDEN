@@ -53,8 +53,9 @@ test("priority response selects instrumentation validation before business chang
   const answer = composeMerchantIntelligence("merchant_priority", {
     funnelBaseline: { trackingValidationStages: ["purchase"] },
   });
-  assert.match(answer, /validate tracking at purchase/i);
-  assert.match(answer, /before changing prices/i);
+  assert.match(answer, /no recorded checkout-to-purchase completion events/i);
+  assert.match(answer, /missing tracking/i);
+  assert.match(answer, /before changing ads, prices or discounts/i);
 });
 
 test("priority response does not invent an action when evidence is insufficient", () => {

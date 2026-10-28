@@ -118,3 +118,15 @@ test("formats unavailable revenue without inventing zero revenue", () => {
   const answer = diagnoseSales({ ...baseEvidence, purchaseRevenue: null });
   assert.doesNotMatch(answer, /recorded purchase revenue is 0/i);
 });
+
+test("checks purchase tracking before recommending ads when traffic is also down", () => {
+  const answer = diagnoseSales({
+    ...baseEvidence,
+    purchases: 0,
+    trafficBaseline: { status: "below_baseline", currentSessions: 10, averageSessions: 50, daysWithTraffic: 5 },
+    revenueBaseline: { status: "purchase_tracking_unconfirmed" },
+  });
+  assert.match(answer, /no confirmed purchase event/i);
+  assert.match(answer, /Run a test order first/i);
+  assert.doesNotMatch(answer, /targeted campaign/i);
+});
