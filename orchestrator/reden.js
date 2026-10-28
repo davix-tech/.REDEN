@@ -1678,8 +1678,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
     );
 
     // Optional analytics must never suppress the core recorded-event answer.
-    // A legacy table/column mismatch should degrade only that section, not return
-    // "Unable to process intelligence request" for the entire merchant request.
+    // Legacy schema differences should degrade only the affected section.
     const safeAnalyticsQuery = async (sql, params = []) => {
       try {
         return await db.query(sql, params);
@@ -2664,7 +2663,7 @@ app.post("/score", async (req, res) => {
     const score =
       actionMap[action] ?? 0;
 
-    const result = await safeAnalyticsQuery(
+    const result = await db.query(
       `
         INSERT INTO decisions (
           site_id,
@@ -2729,7 +2728,7 @@ app.post("/action", async (req, res) => {
   }
 
   try {
-    const result = await safeAnalyticsQuery(
+    const result = await db.query(
       `
         UPDATE decisions
         SET
@@ -2799,7 +2798,7 @@ app.post("/outcome", async (req, res) => {
   }
 
   try {
-    const result = await safeAnalyticsQuery(
+    const result = await db.query(
       `
         UPDATE decisions
         SET
@@ -2827,7 +2826,7 @@ app.post("/outcome", async (req, res) => {
     );
 
     if (!result.rowCount) {
-      const existing = await safeAnalyticsQuery(
+      const existing = await db.query(
         `
           SELECT id, state
           FROM decisions
@@ -2884,7 +2883,7 @@ app.get("/metrics", async (req, res) => {
   const siteId = req.site.site_id;
 
   try {
-    const result = await safeAnalyticsQuery(
+    const result = await db.query(
       `
         SELECT
           COUNT(*)::INTEGER AS decisions,
@@ -2905,39 +2904,14 @@ app.get("/metrics", async (req, res) => {
       [siteId]
     );
 
-    const row = result.rows[0] || {};
-    const eventResult = await db.query(
-      `
-        SELECT
-          event,
-          COUNT(*)::INTEGER AS count
-        FROM event_logs
-        WHERE site_id = $1
-          AND created_at >= date_trunc('day', NOW() AT TIME ZONE COALESCE(
-            (SELECT timezone FROM sites WHERE site_id = $1),
-            'Africa/Lagos'
-          )) AT TIME ZONE COALESCE(
-            (SELECT timezone FROM sites WHERE site_id = $1),
-            'Africa/Lagos'
-          )
-        GROUP BY event
-      `,
-      [siteId]
-    );
-    const events = {};
-    for (const eventRow of eventResult.rows) {
-      events[eventRow.event] = Number(eventRow.count || 0);
-    }
+    const row = result.rows[0];
 
     return success(res, {
       decisions: Number(row.decisions || 0),
-      conversions: Number(row.conversions || 0),
+      conversions: Number(
+        row.conversions || 0
+      ),
       revenue: Number(row.revenue || 0),
-      events,
-      totalEvents: Object.values(events).reduce((sum, count) => sum + count, 0),
-      sessions: Object.values(events).length
-        ? undefined
-        : 0,
     });
   } catch (error) {
     console.error("[METRICS ERROR]", error);
@@ -3004,7 +2978,7 @@ cron.schedule(
 
       for (const job of jobs.rows) {
         try {
-          const converted = await safeAnalyticsQuery(
+          const converted = await db.query(
             `
               SELECT id
               FROM decisions
@@ -3021,7 +2995,7 @@ cron.schedule(
           );
 
           if (converted.rowCount) {
-            await safeAnalyticsQuery(
+            await db.query(
               `
                 UPDATE recovery_queue
                 SET
@@ -3046,7 +3020,7 @@ cron.schedule(
               { jobId: job.id, siteId: job.site_id }
             );
 
-            await safeAnalyticsQuery(
+            await db.query(
               `
                 UPDATE recovery_queue
                 SET
@@ -3060,7 +3034,7 @@ cron.schedule(
             continue;
           }
 
-          const siteResult = await safeAnalyticsQuery(
+          const siteResult = await db.query(
             `
               SELECT
                 site_id,
@@ -3091,7 +3065,7 @@ cron.schedule(
               job.discount_percent,
           });
 
-          await safeAnalyticsQuery(
+          await db.query(
             `
               UPDATE recovery_queue
               SET
@@ -3102,7 +3076,7 @@ cron.schedule(
             [job.id]
           );
 
-          await safeAnalyticsQuery(
+          await db.query(
             `
               INSERT INTO email_logs (
                 site_id,
@@ -3133,7 +3107,7 @@ cron.schedule(
             }
           );
 
-          await safeAnalyticsQuery(
+          await db.query(
             `
               UPDATE recovery_queue
               SET
