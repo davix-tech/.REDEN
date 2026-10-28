@@ -326,9 +326,25 @@ async function initializeDatabase() {
       )
     `);
 
+    // CREATE TABLE IF NOT EXISTS does not upgrade an existing production table.
+    // Explicitly migrate every session field used by the SDK and intelligence queries.
+    // This keeps older databases from breaking /intelligence when new evidence is queried.
     await client.query(`
       ALTER TABLE session_summaries
-      ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ
+        ADD COLUMN IF NOT EXISTS page_views INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS product_views INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cart_additions INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS checkout_started BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS purchased BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS cart_value NUMERIC(12,2) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS revenue NUMERIC(12,2) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS intent_score NUMERIC(8,4) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS traffic_source VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS utm_campaign VARCHAR(255)
     `);
 
     /*
