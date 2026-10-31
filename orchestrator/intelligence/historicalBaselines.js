@@ -136,39 +136,1399 @@ export async function loadHistoricalBaselines({
     [siteId, timeZone, baselineStartUTC, endUTC, localTime]
   );
 
+  // Use each recorded PURCHASE event's own payload value. A missing or
+  // stale session_summaries row must not turn recorded sales into zero.
   const revenueDaysResult = await db.query(
     `
-      WITH purchase_sessions AS (
+      WITH purchase_events AS (
         SELECT
-          site_id,
+          (created_at AT TIME ZONE $2)::date::text AS local_date,
           session_id,
-          (created_at AT TIME ZONE $2)::date AS purchase_local_date
+          COALESCE(
+            CASE WHEN payload->>'revenue' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+      pricedPurchaseEvents: asNumber(row.priced_purchase_events),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0 && revenueDay.pricedPurchaseEvents > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.pricedPurchaseEvents === 0) {
+    revenueBaseline.status = "purchase_revenue_unavailable";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'revenue')::NUMERIC END,
+            CASE WHEN payload->>'total' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'total')::NUMERIC END,
+            CASE WHEN payload->>'value' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'value')::NUMERIC END,
+            CASE WHEN payload->>'order_total' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'order_total')::NUMERIC END,
+            CASE WHEN payload->>'orderTotal' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'orderTotal')::NUMERIC END,
+            CASE WHEN payload->>'amount' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'amount')::NUMERIC END,
+            CASE WHEN payload->>'cart_value' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'cart_value')::NUMERIC END,
+            CASE WHEN payload->>'cartValue' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->>'cartValue')::NUMERIC END,
+            CASE WHEN payload->'cart'->>'value' ~ '^[0-9]+([.][0-9]+)?
+
+  const eventDays = new Map(eventDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      date: row.local_date,
+      pageViewSessions: asNumber(row.page_view_sessions),
+      productViewSessions: asNumber(row.product_view_sessions),
+      addToCartSessions: asNumber(row.add_to_cart_sessions),
+      checkoutSessions: asNumber(row.checkout_sessions),
+      purchaseSessions: asNumber(row.purchase_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+    },
+  ]));
+  const revenueDays = new Map(revenueDaysResult.rows.map((row) => [
+    row.local_date,
+    {
+      revenue: asNumber(row.revenue),
+      purchasedSessions: asNumber(row.purchased_sessions),
+    },
+  ]));
+
+  const current = eventDays.get(localDate) ?? {
+    date: localDate,
+    pageViewSessions: 0,
+    productViewSessions: 0,
+    addToCartSessions: 0,
+    checkoutSessions: 0,
+    purchaseSessions: 0,
+    purchaseEventSessions: 0,
+  };
+  const currentRevenueRow = revenueDays.get(localDate) ?? null;
+
+  const historicalTrafficDays = [...eventDays.values()].filter(
+    (day) => day.date < localDate && day.pageViewSessions > 0
+  );
+
+  const funnelAverages = {};
+  const funnelDaysByStage = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    const denominatorKey = FUNNEL_STAGE_METRICS[stage].denominator;
+    // Include zero stage counts when the preceding stage has recorded sessions.
+    // A zero may still indicate a tracking problem, so it is not treated as a
+    // confirmed current-day decline without a separate instrumentation check.
+    const observedStageDays = historicalTrafficDays.filter(
+      (day) => day[denominatorKey] > 0
+    );
+    funnelDaysByStage[stage] = observedStageDays.length;
+    funnelAverages[stage] = average(
+      observedStageDays
+        .map((day) => dailyRate(day, stage))
+        .filter((rate) => rate !== null)
+    );
+  }
+
+  const currentRates = {};
+  for (const stage of Object.keys(FUNNEL_STAGE_METRICS)) {
+    currentRates[stage] = dailyRate(current, stage);
+  }
+
+  const funnelBaseline = {
+    ...empty.funnelBaseline,
+    current: {
+      pageViewSessions: current.pageViewSessions,
+      productViewSessions: current.productViewSessions,
+      addToCartSessions: current.addToCartSessions,
+      checkoutSessions: current.checkoutSessions,
+      purchaseSessions: current.purchaseSessions,
+      rates: currentRates,
+    },
+    averages: funnelAverages,
+    daysByStage: funnelDaysByStage,
+    daysWithTraffic: historicalTrafficDays.length,
+    trackingValidationStages: [],
+  };
+
+  // A zero current-stage count after meaningful upstream traffic is ambiguous:
+  // it may be a real funnel break or a missing event integration. Surface it
+  // explicitly so REDEN recommends validation rather than silently hiding it.
+  for (const [stage, metric] of Object.entries(FUNNEL_STAGE_METRICS)) {
+    const denominator = current[metric.denominator];
+    const stageCount = current[metric.numerator];
+    if (
+      historicalTrafficDays.length >= MIN_COMPARABLE_DAYS &&
+      funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+      denominator >= 5 &&
+      stageCount === 0 &&
+      Number(funnelAverages[stage]) > 0
+    ) {
+      funnelBaseline.trackingValidationStages.push(stage);
+    }
+  }
+
+  if (historicalTrafficDays.length >= MIN_COMPARABLE_DAYS) {
+    funnelBaseline.status = "available";
+    funnelBaseline.lowStages = Object.entries(funnelAverages)
+      .filter(([stage, baselineRate]) => {
+        const currentRate = currentRates[stage];
+        const currentStageCount = current[FUNNEL_STAGE_METRICS[stage].numerator];
+        const currentDenominator = current[FUNNEL_STAGE_METRICS[stage].denominator];
+        // A zero count can indicate missing instrumentation. Do not label it
+        // a confirmed conversion decline without an independent tracking check.
+        return current.pageViewSessions >= 5 &&
+          currentDenominator > 0 &&
+          currentStageCount > 0 &&
+          baselineRate > 0 &&
+          funnelDaysByStage[stage] >= MIN_COMPARABLE_DAYS &&
+          currentRate < baselineRate * LOW_BASELINE_RATIO;
+      })
+      .map(([stage]) => stage);
+    if (funnelBaseline.lowStages.length) {
+      funnelBaseline.status = "below_baseline";
+    }
+  }
+
+  const historicalPurchaseDays = [...eventDays.values()]
+    .filter((day) => day.date < localDate && day.pageViewSessions > 0 &&
+      day.purchaseEventSessions > 0)
+    .filter((day) => {
+      const revenueDay = revenueDays.get(day.date);
+      return revenueDay && revenueDay.purchasedSessions > 0;
+    });
+  const historicalRevenue = historicalPurchaseDays.map(
+    (day) => revenueDays.get(day.date).revenue
+  );
+  const averageRevenue = average(historicalRevenue);
+
+  const revenueBaseline = {
+    ...empty.revenueBaseline,
+    currentRevenue: currentRevenueRow?.revenue ?? null,
+    averageRevenue,
+    daysWithComparablePurchases: historicalPurchaseDays.length,
+  };
+
+  if (current.purchaseEventSessions === 0) {
+    revenueBaseline.status = "purchase_tracking_unconfirmed";
+  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
+    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (
+    historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
+    averageRevenue !== null &&
+    averageRevenue > 0
+  ) {
+    revenueBaseline.status =
+      currentRevenueRow.revenue < averageRevenue * LOW_BASELINE_RATIO
+        ? "below_baseline"
+        : "not_markedly_below_baseline";
+  }
+
+  return { revenueBaseline, funnelBaseline };
+}
+ THEN (payload->'cart'->>'value')::NUMERIC END
+          ) AS order_revenue
         FROM event_logs
         WHERE site_id = $1
           AND event = 'PURCHASE'
           AND created_at >= $3
           AND created_at < $4
           AND (created_at AT TIME ZONE $2)::time <= $5::time
-        GROUP BY
-          site_id,
-          session_id,
-          (created_at AT TIME ZONE $2)::date
       )
       SELECT
-        (ss.purchased_at AT TIME ZONE $2)::date::text AS local_date,
-        COALESCE(SUM(ss.revenue), 0)::NUMERIC AS revenue,
-        COUNT(*) FILTER (WHERE ss.purchased = TRUE)::INTEGER AS purchased_sessions
-      FROM session_summaries ss
-      JOIN purchase_sessions ps
-        ON ps.site_id = ss.site_id
-        AND ps.session_id = ss.session_id
-        AND ps.purchase_local_date = (ss.purchased_at AT TIME ZONE $2)::date
-      WHERE ss.site_id = $1
-        AND ss.purchased = TRUE
-        AND ss.purchased_at >= $3
-        AND ss.purchased_at < $4
-        AND (ss.purchased_at AT TIME ZONE $2)::time <= $5::time
-      GROUP BY (ss.purchased_at AT TIME ZONE $2)::date
+        local_date,
+        COALESCE(SUM(order_revenue), 0)::NUMERIC AS revenue,
+        COUNT(DISTINCT session_id)::INTEGER AS purchased_sessions,
+        COUNT(*) FILTER (WHERE order_revenue IS NOT NULL)::INTEGER AS priced_purchase_events
+      FROM purchase_events
+      GROUP BY local_date
       ORDER BY local_date
     `,
     [siteId, timeZone, baselineStartUTC, endUTC, localTime]
