@@ -24,6 +24,7 @@ export async function updateSessionContext({
     const normalizedCartValue =
       Number.isFinite(cartValue) ? Math.max(0, cartValue) : 0;
 
+    const isPurchase = event === "PURCHASE";
     const rawRevenue = isPurchase
       ? (
           safePayload.revenue ??
@@ -43,7 +44,6 @@ export async function updateSessionContext({
     const normalizedRevenue =
       Number.isFinite(revenue) ? Math.max(0, revenue) : 0;
 
-    const isPurchase = event === "PURCHASE";
     const isCheckout = event === "CHECKOUT_STARTED";
     const pageView = event === "PAGE_VIEW";
     const productView = event === "PRODUCT_VIEW";
