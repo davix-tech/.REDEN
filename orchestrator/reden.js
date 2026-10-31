@@ -3343,11 +3343,11 @@ async function runMerchantReport(reportType) {
 }
 
 cron.schedule("0 8 * * *", () => runMerchantReport("morning"), {
-  timezone: "UTC",
+  timezone: "Africa/Lagos",
 });
 
 cron.schedule("0 20 * * *", () => runMerchantReport("evening"), {
-  timezone: "UTC",
+  timezone: "Africa/Lagos",
 });
 
 /* =========================================================
