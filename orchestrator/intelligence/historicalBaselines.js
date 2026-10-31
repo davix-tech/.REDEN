@@ -138,37 +138,47 @@ export async function loadHistoricalBaselines({
 
   const revenueDaysResult = await db.query(
     `
-      WITH purchase_sessions AS (
+      WITH purchase_events AS (
         SELECT
-          site_id,
+          (created_at AT TIME ZONE $2)::date::text AS local_date,
           session_id,
-          (created_at AT TIME ZONE $2)::date AS purchase_local_date
+          COALESCE(
+            NULLIF(payload->>'revenue', ''),
+            NULLIF(payload->>'total', ''),
+            NULLIF(payload->>'value', ''),
+            NULLIF(payload->>'order_total', ''),
+            NULLIF(payload->>'orderTotal', ''),
+            NULLIF(payload->>'amount', ''),
+            NULLIF(payload->>'cart_value', ''),
+            NULLIF(payload->>'cartValue', ''),
+            NULLIF(payload #>> '{cart,value}', '')
+          ) AS amount_text
         FROM event_logs
         WHERE site_id = $1
           AND event = 'PURCHASE'
           AND created_at >= $3
           AND created_at < $4
           AND (created_at AT TIME ZONE $2)::time <= $5::time
-        GROUP BY
-          site_id,
+      ),
+      normalized_purchases AS (
+        SELECT
+          local_date,
           session_id,
-          (created_at AT TIME ZONE $2)::date
+          CASE
+            WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
+            THEN amount_text::NUMERIC
+            ELSE NULL
+          END AS amount
+        FROM purchase_events
       )
       SELECT
-        (ss.purchased_at AT TIME ZONE $2)::date::text AS local_date,
-        COALESCE(SUM(ss.revenue), 0)::NUMERIC AS revenue,
-        COUNT(*) FILTER (WHERE ss.purchased = TRUE)::INTEGER AS purchased_sessions
-      FROM session_summaries ss
-      JOIN purchase_sessions ps
-        ON ps.site_id = ss.site_id
-        AND ps.session_id = ss.session_id
-        AND ps.purchase_local_date = (ss.purchased_at AT TIME ZONE $2)::date
-      WHERE ss.site_id = $1
-        AND ss.purchased = TRUE
-        AND ss.purchased_at >= $3
-        AND ss.purchased_at < $4
-        AND (ss.purchased_at AT TIME ZONE $2)::time <= $5::time
-      GROUP BY (ss.purchased_at AT TIME ZONE $2)::date
+        local_date,
+        COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
+        COUNT(DISTINCT session_id) FILTER (WHERE amount IS NOT NULL)::INTEGER AS purchased_sessions,
+        COUNT(DISTINCT session_id)::INTEGER AS purchase_event_sessions,
+        COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events
+      FROM normalized_purchases
+      GROUP BY local_date
       ORDER BY local_date
     `,
     [siteId, timeZone, baselineStartUTC, endUTC, localTime]
@@ -191,6 +201,8 @@ export async function loadHistoricalBaselines({
     {
       revenue: asNumber(row.revenue),
       purchasedSessions: asNumber(row.purchased_sessions),
+      purchaseEventSessions: asNumber(row.purchase_event_sessions),
+      pricedPurchaseEvents: asNumber(row.priced_purchase_events),
     },
   ]));
 
@@ -292,7 +304,7 @@ export async function loadHistoricalBaselines({
       day.purchaseEventSessions > 0)
     .filter((day) => {
       const revenueDay = revenueDays.get(day.date);
-      return revenueDay && revenueDay.purchasedSessions > 0;
+      return revenueDay && revenueDay.pricedPurchaseEvents > 0;
     });
   const historicalRevenue = historicalPurchaseDays.map(
     (day) => revenueDays.get(day.date).revenue
@@ -308,8 +320,8 @@ export async function loadHistoricalBaselines({
 
   if (current.purchaseEventSessions === 0) {
     revenueBaseline.status = "purchase_tracking_unconfirmed";
-  } else if (!currentRevenueRow || currentRevenueRow.purchasedSessions === 0) {
-    revenueBaseline.status = "purchase_summary_mismatch";
+  } else if (!currentRevenueRow || currentRevenueRow.pricedPurchaseEvents === 0) {
+    revenueBaseline.status = "purchase_revenue_unavailable";
   } else if (
     historicalPurchaseDays.length >= MIN_COMPARABLE_DAYS &&
     averageRevenue !== null &&

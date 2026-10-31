@@ -27,8 +27,13 @@ const eventDay = (local_date, page_view_sessions, overrides = {}) => ({
   ...overrides,
 });
 
-const revenueDay = (local_date, revenue, purchased_sessions = 1) => ({
-  local_date, revenue, purchased_sessions,
+const revenueDay = (local_date, revenue, purchased_sessions = 1, overrides = {}) => ({
+  local_date,
+  revenue,
+  purchased_sessions,
+  purchase_event_sessions: purchased_sessions,
+  priced_purchase_events: purchased_sessions,
+  ...overrides,
 });
 
 const input = {
@@ -49,8 +54,9 @@ test("baseline queries are tenant-scoped and require two read-only queries", asy
   assert.match(db.queries[0], /add_to_cart_at >= product_view_at/i);
   assert.match(db.queries[0], /checkout_started_at >= add_to_cart_at/i);
   assert.match(db.queries[0], /purchase_at >= checkout_started_at/i);
-  assert.match(db.queries[1], /JOIN purchase_sessions ps/i);
-  assert.match(db.queries[1], /ps\.session_id = ss\.session_id/i);
+  assert.match(db.queries[1], /FROM event_logs/i);
+  assert.match(db.queries[1], /payload->>'revenue'/i);
+  assert.match(db.queries[1], /event = 'PURCHASE'/i);
   assert.equal(result.revenueBaseline.status, "purchase_tracking_unconfirmed");
   assert.equal(result.funnelBaseline.status, "insufficient_history");
 });
@@ -203,4 +209,55 @@ test("historical zero stage rates are included when the preceding stage has traf
   });
   assert.equal(result.funnelBaseline.averages.productView, 0.8);
   assert.equal(result.funnelBaseline.daysByStage.productView, 5);
+});
+
+test("purchase events with valid amounts drive revenue even without session summaries", async () => {
+  const eventDays = [
+    ...Array.from({ length: 5 }, (_, i) =>
+      eventDay(`2026-10-${String(19 + i).padStart(2, "0")}`, 20)
+    ),
+    eventDay("2026-10-24", 20, {
+      purchase_event_sessions: 1,
+      purchase_sessions: 1,
+    }),
+  ];
+  const revenueDays = [
+    ...Array.from({ length: 5 }, (_, i) =>
+      revenueDay(`2026-10-${String(19 + i).padStart(2, "0")}`, 1000)
+    ),
+    revenueDay("2026-10-24", 185000, 1, {
+      purchase_event_sessions: 1,
+      priced_purchase_events: 1,
+    }),
+  ];
+  const result = await loadHistoricalBaselines({
+    db: mockDb({ eventDays, revenueDays }), ...input,
+  });
+  assert.equal(result.revenueBaseline.currentRevenue, 185000);
+  assert.equal(result.revenueBaseline.status, "not_markedly_below_baseline");
+});
+
+test("purchase events without valid order amounts are reported as unavailable", async () => {
+  const eventDays = [
+    ...Array.from({ length: 5 }, (_, i) =>
+      eventDay(`2026-10-${String(19 + i).padStart(2, "0")}`, 20)
+    ),
+    eventDay("2026-10-24", 20, {
+      purchase_event_sessions: 1,
+      purchase_sessions: 1,
+    }),
+  ];
+  const revenueDays = [
+    ...Array.from({ length: 5 }, (_, i) =>
+      revenueDay(`2026-10-${String(19 + i).padStart(2, "0")}`, 1000)
+    ),
+    revenueDay("2026-10-24", 0, 0, {
+      purchase_event_sessions: 1,
+      priced_purchase_events: 0,
+    }),
+  ];
+  const result = await loadHistoricalBaselines({
+    db: mockDb({ eventDays, revenueDays }), ...input,
+  });
+  assert.equal(result.revenueBaseline.status, "purchase_revenue_unavailable");
 });

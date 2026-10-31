@@ -745,8 +745,20 @@ function composeIdentity(site) {
   return `${site.name} is the connected merchant site in REDEN.`;
 }
 
+function formatPurchaseRevenue(evidence) {
+  if (evidence.purchaseRevenueAvailable === false) {
+    return "unavailable because PURCHASE events contain no valid numeric order amount";
+  }
+
+  return Number(evidence.purchaseRevenue || 0).toFixed(2);
+}
+
 function composeRevenue(evidence) {
-  const amount = Number(evidence.purchaseRevenue || 0).toFixed(2);
+  if (evidence.purchaseRevenueAvailable === false) {
+    return "Purchase events were recorded today, but their payloads do not contain a valid numeric order amount. Storefront revenue is unavailable, not confirmed to be zero. This is recorded revenue, not verified profit.";
+  }
+
+  const amount = formatPurchaseRevenue(evidence);
   return `Your store recorded ${amount} in sales revenue today. This is recorded revenue, not verified profit. The store currency has not been confirmed.`;
 }
 
@@ -775,9 +787,7 @@ function composeTraffic(evidence) {
 }
 
 function composePurchases(evidence) {
-  return `Today REDEN recorded ${evidence.purchases} purchase events across ${evidence.purchasedSessions} purchased sessions, with storefront purchase revenue of ${Number(evidence.purchaseRevenue ?? 0).toFixed(
-    2
-  )}.`;
+  return `Today REDEN recorded ${evidence.purchases} purchase events across ${evidence.purchasedSessions} purchased sessions, with storefront purchase revenue ${formatPurchaseRevenue(evidence)}.`;
 }
 
 function composeConversion(evidence) {
@@ -794,9 +804,7 @@ function composeConversion(evidence) {
 }
 
 function composeSales(evidence) {
-  return `Today there were ${evidence.purchases} purchase events and ${evidence.purchaseRevenue.toFixed(
-    2
-  )} in recorded storefront purchase revenue.`;
+  return `Today there were ${evidence.purchases} purchase events and storefront purchase revenue was ${formatPurchaseRevenue(evidence)}.`;
 }
 
 function composeCart(evidence) {
@@ -903,6 +911,10 @@ function composeAdvice(evidence) {
     recommendations.push(
       `Same-time recorded storefront purchase revenue is materially below its comparable baseline (${Number(revenueBaseline.currentRevenue).toFixed(2)} versus ${Number(revenueBaseline.averageRevenue).toFixed(2)} across ${revenueBaseline.daysWithComparablePurchases} eligible purchase days). Compare purchase count and average order value, and verify order/payment tracking before changing prices or ad spend.`
     );
+  } else if (revenueBaseline?.status === "purchase_revenue_unavailable") {
+    recommendations.push(
+      "Purchase events were recorded, but REDEN could not read a valid order amount from them. Verify that the PURCHASE payload includes a numeric revenue or total value before comparing sales."
+    );
   } else if (
     revenueBaseline?.status === "purchase_tracking_unconfirmed" ||
     revenueBaseline?.status === "purchase_summary_mismatch"
@@ -957,9 +969,7 @@ function composeOverview(evidence) {
     trafficContext = " REDEN does not yet have enough reliable historical traffic to determine whether today's visits are unusually low.";
   }
 
-  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions, ${evidence.totalEvents} events, ${evidence.purchases} purchase events, and ${evidence.purchaseRevenue.toFixed(
-    2
-  )} in storefront purchase revenue. It also completed ${
+  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions, ${evidence.totalEvents} events, ${evidence.purchases} purchase events, and storefront purchase revenue of ${formatPurchaseRevenue(evidence)}. It also completed ${
     evidence.decisions
   } decisions with ${evidence.conversions} conversions, giving ${conversionText}.${trafficContext}`;
 }
@@ -1915,20 +1925,41 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const purchaseResult = await safeAnalyticsQuery(
       `
+        WITH purchase_events AS (
+          SELECT
+            session_id,
+            COALESCE(
+              NULLIF(payload->>'revenue', ''),
+              NULLIF(payload->>'total', ''),
+              NULLIF(payload->>'value', ''),
+              NULLIF(payload->>'order_total', ''),
+              NULLIF(payload->>'orderTotal', ''),
+              NULLIF(payload->>'amount', ''),
+              NULLIF(payload->>'cart_value', ''),
+              NULLIF(payload->>'cartValue', ''),
+              NULLIF(payload #>> '{cart,value}', '')
+            ) AS amount_text
+          FROM event_logs
+          WHERE site_id = $1
+            AND event = 'PURCHASE'
+            AND created_at >= $2
+            AND created_at < $3
+        ),
+        normalized_purchases AS (
+          SELECT
+            session_id,
+            CASE
+              WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
+              THEN amount_text::NUMERIC
+              ELSE NULL
+            END AS amount
+          FROM purchase_events
+        )
         SELECT
-          COALESCE(
-            SUM(revenue),
-            0
-          )::NUMERIC AS revenue,
-
-          COUNT(*) FILTER (
-            WHERE purchased = TRUE
-          )::INTEGER AS purchased_sessions
-        FROM session_summaries
-        WHERE site_id = $1
-          AND purchased = TRUE
-          AND purchased_at >= $2
-          AND purchased_at < $3
+          COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
+          COUNT(DISTINCT session_id)::INTEGER AS purchased_sessions,
+          COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events
+        FROM normalized_purchases
       `,
       [siteId, startUTC, endUTC]
     );
@@ -1938,6 +1969,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
     const purchaseRevenue = Number(
       purchaseRow.revenue || 0
     );
+    const purchaseRevenueAvailable =
+      Number(purchaseRow.priced_purchase_events || 0) > 0;
 
     const purchasedSessions = Number(
       purchaseRow.purchased_sessions || 0
@@ -2231,6 +2264,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
       decisionRevenue,
       purchaseRevenue,
+      purchaseRevenueAvailable,
 
       purchasedSessions,
 
