@@ -24,7 +24,21 @@ export async function updateSessionContext({
     const normalizedCartValue =
       Number.isFinite(cartValue) ? Math.max(0, cartValue) : 0;
 
-    const revenue = Number(safePayload.revenue ?? 0);
+    const rawRevenue = isPurchase
+      ? (
+          safePayload.revenue ??
+          safePayload.total ??
+          safePayload.value ??
+          safePayload.order_total ??
+          safePayload.orderTotal ??
+          safePayload.amount ??
+          safePayload.cart_value ??
+          safePayload.cartValue ??
+          safePayload.cart?.value ??
+          0
+        )
+      : (safePayload.revenue ?? 0);
+    const revenue = Number(rawRevenue);
 
     const normalizedRevenue =
       Number.isFinite(revenue) ? Math.max(0, revenue) : 0;
