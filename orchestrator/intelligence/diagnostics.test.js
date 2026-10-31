@@ -87,6 +87,17 @@ test("recommends tracking verification when purchase events are absent", () => {
   assert.match(answer, /before increasing ad spend/i);
 });
 
+test("explains missing purchase amounts without reporting revenue as zero", () => {
+  const answer = diagnoseSales({
+    ...baseEvidence,
+    revenueBaseline: { status: "purchase_revenue_unavailable" },
+  });
+  assert.match(answer, /purchase events/i);
+  assert.match(answer, /do not contain a usable order amount/i);
+  assert.match(answer, /revenue: order\.total/i);
+  assert.doesNotMatch(answer, /revenue is 0/i);
+});
+
 test("treats mismatched purchase and session records as a data-quality issue", () => {
   const answer = diagnoseSales({
     ...baseEvidence,
