@@ -600,6 +600,7 @@ export async function sendWelcomeEmail({
   siteId,
   apiKey,
   plan = "basic",
+  merchantName,
 }) {
   return sendEmail({
     to,
@@ -631,9 +632,12 @@ export async function sendWelcomeEmail({
               line-height:1.7;
             "
           >
-            Your REDEN infrastructure has been provisioned
-            successfully under the
-            <strong>${escapeHtml(plan)}</strong> tier.
+            REDEN has been prepared for
+            <strong>${escapeHtml(merchantName || "your store")}</strong>
+            under the <strong>${escapeHtml(plan)}</strong> plan.
+            Your private setup details are included below. This email is sent
+            directly to the store owner; the person who submitted setup does
+            not receive your API key in the onboarding response.
           </p>
 
           <div
@@ -695,7 +699,7 @@ export async function sendWelcomeEmail({
                 font-size:12px;
               "
             >&lt;script
-  src="https://api.dcore.name.ng/sdk.js"
+  src="https://reden.dcore.name.ng/sdk.js"
   data-site-id="${escapeHtml(siteId)}"
   data-api-key="${escapeHtml(apiKey)}"
 &gt;&lt;/script&gt;</code></pre>
@@ -735,6 +739,16 @@ export async function sendWelcomeEmail({
               <li>
                 Connect checkout events so REDEN can
                 understand purchase intent and outcomes.
+              </li>
+
+              <li>
+                Keep the API key private. Do not post it publicly or send it
+                to anyone who does not manage your store integration.
+              </li>
+
+              <li>
+                REDEN sends two email briefs each day, summarizing recorded
+                decision activity from the previous 12 hours.
               </li>
             </ol>
           </div>
