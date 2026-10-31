@@ -234,7 +234,7 @@ test("purchase events with valid amounts drive revenue even without session summ
     db: mockDb({ eventDays, revenueDays }), ...input,
   });
   assert.equal(result.revenueBaseline.currentRevenue, 185000);
-  assert.equal(result.revenueBaseline.status, "below_baseline");
+  assert.equal(result.revenueBaseline.status, "not_markedly_below_baseline");
 });
 
 test("purchase events without valid order amounts are reported as unavailable", async () => {
