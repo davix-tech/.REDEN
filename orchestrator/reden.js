@@ -903,6 +903,10 @@ function composeAdvice(evidence) {
     recommendations.push(
       `Same-time recorded storefront purchase revenue is materially below its comparable baseline (${Number(revenueBaseline.currentRevenue).toFixed(2)} versus ${Number(revenueBaseline.averageRevenue).toFixed(2)} across ${revenueBaseline.daysWithComparablePurchases} eligible purchase days). Compare purchase count and average order value, and verify order/payment tracking before changing prices or ad spend.`
     );
+  } else if (revenueBaseline?.status === "purchase_revenue_unavailable") {
+    recommendations.push(
+      "Purchase events were recorded, but REDEN could not read a valid order amount from them. Verify that the PURCHASE payload includes a numeric revenue or total value before comparing sales."
+    );
   } else if (
     revenueBaseline?.status === "purchase_tracking_unconfirmed" ||
     revenueBaseline?.status === "purchase_summary_mismatch"
@@ -1915,20 +1919,41 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const purchaseResult = await safeAnalyticsQuery(
       `
+        WITH purchase_events AS (
+          SELECT
+            session_id,
+            COALESCE(
+              NULLIF(payload->>'revenue', ''),
+              NULLIF(payload->>'total', ''),
+              NULLIF(payload->>'value', ''),
+              NULLIF(payload->>'order_total', ''),
+              NULLIF(payload->>'orderTotal', ''),
+              NULLIF(payload->>'amount', ''),
+              NULLIF(payload->>'cart_value', ''),
+              NULLIF(payload->>'cartValue', ''),
+              NULLIF(payload #>> '{cart,value}', '')
+            ) AS amount_text
+          FROM event_logs
+          WHERE site_id = $1
+            AND event = 'PURCHASE'
+            AND created_at >= $2
+            AND created_at < $3
+        ),
+        normalized_purchases AS (
+          SELECT
+            session_id,
+            CASE
+              WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
+              THEN amount_text::NUMERIC
+              ELSE NULL
+            END AS amount
+          FROM purchase_events
+        )
         SELECT
-          COALESCE(
-            SUM(revenue),
-            0
-          )::NUMERIC AS revenue,
-
-          COUNT(*) FILTER (
-            WHERE purchased = TRUE
-          )::INTEGER AS purchased_sessions
-        FROM session_summaries
-        WHERE site_id = $1
-          AND purchased = TRUE
-          AND purchased_at >= $2
-          AND purchased_at < $3
+          COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
+          COUNT(DISTINCT session_id)::INTEGER AS purchased_sessions,
+          COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events
+        FROM normalized_purchases
       `,
       [siteId, startUTC, endUTC]
     );
