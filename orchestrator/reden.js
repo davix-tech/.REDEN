@@ -18,7 +18,9 @@ import {
 import { initRedis, redis } from "./infrastructure/redis.js";
 import {
   sendRecoveryEmail,
-  sendDailyReport,
+  sendMorningReport,
+  sendEveningReport,
+  sendWelcomeEmail,
 } from "./notification/emailEngine.js";
 import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
@@ -1308,40 +1310,27 @@ app.post("/api/v1/onboard", async (req, res) => {
   const ownerEmail = normalizeEmail(req.body?.owner_email);
 
   if (!name || !ownerEmail) {
-    return failure(
-      res,
-      400,
-      "name and owner_email are required"
-    );
+    return failure(res, 400, "name and owner_email are required");
   }
 
   const client = await db.connect();
+  let site;
+  let wasCreated = false;
 
   try {
     await client.query("BEGIN");
 
     await client.query(
       `
-        SELECT pg_advisory_xact_lock(
-          hashtext($1),
-          hashtext($2)
-        )
+        SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))
       `,
       [ownerEmail, name.toLowerCase()]
     );
 
     const existing = await client.query(
       `
-        SELECT
-          site_id,
-          api_key,
-          name,
-          owner_email,
-          active,
-          plan,
-          subscription_status,
-          timezone,
-          created_at
+        SELECT site_id, api_key, name, owner_email, active, plan,
+               subscription_status, timezone, created_at
         FROM sites
         WHERE LOWER(owner_email) = LOWER($1)
           AND LOWER(name) = LOWER($2)
@@ -1352,70 +1341,118 @@ app.post("/api/v1/onboard", async (req, res) => {
     );
 
     if (existing.rowCount) {
-      await client.query("COMMIT");
+      site = existing.rows[0];
+    } else {
+      const siteId = generateSiteId();
+      const apiKey = generateApiKey();
 
-      return success(res, {
-        existing: true,
-        site: existing.rows[0],
-      });
+      const inserted = await client.query(
+        `
+          INSERT INTO sites (
+            site_id, api_key, name, owner_email, active,
+            plan, subscription_status, timezone
+          )
+          VALUES ($1, $2, $3, $4, TRUE, 'basic', 'active', 'Africa/Lagos')
+          RETURNING site_id, api_key, name, owner_email, active,
+                    plan, subscription_status, timezone, created_at
+        `,
+        [siteId, apiKey, name, ownerEmail]
+      );
+
+      site = inserted.rows[0];
+      wasCreated = true;
     }
 
-    const siteId = generateSiteId();
-    const apiKey = generateApiKey();
-
-    const inserted = await client.query(
-      `
-        INSERT INTO sites (
-          site_id,
-          api_key,
-          name,
-          owner_email,
-          active,
-          plan,
-          subscription_status,
-          timezone
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          TRUE,
-          'basic',
-          'active',
-          'Africa/Lagos'
-        )
-        RETURNING
-          site_id,
-          api_key,
-          name,
-          owner_email,
-          active,
-          plan,
-          subscription_status,
-          timezone,
-          created_at
-      `,
-      [siteId, apiKey, name, ownerEmail]
-    );
-
     await client.query("COMMIT");
-
-    return success(res, {
-      existing: false,
-      site: inserted.rows[0],
-    });
   } catch (error) {
-    await client.query("ROLLBACK");
-
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("[ONBOARD ERROR]", error);
-
     return failure(res, 500, "Onboarding failed");
   } finally {
     client.release();
   }
-});
 
+  // Never return the API key to the developer/browser that requested setup.
+  // Deliver it directly to the verified client email instead.
+  try {
+    const sentBefore = await db.query(
+      `
+        SELECT 1
+        FROM email_logs
+        WHERE site_id = $1
+          AND type = 'WELCOME'
+          AND status = 'SENT'
+        LIMIT 1
+      `,
+      [site.site_id]
+    );
+
+    let emailSent = sentBefore.rowCount > 0;
+    if (!emailSent) {
+      const delivery = await sendWelcomeEmail({
+        to: ownerEmail,
+        siteId: site.site_id,
+        apiKey: site.api_key,
+        plan: site.plan || "basic",
+        merchantName: site.name,
+      });
+
+      if (delivery?.ok) {
+        await db.query(
+          `
+            INSERT INTO email_logs (site_id, type, status)
+            VALUES ($1, 'WELCOME', 'SENT')
+          `,
+          [site.site_id]
+        );
+        emailSent = true;
+      } else {
+        await db.query(
+          `
+            INSERT INTO email_logs (site_id, type, status)
+            VALUES ($1, 'WELCOME', 'FAILED')
+          `,
+          [site.site_id]
+        );
+      }
+    }
+
+    const safeSite = {
+      site_id: site.site_id,
+      name: site.name,
+      owner_email: site.owner_email,
+      active: site.active,
+      plan: site.plan,
+      subscription_status: site.subscription_status,
+      timezone: site.timezone,
+      created_at: site.created_at,
+    };
+
+    if (!emailSent) {
+      return failure(
+        res,
+        502,
+        "Site was provisioned, but the access email could not be sent. Retry onboarding to retry delivery."
+      );
+    }
+
+    return success(res, {
+      existing: !wasCreated,
+      emailSent: true,
+      site: safeSite,
+    });
+  } catch (error) {
+    console.error("[ONBOARD EMAIL ERROR]", {
+      siteId: site?.site_id,
+      message: error?.message,
+    });
+    return failure(
+      res,
+      502,
+      "Site was provisioned, but access email delivery could not be confirmed. Retry onboarding to retry delivery."
+    );
+  }
+});
 /* =========================================================
    VERIFY
 ========================================================= */
@@ -3201,130 +3238,117 @@ cron.schedule(
 );
 
 /* =========================================================
-   DAILY REPORT CRON
+   TWICE-DAILY MERCHANT REPORTS
+   Reports run at 08:00 and 20:00 UTC. Each report summarizes
+   the previous 12 hours and is sent to the merchant owner.
 ========================================================= */
 
-cron.schedule(
-  "0 8 * * *",
-  async () => {
-    const client = await db.connect();
+async function runMerchantReport(reportType) {
+  const client = await db.connect();
+
+  try {
+    const lockName = `reden_${reportType}_report`;
+    const lockResult = await client.query(
+      `SELECT pg_try_advisory_lock(hashtext($1)) AS locked`,
+      [lockName]
+    );
+
+    if (!lockResult.rows[0]?.locked) return;
 
     try {
-      const lockResult = await client.query(
-        `
-          SELECT pg_try_advisory_lock(
-            hashtext('reden_daily_report')
-          ) AS locked
-        `
-      );
+      const sitesResult = await client.query(`
+        SELECT site_id, name, owner_email, timezone
+        FROM sites
+        WHERE active = TRUE
+          AND owner_email IS NOT NULL
+          AND owner_email <> ''
+      `);
 
-      if (!lockResult.rows[0]?.locked) {
-        return;
-      }
+      for (const site of sitesResult.rows) {
+        try {
+          const metricsResult = await client.query(
+            `
+              SELECT
+                COUNT(*)::INTEGER AS total,
+                COUNT(*) FILTER (WHERE converted = TRUE)::INTEGER AS conversions,
+                COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+              FROM decisions
+              WHERE site_id = $1
+                AND state = 'COMPLETED'
+                AND completed_at >= NOW() - INTERVAL '12 hours'
+            `,
+            [site.site_id]
+          );
 
-      try {
-        const sitesResult = await client.query(`
-          SELECT
-            site_id,
-            name,
-            owner_email,
-            timezone
-          FROM sites
-          WHERE active = TRUE
-        `);
+          const row = metricsResult.rows[0] || {};
+          const metrics = {
+            total: Number(row.total || 0),
+            conversions: Number(row.conversions || 0),
+            revenue: Number(row.revenue || 0),
+          };
 
-        for (const site of sitesResult.rows) {
-          try {
-            const metricsResult =
-              await client.query(
-                `
-                  SELECT
-                    COUNT(*)::INTEGER AS decisions,
+          const reportFunction =
+            reportType === "morning" ? sendMorningReport : sendEveningReport;
 
-                    COUNT(*) FILTER (
-                      WHERE converted = TRUE
-                    )::INTEGER AS conversions,
+          const delivery = await reportFunction({
+            to: site.owner_email,
+            merchantName: site.name,
+            metrics,
+            intelligence: [{
+              title: "Your REDEN reporting window",
+              summary: "This brief summarizes recorded REDEN decision activity from the previous 12 hours. Recorded revenue is not the same as profit.",
+              priority: "normal",
+              status: "active",
+            }],
+          });
 
-                    COALESCE(
-                      SUM(revenue),
-                      0
-                    )::NUMERIC AS revenue
+          await client.query(
+            `
+              INSERT INTO email_logs (site_id, type, status)
+              VALUES ($1, $2, $3)
+            `,
+            [
+              site.site_id,
+              reportType === "morning" ? "MORNING_REPORT" : "EVENING_REPORT",
+              delivery?.ok ? "SENT" : "FAILED",
+            ]
+          );
 
-                  FROM decisions
-                  WHERE site_id = $1
-                    AND state = 'COMPLETED'
-                    AND completed_at >= NOW() - INTERVAL '24 hours'
-                `,
-                [site.site_id]
-              );
-
-            const metrics =
-              metricsResult.rows[0];
-
-            await sendDailyReport({
-              site,
-              metrics: {
-                decisions: Number(
-                  metrics.decisions || 0
-                ),
-                conversions: Number(
-                  metrics.conversions || 0
-                ),
-                revenue: Number(
-                  metrics.revenue || 0
-                ),
-              },
+          if (!delivery?.ok) {
+            console.error("[REPORT DELIVERY FAILED]", {
+              siteId: site.site_id,
+              reportType,
+              error: delivery?.error || "unknown",
             });
-
-            await client.query(
-              `
-                INSERT INTO email_logs (
-                  site_id,
-                  type,
-                  status,
-                  created_at
-                )
-                VALUES (
-                  $1,
-                  'DAILY_REPORT',
-                  'SENT',
-                  NOW()
-                )
-              `,
-              [site.site_id]
-            );
-          } catch (error) {
-            console.error(
-              "[DAILY REPORT SITE ERROR]",
-              {
-                siteId: site.site_id,
-                error,
-              }
-            );
           }
+        } catch (error) {
+          console.error("[REPORT SITE ERROR]", {
+            siteId: site.site_id,
+            reportType,
+            message: error?.message,
+          });
         }
-      } finally {
-        await client.query(
-          `
-            SELECT pg_advisory_unlock(
-              hashtext('reden_daily_report')
-            )
-          `
-        );
       }
-    } catch (error) {
-      console.error(
-        "[DAILY REPORT CRON ERROR]",
-        error
-      );
     } finally {
-      client.release();
+      await client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockName]);
     }
-  },
-  {
-    timezone: "UTC",
+  } catch (error) {
+    console.error("[REPORT CRON ERROR]", {
+      reportType,
+      message: error?.message,
+    });
+  } finally {
+    client.release();
   }
-);
+}
+
+cron.schedule("0 8 * * *", () => runMerchantReport("morning"), {
+  timezone: "UTC",
+});
+
+cron.schedule("0 20 * * *", () => runMerchantReport("evening"), {
+  timezone: "UTC",
+});
 
 /* =========================================================
    404
