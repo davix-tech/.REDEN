@@ -1913,17 +1913,12993 @@ app.post("/api/v1/intelligence", async (req, res) => {
       decisionRow.revenue || 0
     );
 
+    // Purchase event payloads are the source of truth for recorded order
+    // value. Session summaries can lag or be absent if an older event was
+    // recorded while its summary update failed.
     const purchaseResult = await safeAnalyticsQuery(
       `
+        WITH purchase_events AS (
+          SELECT
+            session_id,
+            COALESCE(
+              CASE WHEN payload->>'revenue' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
         SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+      purchaseEventSessions,
+      pricedPurchaseEvents,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
           COALESCE(
             SUM(revenue),
             0
-          )::NUMERIC AS revenue,
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'revenue')::NUMERIC END,
+              CASE WHEN payload->>'total' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
 
           COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
             WHERE purchased = TRUE
-          )::INTEGER AS purchased_sessions
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'total')::NUMERIC END,
+              CASE WHEN payload->>'value' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'value')::NUMERIC END,
+              CASE WHEN payload->>'order_total' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'order_total')::NUMERIC END,
+              CASE WHEN payload->>'orderTotal' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'orderTotal')::NUMERIC END,
+              CASE WHEN payload->>'amount' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'amount')::NUMERIC END,
+              CASE WHEN payload->>'cart_value' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'cart_value')::NUMERIC END,
+              CASE WHEN payload->>'cartValue' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->>'cartValue')::NUMERIC END,
+              CASE WHEN payload->'cart'->>'value' ~ '^[0-9]+([.][0-9]+)?
+    const recoveryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE status = 'PENDING'
+          )::INTEGER AS pending,
+
+          COUNT(*) FILTER (
+            WHERE status = 'SENT'
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'COMPLETED'
+          )::INTEGER AS completed,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+        FROM recovery_queue
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const recoveryRow = recoveryResult.rows[0] || {};
+
+    const recovery = {
+      pending: Number(recoveryRow.pending || 0),
+      sent: Number(recoveryRow.sent || 0),
+      completed: Number(
+        recoveryRow.completed || 0
+      ),
+      failed: Number(recoveryRow.failed || 0),
+    };
+
+    const emailResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS total,
+
+          COUNT(*) FILTER (
+            WHERE status IN ('SENT', 'DELIVERED')
+          )::INTEGER AS sent,
+
+          COUNT(*) FILTER (
+            WHERE status = 'DELIVERED'
+          )::INTEGER AS delivered,
+
+          COUNT(*) FILTER (
+            WHERE status = 'FAILED'
+          )::INTEGER AS failed
+
+        FROM email_logs
+        WHERE site_id = $1
+          AND created_at >= $2
+          AND created_at < $3
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const emailRow = emailResult.rows[0] || {};
+
+    const emails = {
+      total: Number(emailRow.total || 0),
+      sent: Number(emailRow.sent || 0),
+      delivered: Number(
+        emailRow.delivered || 0
+      ),
+      failed: Number(emailRow.failed || 0),
+    };
+
+    /*
+     * Recent behavioural intent is computed from session events and is a
+     * heuristic, not a calibrated purchase probability. Keep the window short
+     * so this is useful for timely triage rather than historical reporting.
+     */
+    const intentSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS recent_sessions,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+          )::INTEGER AS high_intent_unpurchased,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND cart_additions > 0
+          )::INTEGER AS high_intent_with_cart,
+          COUNT(*) FILTER (
+            WHERE intent_score >= 0.70
+              AND purchased = FALSE
+              AND checkout_started = TRUE
+          )::INTEGER AS high_intent_with_checkout,
+          COALESCE(
+            SUM(cart_value) FILTER (
+              WHERE intent_score >= 0.70
+                AND purchased = FALSE
+          ), 0)::NUMERIC AS high_intent_cart_value
+        FROM session_summaries
+        WHERE site_id = $1
+          AND last_seen_at >= NOW() - INTERVAL '30 minutes'
+      `,
+      [siteId]
+    );
+
+    const intentSummaryRow = intentSummaryResult.rows[0] || {};
+    const intentSummary = {
+      windowMinutes: 30,
+      recentSessions: Number(intentSummaryRow.recent_sessions || 0),
+      highIntentUnpurchased: Number(intentSummaryRow.high_intent_unpurchased || 0),
+      highIntentWithCart: Number(intentSummaryRow.high_intent_with_cart || 0),
+      highIntentWithCheckout: Number(intentSummaryRow.high_intent_with_checkout || 0),
+      highIntentCartValue: Number(intentSummaryRow.high_intent_cart_value || 0),
+      scoreType: "behavioural_heuristic",
+      threshold: 0.70,
+    };
+
+    /*
+     * Outcome reporting compares recorded action outcomes. It is deliberately
+     * not labelled incremental lift: the current system does not maintain a
+     * randomized holdout or equivalent counterfactual baseline.
+     */
+    const interventionOutcomeResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          action,
+          COUNT(*) FILTER (
+            WHERE actioned_at >= $2
+              AND actioned_at < $3
+          )::INTEGER AS actioned,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS completed,
+          COUNT(*) FILTER (
+            WHERE state = 'COMPLETED'
+              AND converted = TRUE
+              AND completed_at >= $2
+              AND completed_at < $3
+          )::INTEGER AS conversions,
+          COALESCE(
+            SUM(revenue) FILTER (
+              WHERE state = 'COMPLETED'
+                AND completed_at >= $2
+                AND completed_at < $3
+            ), 0
+          )::NUMERIC AS recorded_revenue
+        FROM decisions
+        WHERE site_id = $1
+          AND (
+            (created_at >= $2 AND created_at < $3)
+            OR (actioned_at >= $2 AND actioned_at < $3)
+            OR (completed_at >= $2 AND completed_at < $3)
+          )
+        GROUP BY action
+        ORDER BY action
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const interventionOutcomes = interventionOutcomeResult.rows.map((row) => ({
+      action: row.action,
+      actioned: Number(row.actioned || 0),
+      completed: Number(row.completed || 0),
+      conversions: Number(row.conversions || 0),
+      recordedRevenue: Number(row.recorded_revenue || 0),
+    }));
+
+    const banditResult = await safeAnalyticsQuery(
+      `
+        SELECT *
+        FROM bandit_state
+        WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    let bandit = null;
+
+    if (banditResult.rowCount) {
+      const rows = banditResult.rows;
+
+      let pulls = 0;
+
+      for (const row of rows) {
+        pulls += Number(
+          row.pulls ??
+            row.total_pulls ??
+            row.count ??
+            0
+        );
+      }
+
+      bandit = {
+        pulls,
+        actions: rows.length,
+      };
+    }
+
+    /*
+     * ATTRIBUTION
+     *
+     * Grouped by traffic_source on session_summaries, scoped
+     * to sessions FIRST SEEN today (not purchased today,
+     * since attribution is about the session's origin, not
+     * its purchase timing). A session's revenue column is
+     * cumulative for that session (see contextEngine.js), so
+     * this reflects revenue attributable to sessions that
+     * originated today.
+     */
+    const attributionResult = await safeAnalyticsQuery(
+      `
+        SELECT
+          COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COUNT(*)::INTEGER AS sessions,
+          COUNT(*) FILTER (
+            WHERE purchased = TRUE
+          )::INTEGER AS purchases,
+          COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
+        FROM session_summaries
+        WHERE site_id = $1
+          AND first_seen_at >= $2
+          AND first_seen_at < $3
+        GROUP BY COALESCE(traffic_source, 'unknown')
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const attribution = attributionResult.rows.map((row) => {
+      const purchases = Number(row.purchases || 0);
+      const revenue = Number(row.revenue || 0);
+
+      return {
+        trafficSource: row.traffic_source,
+        sessions: Number(row.sessions || 0),
+        purchases,
+        revenue,
+        avgOrderValue:
+          purchases > 0 ? revenue / purchases : 0,
+      };
+    });
+
+    const evidence = {
+      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    let intents = detectIntents(question);
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = sections.join("\n\n");
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson(evidence),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const sanitizedPayload = {
+    ...payload,
+    cart_value: boundedCartValue,
+  };
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+
+  const utmSource = normalizeString(
+    payload.utm_source || payload.utmSource,
+    100
+  );
+
+  const utmMedium = normalizeString(
+    payload.utm_medium || payload.utmMedium,
+    100
+  );
+
+  const utmCampaign = normalizeString(
+    payload.utm_campaign || payload.utmCampaign,
+    255
+  );
+
+  const hasAttributionData = Boolean(
+    referrer || utmSource || utmCampaign
+  );
+
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({
+        referrer,
+        utmSource,
+        utmMedium,
+      })
+    : null;
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    if (eventResult.rowCount) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [siteId, sessionId, trafficSource, utmCampaign || null]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   DAILY REPORT CRON
+========================================================= */
+
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      const lockResult = await client.query(
+        `
+          SELECT pg_try_advisory_lock(
+            hashtext('reden_daily_report')
+          ) AS locked
+        `
+      );
+
+      if (!lockResult.rows[0]?.locked) {
+        return;
+      }
+
+      try {
+        const sitesResult = await client.query(`
+          SELECT
+            site_id,
+            name,
+            owner_email,
+            timezone
+          FROM sites
+          WHERE active = TRUE
+        `);
+
+        for (const site of sitesResult.rows) {
+          try {
+            const metricsResult =
+              await client.query(
+                `
+                  SELECT
+                    COUNT(*)::INTEGER AS decisions,
+
+                    COUNT(*) FILTER (
+                      WHERE converted = TRUE
+                    )::INTEGER AS conversions,
+
+                    COALESCE(
+                      SUM(revenue),
+                      0
+                    )::NUMERIC AS revenue
+
+                  FROM decisions
+                  WHERE site_id = $1
+                    AND state = 'COMPLETED'
+                    AND completed_at >= NOW() - INTERVAL '24 hours'
+                `,
+                [site.site_id]
+              );
+
+            const metrics =
+              metricsResult.rows[0];
+
+            await sendDailyReport({
+              site,
+              metrics: {
+                decisions: Number(
+                  metrics.decisions || 0
+                ),
+                conversions: Number(
+                  metrics.conversions || 0
+                ),
+                revenue: Number(
+                  metrics.revenue || 0
+                ),
+              },
+            });
+
+            await client.query(
+              `
+                INSERT INTO email_logs (
+                  site_id,
+                  type,
+                  status,
+                  created_at
+                )
+                VALUES (
+                  $1,
+                  'DAILY_REPORT',
+                  'SENT',
+                  NOW()
+                )
+              `,
+              [site.site_id]
+            );
+          } catch (error) {
+            console.error(
+              "[DAILY REPORT SITE ERROR]",
+              {
+                siteId: site.site_id,
+                error,
+              }
+            );
+          }
+        }
+      } finally {
+        await client.query(
+          `
+            SELECT pg_advisory_unlock(
+              hashtext('reden_daily_report')
+            )
+          `
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[DAILY REPORT CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+ THEN (payload->'cart'->>'value')::NUMERIC END
+            ) AS order_revenue
+          FROM event_logs
+          WHERE site_id = $1
+            AND event = 'PURCHASE'
+            AND created_at >= $2
+            AND created_at < $3
+        )
+        SELECT
+          COALESCE(SUM(order_revenue), 0)::NUMERIC AS revenue,
+          COUNT(*) FILTER (WHERE order_revenue IS NOT NULL)::INTEGER AS priced_purchase_events,
+          COUNT(DISTINCT session_id)::INTEGER AS purchase_event_sessions
+        FROM purchase_events
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const purchaseRow = purchaseResult.rows[0] || {};
+    const purchaseRevenue = Number(purchaseRow.revenue || 0);
+    const pricedPurchaseEvents = Number(purchaseRow.priced_purchase_events || 0);
+    const purchaseEventSessions = Number(purchaseRow.purchase_event_sessions || 0);
+
+    // Keep summary counts for consistency diagnostics, not as the revenue source.
+    const purchasedSummaryResult = await safeAnalyticsQuery(
+      `
+        SELECT COUNT(*)::INTEGER AS purchased_sessions
         FROM session_summaries
         WHERE site_id = $1
           AND purchased = TRUE
@@ -1932,15 +14908,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
       `,
       [siteId, startUTC, endUTC]
     );
-
-    const purchaseRow = purchaseResult.rows[0] || {};
-
-    const purchaseRevenue = Number(
-      purchaseRow.revenue || 0
-    );
-
     const purchasedSessions = Number(
-      purchaseRow.purchased_sessions || 0
+      purchasedSummaryResult.rows[0]?.purchased_sessions || 0
     );
 
     const recoveryResult = await safeAnalyticsQuery(
