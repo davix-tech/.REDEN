@@ -49,8 +49,8 @@ test("baseline queries are tenant-scoped and require two read-only queries", asy
   assert.match(db.queries[0], /add_to_cart_at >= product_view_at/i);
   assert.match(db.queries[0], /checkout_started_at >= add_to_cart_at/i);
   assert.match(db.queries[0], /purchase_at >= checkout_started_at/i);
-  assert.match(db.queries[1], /JOIN purchase_sessions ps/i);
-  assert.match(db.queries[1], /ps\.session_id = ss\.session_id/i);
+  assert.match(db.queries[1], /FROM event_logs/i);
+  assert.match(db.queries[1], /payload->>'revenue'/i);
   assert.equal(result.revenueBaseline.status, "purchase_tracking_unconfirmed");
   assert.equal(result.funnelBaseline.status, "insufficient_history");
 });
