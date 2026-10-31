@@ -76,6 +76,10 @@ export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
     return "REDEN has no confirmed purchase event for this period. That could mean no orders or missing purchase tracking. Run a test order first; if tracking works, check visits, add-to-cart activity and checkout to find where shoppers stop before increasing ad spend.";
   }
 
+  if (revenueBaseline.status === "purchase_revenue_unavailable") {
+    return "REDEN recorded purchase events, but those events do not contain a usable order amount. Check that the PURCHASE payload includes a numeric revenue value (for example, revenue: order.total). Until amounts are recorded, I cannot compare revenue reliably.";
+  }
+
   if (traffic.status === "below_baseline") {
     const current = numberOrNull(traffic.currentSessions);
     const average = numberOrNull(traffic.averageSessions);
