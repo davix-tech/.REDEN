@@ -28,7 +28,7 @@ const eventDay = (local_date, page_view_sessions, overrides = {}) => ({
 });
 
 const revenueDay = (local_date, revenue, purchased_sessions = 1) => ({
-  local_date, revenue, purchased_sessions,
+  local_date, revenue, purchased_sessions, priced_purchase_events: 1,
 });
 
 const input = {
