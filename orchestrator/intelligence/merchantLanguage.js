@@ -6,6 +6,14 @@
  * in customer-facing answers without changing evidence or decision logic.
  */
 const REPLACEMENTS = [
+  [/\\bPURCHASE_INTENT\\b/g, "signs that a shopper may be ready to buy"],
+  [/\\bHIGH_INTENT\\b/g, "strong signs of wanting to buy"],
+  [/\\bLOW_INTENT\\b/g, "limited signs of wanting to buy"],
+  [/\\bABANDONED_CART\\b/g, "a cart with items left before purchase"],
+  [/\\bRECOVERY_SUCCESS\\b/g, "a sale recovered after a reminder"],
+  [/\\bSESSION_SUMMARY\\b/g, "visit summary"],
+  [/\\bBANDIT_STATE\\b/g, "REDEN's decision history"],
+  [/\\bCONVERSION_DROP\\b/g, "fewer visitors completing purchases"],
   [/high-behavioural-intent session\(s\)/gi, "shoppers showing strong signs of wanting to buy"],
   [/high-behavioural-intent sessions?/gi, "shoppers showing strong signs of wanting to buy"],
   [/behavioural high-intent threshold/gi, "strong buying-signal threshold"],
