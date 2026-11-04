@@ -31,6 +31,7 @@ import { composeGrowthAdvice } from "./intelligence/growthAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 import { composeMerchantIntelligence } from "./intelligence/merchantIntelligence.js";
 import { publishSiteEvent, subscribeToSite } from "./infrastructure/realtime.js";
+import { composeStoreOverview } from "./intelligence/storeOverview.js";
 
 dotenv.config();
 
@@ -967,30 +968,7 @@ function composeAdvice(evidence) {
 }
 
 function composeOverview(evidence) {
-  const conversionRate =
-    evidence.decisions > 0
-      ? (evidence.conversions / evidence.decisions) * 100
-      : null;
-
-  const conversionText =
-    conversionRate === null
-      ? "no completed REDEN decision conversion rate is available"
-      : `a REDEN decision conversion rate of ${conversionRate.toFixed(
-          2
-        )}%`;
-
-  const baseline = evidence.trafficBaseline;
-  let trafficContext = "";
-
-  if (baseline?.status === "below_baseline") {
-    trafficContext = ` Recorded visits are materially below their recent same-time baseline: ${baseline.currentSessions} visits so far versus an average of ${baseline.averageSessions.toFixed(1)} across ${baseline.daysWithTraffic} of the previous 7 days with recorded PAGE_VIEW events. I recommend first checking storefront availability and PAGE_VIEW tracking, then reviewing traffic sources and campaign status if tracking is healthy.`;
-  } else if (baseline?.status === "insufficient_history") {
-    trafficContext = " REDEN does not yet have enough reliable historical traffic to determine whether today's visits are unusually low.";
-  }
-
-  return `Today REDEN recorded ${evidence.uniqueSessions} unique sessions, ${evidence.totalEvents} events, ${evidence.purchases} purchase events, and storefront purchase revenue of ${formatPurchaseRevenue(evidence)}. It also completed ${
-    evidence.decisions
-  } decisions with ${evidence.conversions} conversions, giving ${conversionText}.${trafficContext}`;
+  return composeStoreOverview(evidence);
 }
 
 function composeFunnel(evidence) {
