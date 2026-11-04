@@ -58,7 +58,7 @@ export const ECOMMERCE_KNOWLEDGE = [
   {
     id: "prethim-identity",
     patterns: [
-      /\\b(what is prethim|what s prethim|tell me about prethim|what does prethim do|what kind of company is prethim|what is prethim known for)\\b/i
+      /\b(what is prethim|what s prethim|tell me about prethim|what does prethim do|what kind of company is prethim|what is prethim known for)\b/i
     ],
     answer: "PRETHIM is a technology company building Adaptive Decision Infrastructure: APIs and intelligent software that help applications understand what is happening and decide what to do next. Its focus is solving practical technology problems through adaptive systems. REDEN is PRETHIM's first product, focused on e-commerce."
   },
