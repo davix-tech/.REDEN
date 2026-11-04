@@ -5,14 +5,10 @@
  */
 
 import { detectFollowUpIntent } from "./conversationMemory.js";
+import { normalizeMerchantQuestion } from "./languageDictionary.js";
 
 function normalizeQuestion(question) {
-  return String(question ?? "")
-    .slice(0, 2_000)
-    .toLowerCase()
-    .replace(/[^\w\s$%.-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return normalizeMerchantQuestion(question);
 }
 
 export function detectIntents(question, previousTurn = null) {
@@ -77,7 +73,7 @@ export function detectIntents(question, previousTurn = null) {
 
   // Route common e-commerce definitions to reviewed product knowledge.
   if (/\b(what is|what does|explain|define|meaning of|how does)\b/.test(q) &&
-      /\b(conversion rate|purchase intent|abandoned cart|average order value|aov|ecommerce funnel|sales funnel|revenue|profit|reden|commerce orchestration|discount)\b/.test(q)) {
+      /\b(conversion rate|purchase intent|abandoned cart|average order value|aov|ecommerce funnel|sales funnel|revenue|profit|reden|commerce orchestration|discount|traffic|product views)\b/.test(q)) {
     return ["commerce_knowledge"];
   }
 
