@@ -344,7 +344,56 @@ async function initializeDatabase() {
         ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         ADD COLUMN IF NOT EXISTS traffic_source VARCHAR(50),
-        ADD COLUMN IF NOT EXISTS utm_campaign VARCHAR(255)
+        ADD COLUMN IF NOT EXISTS utm_campaign VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS utm_source VARCHAR(150),
+        ADD COLUMN IF NOT EXISTS utm_medium VARCHAR(150),
+        ADD COLUMN IF NOT EXISTS utm_term VARCHAR(150),
+        ADD COLUMN IF NOT EXISTS utm_content VARCHAR(150),
+        ADD COLUMN IF NOT EXISTS landing_page VARCHAR(1000),
+        ADD COLUMN IF NOT EXISTS referrer_host VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS customer_ref VARCHAR(200),
+        ADD COLUMN IF NOT EXISTS last_cart_id VARCHAR(200)
+    `);
+
+    /*
+     * Identified purchase ledger. event_logs remains the immutable raw event
+     * record; this table gives each merchant order one canonical row so
+     * multiple purchase-event retries cannot inflate order counts or revenue.
+     * Legacy purchase events without order_id remain in event_logs and are
+     * explicitly treated as unverified order records by intelligence.
+     */
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS commerce_orders (
+        id BIGSERIAL PRIMARY KEY,
+        site_id VARCHAR(100) NOT NULL,
+        order_id VARCHAR(200) NOT NULL,
+        session_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        cart_id VARCHAR(200),
+        customer_ref VARCHAR(200),
+        total NUMERIC(14,2),
+        currency VARCHAR(3),
+        status VARCHAR(50) NOT NULL DEFAULT 'purchase_event',
+        items JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (site_id, order_id)
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_commerce_orders_site_created
+      ON commerce_orders (site_id, created_at DESC)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_commerce_orders_site_customer
+      ON commerce_orders (site_id, customer_ref)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_commerce_orders_site_session
+      ON commerce_orders (site_id, session_id)
     `);
 
     /*
