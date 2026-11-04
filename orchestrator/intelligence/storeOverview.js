@@ -73,13 +73,13 @@ export function composeStoreOverview(evidence = {}) {
   const revenue = evidence.purchaseRevenueAvailable === false
     ? null
     : amount(evidence.purchaseRevenue);
-  const revenuePerPurchase = purchases > 0 && revenue !== null
-    ? (count(evidence.purchaseRevenue) / purchases)
+  const revenuePerPurchase = purchaseRecords > 0 && revenue !== null
+    ? (count(evidence.purchaseRevenue) / purchaseRecords)
     : null;
 
   const sections = [];
   sections.push(
-    `**Performance snapshot**\nToday, REDEN recorded ${sessions} unique session(s) and ${events} events. The store recorded ${purchases} PURCHASE event(s)${revenue === null ? "; purchase revenue could not be reliably calculated" : `, representing ${revenue} in recorded storefront purchase revenue`}. ${revenuePerPurchase === null ? "" : `That is ${amount(revenuePerPurchase)} per purchase event on average, not verified average order value unless purchase events map one-to-one to unique orders.`}`
+    `**Performance snapshot**\nToday, REDEN recorded ${sessions} unique session(s) and ${events} events. The store recorded ${purchases} PURCHASE event(s)${revenue === null ? "; purchase revenue could not be reliably calculated" : `, representing ${revenue} in recorded storefront purchase revenue`}. ${revenuePerPurchase === null ? "" : `That is ${amount(revenuePerPurchase)} per recorded purchase record on average, not verified average order value unless records map one-to-one to unique orders.`}`
   );
 
   if (identifiedOrders || unidentifiedPurchaseEvents) {
