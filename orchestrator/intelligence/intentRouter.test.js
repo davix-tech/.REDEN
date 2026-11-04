@@ -76,6 +76,7 @@ test("routes PRETHIM and simple assistant identity questions to reviewed knowled
   assert.deepEqual(detectIntents("Tell me about PRETHIM"), ["prethim_identity"]);
   assert.deepEqual(detectIntents("What does PRETHIM do?"), ["prethim_identity"]);
   assert.deepEqual(detectIntents("Tell me your name"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("What does REDEN stand for?"), ["reden_identity"]);
   assert.deepEqual(detectIntents("What's your name?"), ["reden_identity"]);
   assert.deepEqual(detectIntents("How are you?"), ["greeting"]);
 });
