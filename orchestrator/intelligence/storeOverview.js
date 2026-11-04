@@ -65,6 +65,9 @@ export function composeStoreOverview(evidence = {}) {
   const carts = count(evidence.addToCart);
   const checkouts = count(evidence.checkoutStarted);
   const purchases = count(evidence.purchases);
+  const purchaseRecords = count(evidence.purchaseRecords ?? evidence.purchases);
+  const identifiedOrders = count(evidence.identifiedOrders);
+  const unidentifiedPurchaseEvents = count(evidence.unidentifiedPurchaseEvents);
   const decisions = count(evidence.decisions);
   const conversions = count(evidence.conversions);
   const revenue = evidence.purchaseRevenueAvailable === false
@@ -79,9 +82,31 @@ export function composeStoreOverview(evidence = {}) {
     `**Performance snapshot**\nToday, REDEN recorded ${sessions} unique session(s) and ${events} events. The store recorded ${purchases} PURCHASE event(s)${revenue === null ? "; purchase revenue could not be reliably calculated" : `, representing ${revenue} in recorded storefront purchase revenue`}. ${revenuePerPurchase === null ? "" : `That is ${amount(revenuePerPurchase)} per purchase event on average, not verified average order value unless purchase events map one-to-one to unique orders.`}`
   );
 
+  if (identifiedOrders || unidentifiedPurchaseEvents) {
+    sections.push(
+      `**Order identity**\nREDEN verified ${identifiedOrders} unique order record(s) using merchant-supplied order IDs. ${unidentifiedPurchaseEvents} legacy purchase event(s) have no usable order ID and cannot be deduplicated reliably at order level. These counts are separate from raw purchase-event counts.`
+    );
+  }
+
   sections.push(
     `**Shopping journey**\nREDEN recorded ${pageViews} page views, ${productViews} product views, ${carts} add-to-cart events and ${checkouts} checkout starts. These are event counts, not necessarily distinct shoppers or orders.`
   );
+
+  const products = Array.isArray(evidence.productPerformance)
+    ? evidence.productPerformance.slice(0, 5)
+    : [];
+  if (products.length) {
+    const productLines = products.map((product) => {
+      const name = product.name || product.productId;
+      const revenueText = count(product.pricedPurchaseLines) > 0
+        ? `, recorded item value ${amount(product.itemRevenue)} ${product.currency || ""}`.trimEnd()
+        : "";
+      return `- ${name}: ${count(product.productViews)} views, ${count(product.addToCartEvents)} add-to-cart event(s), ${count(product.purchaseLineItems)} purchase line item(s)${revenueText}`;
+    });
+    sections.push(`**Product performance**\n${productLines.join("\n")}\nProduct-level figures require consistent product IDs. Item values are not profit and are shown only where line-item prices were supplied.`);
+  } else {
+    sections.push("**Product performance**\nNo product-level performance can yet be established from events with usable product IDs. Ensure PRODUCT_VIEW, ADD_TO_CART and PURCHASE events include product IDs; include line items for multi-product orders.");
+  }
 
   const funnel = evidence.funnelBaseline;
   const traffic = evidence.trafficBaseline;
@@ -179,6 +204,27 @@ export function composeStoreOverview(evidence = {}) {
   if (!priorities.length) {
     priorities.push(
       "1. **Keep monitoring the funnel rather than making a broad change.** The current evidence does not isolate a single confirmed bottleneck. Track visits, product discovery, cart progression, checkout completion and purchase revenue over comparable periods."
+    );
+  }
+
+  const attribution = Array.isArray(evidence.attribution)
+    ? evidence.attribution.slice().sort((a, b) => count(b.sessions) - count(a.sessions)).slice(0, 5)
+    : [];
+  if (attribution.length) {
+    const channels = attribution.map((item) =>
+      `- ${item.trafficSource || "unknown"} / ${item.utmCampaign || "unattributed"}: ${count(item.sessions)} session(s), ${count(item.purchasedSessions ?? item.purchases)} purchased session(s), ${amount(item.revenue) ?? "unavailable"} recorded revenue`
+    );
+    sections.push(`**Acquisition attribution**\n${channels.join("\n")}\nThese are first-touch session attribution figures, not advertising ROI. REDEN needs campaign spend data before it can calculate ROAS or acquisition profitability.`);
+  }
+
+  const customers = evidence.customerIntelligence;
+  if (customers && count(customers.identifiedCustomers) > 0) {
+    sections.push(
+      `**Customer intelligence**\nREDEN identified ${count(customers.identifiedCustomers)} pseudonymous customer(s) associated with orders in this period: ${count(customers.firstTimeIdentifiedCustomers)} first-time identified and ${count(customers.returningCustomers)} returning. This depends on merchants consistently supplying a stable, non-PII customer_ref.`
+    );
+  } else {
+    sections.push(
+      "**Customer intelligence**\nRepeat-customer analysis is unavailable because no usable pseudonymous customer references were attached to identified orders. REDEN does not use customer email addresses as analytics identifiers."
     );
   }
 
