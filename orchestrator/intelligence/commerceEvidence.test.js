@@ -102,3 +102,26 @@ test("creates an order ledger record only when a stable order ID exists", () => 
   assert.equal(record.items.length, 1);
   assert.equal(buildOrderRecord({ siteId: "site_1", sessionId: "s", eventId: "e", payload: {} }), null);
 });
+
+test("uses a purchase order total for session revenue and strips nested direct identifiers", () => {
+  const result = normalizeCommercePayload("PURCHASE", {
+    order: {
+      id: "order-101",
+      total: 18000,
+      customer: { email: "buyer@example.com" },
+      items: [{ product_id: "p-1", quantity: 2, price: 9000 }],
+    },
+    customer: { id: "customer-101", email: "buyer@example.com" },
+    email: "buyer@example.com",
+    phone: "+2348000000000",
+  });
+  assert.equal(result.order_id, "order-101");
+  assert.equal(result.order_total, 18000);
+  assert.equal(result.revenue, 18000);
+  assert.equal(result.customer_ref, "customer-101");
+  assert.equal(result.email, undefined);
+  assert.equal(result.customer, undefined);
+  assert.equal(result.order, undefined);
+  assert.equal(result.phone, undefined);
+  assert.equal(result.items[0].product_id, "p-1");
+});
