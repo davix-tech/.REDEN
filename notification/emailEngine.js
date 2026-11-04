@@ -57,7 +57,11 @@ function formatNumber(value) {
 }
 
 function formatMoney(value) {
-  return Number(value || 0).toLocaleString(undefined, {
+  if (value === null || value === undefined || value === "") {
+    return "Not available";
+  }
+
+  return Number(value).toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
@@ -426,7 +430,7 @@ export async function sendMorningReport({
           >
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Store activity reviewed
+                Visits
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatNumber(metrics.total)}
@@ -525,7 +529,7 @@ export async function sendEveningReport({
           >
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Store activity reviewed
+                Visits
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatNumber(metrics.total)}
