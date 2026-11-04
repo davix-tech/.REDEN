@@ -102,12 +102,7 @@ export function normalizeCommercePayload(event, payload = {}) {
   // Do not retain direct customer identifiers in the event payload.
   delete result.email;
   delete result.customer_email;
-  if (result.customer && typeof result.customer === "object") {
-    result.customer = {
-      ...(customerRef ? { id: customerRef } : {}),
-      ...(text(customer.name, 120) ? { name: text(customer.name, 120) } : {}),
-    };
-  }
+  delete result.customer;
 
   if (event === "PURCHASE" && !orderId) {
     result.order_identity_status = "missing_order_id";
