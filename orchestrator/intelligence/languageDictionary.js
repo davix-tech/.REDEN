@@ -78,7 +78,7 @@ const ALIASES = LANGUAGE_DICTIONARY
   .sort((a, b) => b.alias.length - a.alias.length);
 
 function escapeRegExp(value) {
-  return value.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export function normalizeMerchantQuestion(question) {
@@ -91,8 +91,8 @@ export function normalizeMerchantQuestion(question) {
 
   for (const { alias, canonical } of ALIASES) {
     normalized = normalized.replace(
-      new RegExp(\`(^|\\\\b)\${escapeRegExp(alias)}(?=$|\\\\b)\`, "g"),
-      (match, prefix) => \`\${prefix}\${canonical}\`
+      new RegExp(`(^|\\b)${escapeRegExp(alias)}(?=$|\\b)`, "g"),
+      (match, prefix) => `${prefix}${canonical}`
     );
   }
 
@@ -102,6 +102,6 @@ export function normalizeMerchantQuestion(question) {
 export function findDictionaryEntry(question) {
   const normalized = normalizeMerchantQuestion(question);
   return LANGUAGE_DICTIONARY.find((entry) =>
-    new RegExp(\`(^|\\\\b)\${escapeRegExp(entry.canonical)}(?=$|\\\\b)\`).test(normalized)
+    new RegExp(`(^|\\b)${escapeRegExp(entry.canonical)}(?=$|\\b)`).test(normalized)
   ) || null;
 }
