@@ -379,462 +379,69 @@ async function initializeDatabase() {
       )
     `);
 
-    /* Backfill historical identified purchases once; the unique constraint makes this idempotent. */
+    /* Idempotently backfill historical identified purchases. */
     await client.query(`
+      WITH historical_orders AS (
+        SELECT DISTINCT ON (
+          site_id,
+          COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', ''))
+        )
+          site_id,
+          COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', '')) AS order_id,
+          session_id,
+          event_id,
+          COALESCE(NULLIF(payload->>'cart_id', ''), NULLIF(payload->>'cartId', '')) AS cart_id,
+          NULLIF(payload->>'customer_ref', '') AS customer_ref,
+          COALESCE(NULLIF(payload->>'order_total', ''), NULLIF(payload->>'orderTotal', ''), NULLIF(payload->>'total', ''), NULLIF(payload->>'revenue', ''), NULLIF(payload->>'amount', ''), NULLIF(payload->>'cart_value', ''), NULLIF(payload->>'cartValue', '')) AS amount_text,
+          UPPER(COALESCE(payload->>'currency', '')) AS currency,
+          COALESCE(NULLIF(payload->>'payment_status', ''), NULLIF(payload->>'order_status', ''), 'purchase_event') AS status,
+          CASE
+            WHEN jsonb_typeof(payload->'items') = 'array' THEN payload->'items'
+            WHEN COALESCE(NULLIF(payload->>'product_id', ''), NULLIF(payload->>'productId', '')) IS NOT NULL
+            THEN jsonb_build_array(jsonb_strip_nulls(jsonb_build_object(
+              'product_id', COALESCE(payload->>'product_id', payload->>'productId'),
+              'name', COALESCE(payload->>'product_name', payload->>'productName'),
+              'sku', payload->>'sku',
+              'variant_id', COALESCE(payload->>'variant_id', payload->>'variantId'),
+              'category', payload->>'category',
+              'quantity', COALESCE(payload->>'quantity', payload->>'qty'),
+              'unit_price', COALESCE(payload->>'unit_price', payload->>'unitPrice', payload->>'price'),
+              'currency', payload->>'currency'
+            )))
+            ELSE '[]'::jsonb
+          END AS items,
+          created_at
+        FROM event_logs
+        WHERE event = 'PURCHASE'
+          AND COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', '')) IS NOT NULL
+        ORDER BY site_id,
+          COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', '')),
+          created_at ASC
+      )
       INSERT INTO commerce_orders (
         site_id, order_id, session_id, event_id, cart_id, customer_ref,
         total, currency, status, items, created_at, updated_at
       )
-      SELECT DISTINCT ON (
-        site_id,
-        COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', ''))
-      )
-        site_id,
-        COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', '')),
-        session_id,
-        event_id,
-        COALESCE(NULLIF(payload->>'cart_id', ''), NULLIF(payload->>'cartId', '')),
+      SELECT
+        site_id, order_id, session_id, event_id, cart_id,
         CASE
-          WHEN POSITION('@' IN COALESCE(payload->>'customer_ref', '')) = 0
-            AND COALESCE(payload->>'customer_ref', '') !~ '^[+0-9 ()-]{7,}     * session, not from updated_at (which reflects session
-     * activity time, not purchase time). Also performed
-     * inline in reden.js on boot; kept here too so initDB()
-     * alone is sufficient.
-     */
-    await client.query(`
-      UPDATE session_summaries ss
-      SET purchased_at = (
-        SELECT MIN(el.created_at)
-        FROM event_logs el
-        WHERE el.site_id = ss.site_id
-          AND el.session_id = ss.session_id
-          AND el.event = 'PURCHASE'
-      )
-      WHERE ss.purchased = TRUE
-        AND ss.purchased_at IS NULL
-    `);
-
-    /* =====================================================
-       INTELLIGENCE ANSWERS
-
-       Audit log: every question REDEN answers, the evidence
-       it saw, which intents matched, and the answer given.
-       Also created inline in reden.js on boot.
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS intelligence_answers (
-        id BIGSERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        question TEXT NOT NULL,
-        answer TEXT NOT NULL,
-
-        evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-        intents JSONB NOT NULL DEFAULT '[]'::jsonb,
-
-        latency_ms INTEGER,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       INDEXES
-    ===================================================== */
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_owner_email
-      ON sites (LOWER(owner_email))
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_name
-      ON sites (LOWER(name))
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_completed
-      ON decisions (site_id, completed_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_session_state
-      ON decisions (site_id, session_id, state)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_bandit_state_site
-      ON bandit_state (site_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
-      ON event_logs (site_id, created_at DESC)
-    `);
-
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_event_logs_site_event_id
-      ON event_logs (site_id, event_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_recovery_site_status
-      ON recovery_queue (site_id, status)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_email_logs_site_created
-      ON email_logs (site_id, created_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_updated
-      ON session_summaries (site_id, updated_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_session
-      ON session_summaries (site_id, session_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_intelligence_answers_site_created
-      ON intelligence_answers (site_id, created_at DESC)
-    `);
-
-    /* =====================================================
-       COMMIT
-    ===================================================== */
-
-    await client.query("COMMIT");
-
-    console.log(
-      "[DB] REDEN database schema initialized (matches reden.js query shape)."
-    );
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    console.error("[DB INIT ERROR]", error);
-
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-/* =========================================================
-   CONNECTION ERROR
-========================================================= */
-
-db.on("error", (error) => {
-  console.error("[DB POOL ERROR]", error);
-});
-
-          THEN NULLIF(payload->>'customer_ref', '')
+          WHEN customer_ref IS NOT NULL
+            AND POSITION('@' IN customer_ref) = 0
+            AND translate(customer_ref, '+0123456789 ()-', '') <> ''
+          THEN customer_ref
           ELSE NULL
         END,
         CASE
-          WHEN COALESCE(NULLIF(payload->>'order_total', ''), NULLIF(payload->>'orderTotal', ''), NULLIF(payload->>'total', ''), NULLIF(payload->>'revenue', ''), NULLIF(payload->>'amount', ''), NULLIF(payload->>'cart_value', ''), NULLIF(payload->>'cartValue', '')) ~ '^[0-9]+([.][0-9]+)?     * session, not from updated_at (which reflects session
-     * activity time, not purchase time). Also performed
-     * inline in reden.js on boot; kept here too so initDB()
-     * alone is sufficient.
-     */
-    await client.query(`
-      UPDATE session_summaries ss
-      SET purchased_at = (
-        SELECT MIN(el.created_at)
-        FROM event_logs el
-        WHERE el.site_id = ss.site_id
-          AND el.session_id = ss.session_id
-          AND el.event = 'PURCHASE'
-      )
-      WHERE ss.purchased = TRUE
-        AND ss.purchased_at IS NULL
-    `);
-
-    /* =====================================================
-       INTELLIGENCE ANSWERS
-
-       Audit log: every question REDEN answers, the evidence
-       it saw, which intents matched, and the answer given.
-       Also created inline in reden.js on boot.
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS intelligence_answers (
-        id BIGSERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        question TEXT NOT NULL,
-        answer TEXT NOT NULL,
-
-        evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-        intents JSONB NOT NULL DEFAULT '[]'::jsonb,
-
-        latency_ms INTEGER,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       INDEXES
-    ===================================================== */
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_owner_email
-      ON sites (LOWER(owner_email))
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_name
-      ON sites (LOWER(name))
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_completed
-      ON decisions (site_id, completed_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_session_state
-      ON decisions (site_id, session_id, state)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_bandit_state_site
-      ON bandit_state (site_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
-      ON event_logs (site_id, created_at DESC)
-    `);
-
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_event_logs_site_event_id
-      ON event_logs (site_id, event_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_recovery_site_status
-      ON recovery_queue (site_id, status)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_email_logs_site_created
-      ON email_logs (site_id, created_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_updated
-      ON session_summaries (site_id, updated_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_session
-      ON session_summaries (site_id, session_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_intelligence_answers_site_created
-      ON intelligence_answers (site_id, created_at DESC)
-    `);
-
-    /* =====================================================
-       COMMIT
-    ===================================================== */
-
-    await client.query("COMMIT");
-
-    console.log(
-      "[DB] REDEN database schema initialized (matches reden.js query shape)."
-    );
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    console.error("[DB INIT ERROR]", error);
-
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-/* =========================================================
-   CONNECTION ERROR
-========================================================= */
-
-db.on("error", (error) => {
-  console.error("[DB POOL ERROR]", error);
-});
-
-          THEN COALESCE(NULLIF(payload->>'order_total', ''), NULLIF(payload->>'orderTotal', ''), NULLIF(payload->>'total', ''), NULLIF(payload->>'revenue', ''), NULLIF(payload->>'amount', ''), NULLIF(payload->>'cart_value', ''), NULLIF(payload->>'cartValue', ''))::NUMERIC
+          WHEN amount_text IS NOT NULL AND amount_text <> ''
+            AND translate(amount_text, '0123456789.', '') = ''
+            AND length(amount_text) - length(replace(amount_text, '.', '')) <= 1
+            AND left(amount_text, 1) <> '.' AND right(amount_text, 1) <> '.'
+          THEN amount_text::NUMERIC
           ELSE NULL
         END,
-        CASE WHEN UPPER(COALESCE(payload->>'currency', '')) ~ '^[A-Z]{3}     * session, not from updated_at (which reflects session
-     * activity time, not purchase time). Also performed
-     * inline in reden.js on boot; kept here too so initDB()
-     * alone is sufficient.
-     */
-    await client.query(`
-      UPDATE session_summaries ss
-      SET purchased_at = (
-        SELECT MIN(el.created_at)
-        FROM event_logs el
-        WHERE el.site_id = ss.site_id
-          AND el.session_id = ss.session_id
-          AND el.event = 'PURCHASE'
-      )
-      WHERE ss.purchased = TRUE
-        AND ss.purchased_at IS NULL
-    `);
-
-    /* =====================================================
-       INTELLIGENCE ANSWERS
-
-       Audit log: every question REDEN answers, the evidence
-       it saw, which intents matched, and the answer given.
-       Also created inline in reden.js on boot.
-    ===================================================== */
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS intelligence_answers (
-        id BIGSERIAL PRIMARY KEY,
-
-        site_id VARCHAR(100) NOT NULL,
-
-        question TEXT NOT NULL,
-        answer TEXT NOT NULL,
-
-        evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-        intents JSONB NOT NULL DEFAULT '[]'::jsonb,
-
-        latency_ms INTEGER,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    /* =====================================================
-       INDEXES
-    ===================================================== */
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_owner_email
-      ON sites (LOWER(owner_email))
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_sites_name
-      ON sites (LOWER(name))
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_completed
-      ON decisions (site_id, completed_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_decisions_site_session_state
-      ON decisions (site_id, session_id, state)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_bandit_state_site
-      ON bandit_state (site_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_event_logs_site_created
-      ON event_logs (site_id, created_at DESC)
-    `);
-
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_event_logs_site_event_id
-      ON event_logs (site_id, event_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_recovery_site_status
-      ON recovery_queue (site_id, status)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_email_logs_site_created
-      ON email_logs (site_id, created_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_updated
-      ON session_summaries (site_id, updated_at DESC)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_site_session
-      ON session_summaries (site_id, session_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_intelligence_answers_site_created
-      ON intelligence_answers (site_id, created_at DESC)
-    `);
-
-    /* =====================================================
-       COMMIT
-    ===================================================== */
-
-    await client.query("COMMIT");
-
-    console.log(
-      "[DB] REDEN database schema initialized (matches reden.js query shape)."
-    );
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    console.error("[DB INIT ERROR]", error);
-
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-/* =========================================================
-   CONNECTION ERROR
-========================================================= */
-
-db.on("error", (error) => {
-  console.error("[DB POOL ERROR]", error);
-});
- THEN UPPER(payload->>'currency') ELSE NULL END,
-        COALESCE(NULLIF(payload->>'payment_status', ''), NULLIF(payload->>'order_status', ''), 'purchase_event'),
-        CASE
-          WHEN jsonb_typeof(payload->'items') = 'array' THEN payload->'items'
-          WHEN COALESCE(NULLIF(payload->>'product_id', ''), NULLIF(payload->>'productId', '')) IS NOT NULL
-          THEN jsonb_build_array(jsonb_strip_nulls(jsonb_build_object(
-            'product_id', COALESCE(payload->>'product_id', payload->>'productId'),
-            'name', COALESCE(payload->>'product_name', payload->>'productName'),
-            'sku', payload->>'sku',
-            'variant_id', COALESCE(payload->>'variant_id', payload->>'variantId'),
-            'category', payload->>'category',
-            'quantity', COALESCE(payload->>'quantity', payload->>'qty'),
-            'unit_price', COALESCE(payload->>'unit_price', payload->>'unitPrice', payload->>'price'),
-            'currency', payload->>'currency'
-          )))
-          ELSE '[]'::jsonb
-        END,
-        created_at,
-        created_at
-      FROM event_logs
-      WHERE event = 'PURCHASE'
-        AND COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', '')) IS NOT NULL
-      ORDER BY site_id,
-        COALESCE(NULLIF(payload->>'order_id', ''), NULLIF(payload->>'orderId', ''), NULLIF(payload #>> '{order,id}', '')),
-        created_at ASC
+        CASE WHEN length(currency) = 3 AND currency SIMILAR TO '[A-Z][A-Z][A-Z]' THEN currency ELSE NULL END,
+        status, items, created_at, created_at
+      FROM historical_orders
       ON CONFLICT (site_id, order_id) DO NOTHING
     `);
 
