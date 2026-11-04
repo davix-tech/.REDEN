@@ -32,6 +32,8 @@ import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 import { composeMerchantIntelligence } from "./intelligence/merchantIntelligence.js";
 import { publishSiteEvent, subscribeToSite } from "./infrastructure/realtime.js";
 import { composeStoreOverview } from "./intelligence/storeOverview.js";
+import { normalizeCommercePayload, normalizeAttribution, buildOrderRecord } from "./intelligence/commerceEvidence.js";
+import { recordIdentifiedOrder, loadCommerceIntelligence } from "./intelligence/commerceIntelligence.js";
 
 dotenv.config();
 
@@ -2052,58 +2054,18 @@ app.post("/api/v1/intelligence", async (req, res) => {
       decisionRow.revenue || 0
     );
 
-    const purchaseResult = await safeAnalyticsQuery(
-      `
-        WITH purchase_events AS (
-          SELECT
-            session_id,
-            COALESCE(
-              NULLIF(payload->>'revenue', ''),
-              NULLIF(payload->>'total', ''),
-              NULLIF(payload->>'value', ''),
-              NULLIF(payload->>'order_total', ''),
-              NULLIF(payload->>'orderTotal', ''),
-              NULLIF(payload->>'amount', ''),
-              NULLIF(payload->>'cart_value', ''),
-              NULLIF(payload->>'cartValue', ''),
-              NULLIF(payload #>> '{cart,value}', '')
-            ) AS amount_text
-          FROM event_logs
-          WHERE site_id = $1
-            AND event = 'PURCHASE'
-            AND created_at >= $2
-            AND created_at < $3
-        ),
-        normalized_purchases AS (
-          SELECT
-            session_id,
-            CASE
-              WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
-              THEN amount_text::NUMERIC
-              ELSE NULL
-            END AS amount
-          FROM purchase_events
-        )
-        SELECT
-          COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
-          COUNT(DISTINCT session_id)::INTEGER AS purchased_sessions,
-          COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events
-        FROM normalized_purchases
-      `,
-      [siteId, startUTC, endUTC]
-    );
-
-    const purchaseRow = purchaseResult.rows[0] || {};
-
-    const purchaseRevenue = Number(
-      purchaseRow.revenue || 0
-    );
-    const purchaseRevenueAvailable =
-      Number(purchaseRow.priced_purchase_events || 0) > 0;
-
-    const purchasedSessions = Number(
-      purchaseRow.purchased_sessions || 0
-    );
+    const commerceIntelligence = await loadCommerceIntelligence(db, {
+      siteId,
+      startUTC,
+      endUTC,
+    });
+    const purchaseRevenue = commerceIntelligence.purchaseRevenue;
+    const purchaseRevenueAvailable = commerceIntelligence.purchaseRevenueAvailable;
+    const purchasedSessions = commerceIntelligence.purchasedSessions;
+    const purchaseRecords = commerceIntelligence.purchaseRecords;
+    const identifiedOrders = commerceIntelligence.identifiedOrders;
+    const pricedPurchaseRecords = commerceIntelligence.pricedPurchaseRecords;
+    const unidentifiedPurchaseEvents = commerceIntelligence.unidentifiedPurchaseEvents;
 
     const recoveryResult = await safeAnalyticsQuery(
       `
@@ -2323,16 +2285,21 @@ app.post("/api/v1/intelligence", async (req, res) => {
       `
         SELECT
           COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COALESCE(utm_source, 'unknown') AS utm_source,
+          COALESCE(utm_medium, 'unknown') AS utm_medium,
+          COALESCE(utm_campaign, 'unattributed') AS utm_campaign,
           COUNT(*)::INTEGER AS sessions,
-          COUNT(*) FILTER (
-            WHERE purchased = TRUE
-          )::INTEGER AS purchases,
+          COUNT(*) FILTER (WHERE purchased = TRUE)::INTEGER AS purchases,
           COALESCE(SUM(revenue), 0)::NUMERIC AS revenue
         FROM session_summaries
         WHERE site_id = $1
           AND first_seen_at >= $2
           AND first_seen_at < $3
-        GROUP BY COALESCE(traffic_source, 'unknown')
+        GROUP BY
+          COALESCE(traffic_source, 'unknown'),
+          COALESCE(utm_source, 'unknown'),
+          COALESCE(utm_medium, 'unknown'),
+          COALESCE(utm_campaign, 'unattributed')
       `,
       [siteId, startUTC, endUTC]
     );
@@ -2343,13 +2310,17 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
       return {
         trafficSource: row.traffic_source,
+        utmSource: row.utm_source,
+        utmMedium: row.utm_medium,
+        utmCampaign: row.utm_campaign,
         sessions: Number(row.sessions || 0),
-        purchases,
+        purchasedSessions: purchases,
         revenue,
-        avgOrderValue:
-          purchases > 0 ? revenue / purchases : 0,
       };
     });
+
+    const productPerformance = commerceIntelligence.productPerformance;
+    const customerIntelligence = commerceIntelligence.customerIntelligence;
 
     const evidence = {
       period: "today",
@@ -2387,6 +2358,10 @@ app.post("/api/v1/intelligence", async (req, res) => {
       purchases: Number(
         eventCounts.PURCHASE || 0
       ),
+      purchaseRecords,
+      identifiedOrders,
+      pricedPurchaseRecords,
+      unidentifiedPurchaseEvents,
 
       decisions,
       conversions,
@@ -2403,6 +2378,8 @@ app.post("/api/v1/intelligence", async (req, res) => {
       bandit,
 
       attribution,
+      productPerformance,
+      customerIntelligence,
 
       intentSummary,
       interventionOutcomes,
@@ -2606,10 +2583,14 @@ app.post("/event", async (req, res) => {
     1_000_000_000
   );
 
+  const commercePayload = normalizeCommercePayload(event, payload);
   const sanitizedPayload = {
-    ...payload,
+    ...commercePayload,
     cart_value: boundedCartValue,
   };
+  const orderRecord = event === "PURCHASE"
+    ? buildOrderRecord({ siteId, sessionId, eventId: generatedEventId, payload: sanitizedPayload })
+    : null;
 
   /*
    * Captured here so it's available regardless of which event
@@ -2628,37 +2609,19 @@ app.post("/event", async (req, res) => {
    * COALESCE so an existing traffic_source on the row is
    * never overwritten by a later event on the same session.
    */
-  const referrer = normalizeString(
-    payload.referrer || payload.document_referrer,
-    500
-  );
-
-  const utmSource = normalizeString(
-    payload.utm_source || payload.utmSource,
-    100
-  );
-
-  const utmMedium = normalizeString(
-    payload.utm_medium || payload.utmMedium,
-    100
-  );
-
-  const utmCampaign = normalizeString(
-    payload.utm_campaign || payload.utmCampaign,
-    255
-  );
-
-  const hasAttributionData = Boolean(
-    referrer || utmSource || utmCampaign
-  );
-
+  const attribution = normalizeAttribution(sanitizedPayload, req.body?.path);
+  delete sanitizedPayload.referrer;
+  delete sanitizedPayload.document_referrer;
+  const referrer = normalizeString(payload.referrer || payload.document_referrer, 500);
+  const utmSource = normalizeString(attribution.utm_source, 150);
+  const utmMedium = normalizeString(attribution.utm_medium, 150);
+  const utmCampaign = normalizeString(attribution.utm_campaign, 255);
+  const hasAttributionData = Object.keys(attribution).length > 0;
   const trafficSource = hasAttributionData
-    ? classifyTrafficSource({
-        referrer,
-        utmSource,
-        utmMedium,
-      })
+    ? classifyTrafficSource({ referrer, utmSource, utmMedium })
     : null;
+  const customerRef = normalizeString(sanitizedPayload.customer_ref, 200);
+  const cartId = normalizeString(sanitizedPayload.cart_id, 200);
 
   const client = await db.connect();
 
@@ -2701,7 +2664,11 @@ app.post("/event", async (req, res) => {
       ]
     );
 
-    if (eventResult.rowCount) {
+    let orderInserted = false;
+    if (eventResult.rowCount && orderRecord) {
+      orderInserted = await recordIdentifiedOrder(client, orderRecord);
+    }
+    if (eventResult.rowCount && (!orderRecord || orderInserted)) {
       await updateSessionContext({
         siteId,
         sessionId,
@@ -2719,17 +2686,35 @@ app.post("/event", async (req, res) => {
      * session_id, so this always targets an existing row via
      * UPDATE and only sets the columns if they're still NULL.
      */
-    if (hasAttributionData) {
+    if (hasAttributionData || customerRef || cartId) {
       await client.query(
         `
           UPDATE session_summaries
           SET
             traffic_source = COALESCE(traffic_source, $3),
-            utm_campaign = COALESCE(utm_campaign, $4)
-          WHERE site_id = $1
-            AND session_id = $2
+            utm_campaign = COALESCE(utm_campaign, $4),
+            utm_source = COALESCE(utm_source, $5),
+            utm_medium = COALESCE(utm_medium, $6),
+            utm_term = COALESCE(utm_term, $7),
+            utm_content = COALESCE(utm_content, $8),
+            landing_page = COALESCE(landing_page, $9),
+            referrer_host = COALESCE(referrer_host, $10),
+            customer_ref = COALESCE(customer_ref, $11),
+            last_cart_id = COALESCE($12, last_cart_id)
+          WHERE site_id = $1 AND session_id = $2
         `,
-        [siteId, sessionId, trafficSource, utmCampaign || null]
+        [
+          siteId, sessionId, trafficSource,
+          attribution.utm_campaign || null,
+          attribution.utm_source || null,
+          attribution.utm_medium || null,
+          attribution.utm_term || null,
+          attribution.utm_content || null,
+          attribution.landing_page || null,
+          attribution.referrer_host || null,
+          customerRef || null,
+          cartId || null,
+        ]
       );
     }
 
@@ -2798,6 +2783,8 @@ app.post("/event", async (req, res) => {
     return success(res, {
       accepted: true,
       duplicate: eventResult.rowCount === 0,
+      duplicateOrder: Boolean(orderRecord && eventResult.rowCount && !orderInserted),
+      orderIdentified: Boolean(orderRecord),
       eventId: generatedEventId,
     });
   } catch (error) {

@@ -34,5 +34,9 @@ jobs:
           node --check orchestrator/intelligence/intentRouter.js
           node --check orchestrator/intelligence/historicalBaselines.js
           node --check orchestrator/intelligence/storeOverview.js
+          node --check orchestrator/intelligence/commerceEvidence.js
+          node --check orchestrator/intelligence/commerceIntelligence.js
+          node --check infrastructure/db.js
+          node --check public/sdk.js
       - name: Run intelligence unit tests
         run: npm test
