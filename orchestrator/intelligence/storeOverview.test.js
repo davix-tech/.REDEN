@@ -75,3 +75,13 @@ test("overview does not call purchase events unique orders", () => {
   assert.doesNotMatch(answer, /1 orders/);
   assert.match(answer, /purchase event/);
 });
+
+test("overview does not turn missing revenue into zero", () => {
+  const answer = composeStoreOverview({
+    ...base,
+    purchaseRevenue: null,
+    purchaseRevenueAvailable: false,
+  });
+  assert.match(answer, /purchase revenue could not be reliably calculated/i);
+  assert.doesNotMatch(answer, /representing 0 in recorded storefront purchase revenue/i);
+});
