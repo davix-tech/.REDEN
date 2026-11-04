@@ -19,7 +19,7 @@ export function detectIntents(question) {
   // Weekly revenue questions need a week-to-date calculation, not today's snapshot.
   if (
     /\b(this week|week to date|so far this week|weekly)\b/.test(q) &&
-    /\b(revenue|income|sales|earned|earnings|made|money)\b/.test(q)
+    /\b(revenue|income|sales|earned|earnings|make|made|money)\b/.test(q)
   ) {
     return ["weekly_revenue"];
   }
