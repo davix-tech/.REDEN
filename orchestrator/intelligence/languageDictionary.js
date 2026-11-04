@@ -84,7 +84,7 @@ function escapeRegExp(value) {
 export function normalizeMerchantQuestion(question) {
   let normalized = String(question ?? "").slice(0, 2_000).toLowerCase();
   normalized = normalized
-    .replace(/[’']/g, "")
+    .replace(/[’']/g, " ")
     .replace(/[^\w\s$%.-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
