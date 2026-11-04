@@ -60,7 +60,7 @@ export function detectFollowUpIntent(question, previousTurn) {
     return ["revenue"];
   }
 
-  if (/^(tell me more|explain that|what do you mean|can you explain|how so|elaborate)$/.test(q)) {
+  if (/^(tell me more|explain that|what do you mean|what does that mean|what about it|can you explain|explain further|how so|how does that work|elaborate)$/.test(q)) {
     return ["contextual_follow_up"];
   }
 
@@ -96,7 +96,7 @@ export function composeContextualFollowUp(question, previousTurn) {
     .split(/(?<=[.!?])\s+/)[0]
     .slice(0, 260);
 
-  if (/^(tell me more|elaborate)$/.test(q)) {
+  if (/^(tell me more|elaborate|explain further)$/.test(q)) {
     return `I was referring to ${topic}. The key point was: ${firstSentence} I can break down the figures, the possible explanation, or the next step.`;
   }
 
