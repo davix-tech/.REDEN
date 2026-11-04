@@ -73,7 +73,7 @@ export function detectIntents(question, previousTurn = null) {
 
   // Route common e-commerce definitions to reviewed product knowledge.
   if (/\b(what is|what does|explain|define|meaning of|how does)\b/.test(q) &&
-      /\b(conversion rate|purchase intent|abandoned cart|average order value|aov|ecommerce funnel|sales funnel|revenue|profit|reden|commerce orchestration|discount|traffic|product views)\b/.test(q)) {
+      /\b(conversion rate|purchase intent|abandoned cart|cart abandonment|average order value|aov|ecommerce funnel|sales funnel|revenue|profit|reden|commerce orchestration|discount|traffic|product views)\b/.test(q)) {
     return ["commerce_knowledge"];
   }
 
