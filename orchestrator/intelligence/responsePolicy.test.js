@@ -37,6 +37,38 @@ test("REDEN answers its own name and product identity", () => {
   assert.match(composeConversationResponse("reden_identity", "Who built you?"), /PRETHIM/);
 });
 
+test("answers PRETHIM identity and simple questions in plain language", () => {
+  assert.match(composeCommerceKnowledge("What is PRETHIM?"), /technology company/i);
+  assert.match(composeCommerceKnowledge("What does PRETHIM do?"), /Adaptive Decision Infrastructure/i);
+  assert.match(composeCommerceKnowledge("Tell me your name"), /My name is REDEN/i);
+  assert.match(composeCommerceKnowledge("Who made you?"), /PRETHIM/i);
+});
+
+test("business redirection varies instead of repeating one generic fallback", () => {
+  const first = composeConversationResponse("general_help", "Tell me a joke", []);
+  const second = composeConversationResponse("general_help", "Tell me a joke", [
+    { answer: first }
+  ]);
+  assert.notEqual(first, second);
+  assert.match(first, /store/i);
+  assert.match(second, /commerce business/i);
+});
+
+test("contextual follow-up explains the previous answer rather than losing the topic", () => {
+  const answer = composeConversationResponse(
+    "contextual_follow_up",
+    "Tell me more",
+    [],
+    {
+      question: "How much did I make this week?",
+      answer: "Your store recorded 45,000 in sales this week.",
+      intents: ["weekly_revenue"],
+    }
+  );
+  assert.match(answer, /week-to-date sales figures/i);
+  assert.match(answer, /45,000 in sales/i);
+});
+
 test("commerce knowledge answers common definitions without inventing store facts", () => {
   assert.match(composeCommerceKnowledge("What is conversion rate?"), /proportion of a defined group/);
   assert.match(composeCommerceKnowledge("What is an abandoned cart?"), /do not prove an abandonment count/);
