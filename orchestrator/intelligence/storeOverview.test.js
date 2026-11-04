@@ -21,7 +21,7 @@ const base = {
 
 test("overview interprets small samples and flags purchase-event/order reconciliation", () => {
   const answer = composeStoreOverview(base);
-  assert.match(answer, /one unique session/i);
+  assert.match(answer, /1 unique session/i);
   assert.match(answer, /2 PURCHASE event/);
   assert.match(answer, /Verify unique order IDs/);
   assert.match(answer, /not enough reliable historical traffic/i);
