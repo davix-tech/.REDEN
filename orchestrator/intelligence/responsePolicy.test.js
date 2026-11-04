@@ -42,6 +42,7 @@ test("answers PRETHIM identity and simple questions in plain language", () => {
   assert.match(composeCommerceKnowledge("What does PRETHIM do?"), /Adaptive Decision Infrastructure/i);
   assert.match(composeCommerceKnowledge("Tell me your name"), /My name is REDEN/i);
   assert.match(composeCommerceKnowledge("Who made you?"), /PRETHIM/i);
+  assert.match(composeCommerceKnowledge("What does REDEN stand for?"), /Revenue Decision Engine/i);
 });
 
 test("business redirection varies instead of repeating one generic fallback", () => {
