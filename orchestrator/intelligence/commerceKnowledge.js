@@ -68,6 +68,13 @@ export const ECOMMERCE_KNOWLEDGE = [
     answer: "I’m being developed by PRETHIM, a technology company focused on using APIs and intelligent software systems to solve everyday technology problems."
   },
   {
+    id: "reden-acronym",
+    patterns: [
+      /\b(what does reden stand for|what is the full form of reden|what does reden mean)\b/i
+    ],
+    answer: "REDEN stands for Revenue Decision Engine. It is PRETHIM's adaptive commerce orchestration product, designed to help e-commerce businesses turn shopper behaviour into useful decisions and measurable outcomes."
+  },
+  {
     id: "reden-product",
     patterns: [/\bwhat is reden\b/i, /\bwhat s reden\b/i, /\btell me about reden\b/i, /\bwhat is commerce orchestration\b/i],
     answer: "REDEN is PRETHIM's e-commerce product. It is being built to turn storefront behaviour into evidence-based decisions, appropriate automated actions, and measured outcomes. Its code includes a storefront-event pipeline and an evolving commerce-intelligence layer; not every planned automation or adaptive capability has been verified as production-ready."
