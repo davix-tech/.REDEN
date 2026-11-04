@@ -446,9 +446,20 @@
       ensureSession();
     }
 
+    const eventId =
+      cleanString(
+        options.eventId ||
+          payload.event_id ||
+          payload.eventId,
+        200
+      ) || uuid();
+
     const body = {
       session_id:
         state.sessionId,
+
+      event_id:
+        eventId,
 
       event:
         normalizedEvent,
@@ -1066,21 +1077,39 @@
      AUTO TRACKING
   ───────────────────────────────────────────── */
 
+  function getAttributionPayload() {
+    const payload = {
+      referrer:
+        cleanString(document.referrer, 2000) || null,
+      landing_page:
+        cleanString(window.location.pathname, 1000) || "/",
+    };
+
+    try {
+      const params = new URLSearchParams(window.location.search);
+      for (const key of [
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+      ]) {
+        const value = cleanString(params.get(key) || "", key === "utm_campaign" ? 255 : 150);
+        if (value) payload[key] = value;
+      }
+    } catch {
+      // Attribution is optional; page tracking must still work.
+    }
+
+    return payload;
+  }
+
   function setupPageTracking() {
     if (!config.autoPageview) {
       return;
     }
 
-    void track(
-      "PAGE_VIEW",
-      {
-        referrer:
-          cleanString(
-            document.referrer,
-            2000
-          ) || null,
-      }
-    );
+    void track("PAGE_VIEW", getAttributionPayload());
   }
 
   function getElementClass(el) {
