@@ -2110,7 +2110,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
           COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
           COUNT(DISTINCT session_id)::INTEGER AS purchased_sessions,
           COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events,
-          COUNT(*) FILTER (WHERE identity_type = 'identified' AND amount IS NOT NULL)::INTEGER AS priced_purchase_records,
+          COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_records,
           COUNT(*) FILTER (WHERE identity_type = 'identified')::INTEGER AS identified_orders,
           COUNT(*) FILTER (WHERE identity_type = 'unidentified')::INTEGER AS unidentified_purchase_events,
           COUNT(*)::INTEGER AS purchase_records
