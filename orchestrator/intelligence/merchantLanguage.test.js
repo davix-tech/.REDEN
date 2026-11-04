@@ -33,6 +33,17 @@ test("translates internal REDEN state names into merchant language", () => {
   assert.doesNotMatch(answer, /PURCHASE_INTENT|HIGH_INTENT|LOW_INTENT|ABANDONED_CART|RECOVERY_SUCCESS|BANDIT_STATE/);
 });
 
+test("translates internal decision reasons and action names", () => {
+  const answer = toMerchantLanguage(
+    "high_purchase_intent INCENTIVE_LOW RECOVERY_EMAIL SESSION_START"
+  );
+  assert.match(answer, /strong signs that a shopper may buy/i);
+  assert.match(answer, /small targeted discount/i);
+  assert.match(answer, /cart reminder email/i);
+  assert.match(answer, /new store visit/i);
+  assert.doesNotMatch(answer, /high_purchase_intent|INCENTIVE_LOW|RECOVERY_EMAIL|SESSION_START/);
+});
+
 test("translates internal decision lifecycle labels", () => {
   assert.equal(
     toMerchantLanguage("Check SCORED → ACTIONED → COMPLETED."),
