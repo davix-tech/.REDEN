@@ -27,6 +27,7 @@ import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
 import { composeGrowthAdvice } from "./intelligence/growthAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 import { composeMerchantIntelligence } from "./intelligence/merchantIntelligence.js";
+import { toMerchantLanguage } from "./intelligence/merchantLanguage.js";
 
 dotenv.config();
 
@@ -2303,7 +2304,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
       }
     }
 
-    let answer = sections.join("\n\n");
+    let answer = toMerchantLanguage(sections.join("\n\n"));
 
     if (!answer) {
       answer =
