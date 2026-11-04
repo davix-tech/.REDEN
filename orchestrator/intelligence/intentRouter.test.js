@@ -70,6 +70,38 @@ test("routes REDEN identity questions separately from merchant-store identity", 
   assert.deepEqual(detectIntents("What is my store called?"), ["identity"]);
 });
 
+test("routes PRETHIM and simple assistant identity questions to reviewed knowledge", () => {
+  assert.deepEqual(detectIntents("What is PRETHIM?"), ["prethim_identity"]);
+  assert.deepEqual(detectIntents("What's PRETHIM?"), ["prethim_identity"]);
+  assert.deepEqual(detectIntents("Tell me about PRETHIM"), ["prethim_identity"]);
+  assert.deepEqual(detectIntents("What does PRETHIM do?"), ["prethim_identity"]);
+  assert.deepEqual(detectIntents("Tell me your name"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("What's your name?"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("How are you?"), ["greeting"]);
+});
+
+test("resolves short follow-up questions using the previous turn", () => {
+  const weeklyTurn = {
+    question: "How much did I make this week?",
+    answer: "Your store recorded sales this week.",
+    intents: ["weekly_revenue"],
+  };
+  assert.deepEqual(detectIntents("And last week?", weeklyTurn), ["weekly_revenue"]);
+  assert.deepEqual(detectIntents("What about today?", weeklyTurn), ["revenue"]);
+  assert.deepEqual(detectIntents("Why?", weeklyTurn), ["weekly_revenue", "diagnostic"]);
+  assert.deepEqual(detectIntents("Tell me more", weeklyTurn), ["contextual_follow_up"]);
+});
+
+test("routes follow-up action requests to merchant prioritization", () => {
+  const previousTurn = {
+    question: "Why are sales down?",
+    answer: "Recorded sales are below the recent baseline.",
+    intents: ["diagnostic"],
+  };
+  assert.deepEqual(detectIntents("What should I do then?", previousTurn), ["merchant_priority"]);
+  assert.deepEqual(detectIntents("How do I fix it?", previousTurn), ["merchant_priority"]);
+});
+
 test("routes basic e-commerce definitions to reviewed knowledge", () => {
   assert.deepEqual(detectIntents("What is conversion rate?"), ["commerce_knowledge"]);
   assert.deepEqual(detectIntents("Explain purchase intent"), ["commerce_knowledge"]);
