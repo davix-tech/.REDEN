@@ -1,3 +1,5 @@
+import { findDictionaryEntry, normalizeMerchantQuestion } from "./languageDictionary.js";
+
 /**
  * REDEN's version-controlled starter knowledge pack.
  *
@@ -112,10 +114,15 @@ export const ECOMMERCE_KNOWLEDGE = [
 ];
 
 export function composeCommerceKnowledge(question = "") {
-  const q = String(question ?? "").slice(0, 2_000);
+  const q = normalizeMerchantQuestion(question);
   const match = ECOMMERCE_KNOWLEDGE.find((entry) =>
     entry.patterns.some((pattern) => pattern.test(q))
   );
   if (match) return match.answer;
+  const dictionaryEntry = findDictionaryEntry(question);
+  if (dictionaryEntry && /\b(what is|what does|define|meaning of|explain)\b/.test(q)) {
+    const label = dictionaryEntry.canonical.replace(/\b\w/g, (letter) => letter.toUpperCase());
+    return label + ": " + dictionaryEntry.meaning;
+  }
   return "I can explain REDEN and common e-commerce concepts from my reviewed knowledge. I don’t have enough information to answer that exact question reliably yet; ask about conversion rate, purchase intent, cart abandonment, average order value, the sales funnel, cart recovery, or revenue versus profit.";
 }
