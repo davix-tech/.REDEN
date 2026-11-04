@@ -1039,9 +1039,6 @@ function composeIntent(intent, evidence, site, question = "", recentTurns = [], 
     case "gratitude":
     case "capabilities":
     case "general_help":
-    case "greeting":
-    case "gratitude":
-    case "capabilities":
     case "reden_identity":
     case "prethim_identity":
     case "commerce_knowledge":
