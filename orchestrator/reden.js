@@ -2774,6 +2774,9 @@ app.post("/event", async (req, res) => {
    * never overwritten by a later event on the same session.
    */
   const attribution = normalizeAttribution(sanitizedPayload, req.body?.path);
+  // Persist only the referrer host; full referrer URLs can contain private query parameters.
+  delete sanitizedPayload.referrer;
+  delete sanitizedPayload.document_referrer;
   const referrer = normalizeString(
     payload.referrer || payload.document_referrer,
     500
