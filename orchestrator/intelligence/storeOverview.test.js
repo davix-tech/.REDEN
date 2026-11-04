@@ -85,3 +85,77 @@ test("overview does not turn missing revenue into zero", () => {
   assert.match(answer, /purchase revenue could not be reliably calculated/i);
   assert.doesNotMatch(answer, /representing 0 in recorded storefront purchase revenue/i);
 });
+
+test("overview separates identified unique orders from purchase events without order IDs", () => {
+  const answer = composeStoreOverview({
+    ...base,
+    purchases: 3,
+    purchaseRecords: 2,
+    identifiedOrders: 1,
+    unidentifiedPurchaseEvents: 1,
+  });
+  assert.match(answer, /1 unique order record/);
+  assert.match(answer, /1 legacy purchase event/);
+  assert.match(answer, /cannot be deduplicated reliably/);
+});
+
+test("overview uses product IDs for product-level performance and discloses missing prices", () => {
+  const answer = composeStoreOverview({
+    ...base,
+    productPerformance: [{
+      productId: "sku-1",
+      name: "Blue Shirt",
+      productViews: 12,
+      addToCartEvents: 4,
+      purchaseLineItems: 2,
+      cartQuantity: 5,
+      itemRevenue: 25000,
+      pricedPurchaseLines: 2,
+      currency: "NGN",
+    }],
+  });
+  assert.match(answer, /Blue Shirt/);
+  assert.match(answer, /12 views/);
+  assert.match(answer, /recorded item value/);
+});
+
+test("overview reports campaign attribution without claiming advertising ROI", () => {
+  const answer = composeStoreOverview({
+    ...base,
+    attribution: [{
+      trafficSource: "paid_instagram",
+      utmCampaign: "november_launch",
+      sessions: 10,
+      purchasedSessions: 2,
+      revenue: 50000,
+    }],
+  });
+  assert.match(answer, /Acquisition attribution/);
+  assert.match(answer, /november_launch/);
+  assert.match(answer, /not advertising ROI/);
+  assert.match(answer, /campaign spend data/);
+});
+
+test("overview reports pseudonymous customer cohorts without exposing identifiers", () => {
+  const answer = composeStoreOverview({
+    ...base,
+    customerIntelligence: {
+      identifiedCustomers: 8,
+      firstTimeIdentifiedCustomers: 5,
+      returningCustomers: 3,
+    },
+  });
+  assert.match(answer, /8 pseudonymous customer/);
+  assert.match(answer, /5 first-time identified/);
+  assert.match(answer, /3 returning/);
+  assert.doesNotMatch(answer, /customer@example.com/);
+});
+
+test("overview explains when customer identity coverage is unavailable", () => {
+  const answer = composeStoreOverview({
+    ...base,
+    customerIntelligence: { identifiedCustomers: 0 },
+  });
+  assert.match(answer, /Repeat-customer analysis is unavailable/);
+  assert.match(answer, /does not use customer email addresses/);
+});
