@@ -102,6 +102,17 @@ export function normalizeCommercePayload(event, payload = {}) {
   // Do not retain direct customer identifiers in the event payload.
   delete result.email;
   delete result.customer_email;
+  delete result.customer_id;
+  delete result.customerId;
+  delete result.customer_name;
+  delete result.phone;
+  delete result.phone_number;
+  delete result.address;
+  delete result.billing_address;
+  delete result.shipping_address;
+  delete result.product;
+  delete result.cart;
+  delete result.order;
   delete result.customer;
 
   if (event === "PURCHASE" && !orderId) {
