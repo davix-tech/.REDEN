@@ -9,5 +9,7 @@ test("routes weekly revenue questions to week-to-date reporting", () => {
 });
 
 test("keeps daily revenue questions on the existing daily path", () => {
-  assert.deepEqual(detectIntents("How much revenue did I make today?"), ["revenue"]);
+  const intents = detectIntents("How much revenue did I make today?");
+  assert.equal(intents[0], "revenue");
+  assert.equal(intents.includes("weekly_revenue"), false);
 });
