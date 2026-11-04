@@ -22,6 +22,7 @@ import {
   sendEveningReport,
 } from "./notification/emailEngine.js";
 import { toMerchantLanguage } from "./intelligence/merchantLanguage.js";
+import { composeWeeklyRevenue, loadWeeklyRevenue } from "./intelligence/weeklyRevenue.js";
 import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
 import { composeConversationResponse } from "./intelligence/responsePolicy.js";
@@ -1047,6 +1048,9 @@ function composeIntent(intent, evidence, site, question = "") {
 
     case "revenue":
       return composeRevenue(evidence);
+
+    case "weekly_revenue":
+      return composeWeeklyRevenue(evidence.weeklyRevenue);
 
     case "traffic":
       return composeTraffic(evidence);
@@ -2284,6 +2288,15 @@ app.post("/api/v1/intelligence", async (req, res) => {
     };
 
     let intents = detectIntents(question);
+
+    if (intents.includes("weekly_revenue")) {
+      evidence.weeklyRevenue = await loadWeeklyRevenue({
+        db,
+        siteId,
+        timeZone,
+        referenceDate: referenceNow,
+      });
+    }
 
     if (!intents.length) {
       // Unknown/general questions must not be misrepresented as a store overview.
