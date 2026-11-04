@@ -52,13 +52,27 @@ export const ECOMMERCE_KNOWLEDGE = [
   },
   {
     id: "reden-name",
-    patterns: [/\b(what is your name|what s your name|who are you)\b/i],
+    patterns: [/\b(what is your name|what s your name|tell me your name|what should i call you|who are you|what are you|what is your role|are you (a )?(bot|chatbot|ai))\b/i],
     answer: "My name is REDEN. I’m PRETHIM’s commerce-intelligence assistant, designed to help merchants understand store performance and decide what to investigate or improve next."
   },
   {
+    id: "prethim-identity",
+    patterns: [
+      /\b(what is prethim|what s prethim|tell me about prethim|what does prethim do|what kind of company is prethim|what is prethim known for)\b/i
+    ],
+    answer: "PRETHIM is a technology company building Adaptive Decision Infrastructure: APIs and intelligent software that help applications understand what is happening and decide what to do next. Its focus is solving practical technology problems through adaptive systems. REDEN is PRETHIM's first product, focused on e-commerce."
+  },
+  {
     id: "reden-maker",
-    patterns: [/\b(who built you|who created you|which company (built|created) you)\b/i],
+    patterns: [/\b(who built you|who created you|who made you|who developed you|which company (built|created|developed) you)\b/i],
     answer: "I’m being developed by PRETHIM, a technology company focused on using APIs and intelligent software systems to solve everyday technology problems."
+  },
+  {
+    id: "reden-acronym",
+    patterns: [
+      /\b(what does reden stand for|what is the full form of reden|what does reden mean)\b/i
+    ],
+    answer: "REDEN stands for Revenue Decision Engine. It is PRETHIM's adaptive commerce orchestration product, designed to help e-commerce businesses turn shopper behaviour into useful decisions and measurable outcomes."
   },
   {
     id: "reden-product",

@@ -18,8 +18,8 @@ test("capability response distinguishes recorded revenue from profit", () => {
 
 test("general fallback does not invent an answer", () => {
   const answer = composeConversationResponse("general_help", "Who won an event yesterday?");
-  assert.match(answer, /not confident I can answer that reliably/);
-  assert.match(answer, /rather than guess/);
+  assert.match(answer, /can.t reliably answer that from my reviewed knowledge/);
+  assert.match(answer, /won.t make something up/);
 });
 
 test("response policy exposes versioned, structured principles", () => {
@@ -35,6 +35,39 @@ test("REDEN answers its own name and product identity", () => {
   assert.match(composeConversationResponse("reden_identity", "What is your name?"), /My name is REDEN/);
   assert.match(composeConversationResponse("reden_identity", "What is REDEN?"), /PRETHIM's e-commerce product/);
   assert.match(composeConversationResponse("reden_identity", "Who built you?"), /PRETHIM/);
+});
+
+test("answers PRETHIM identity and simple questions in plain language", () => {
+  assert.match(composeCommerceKnowledge("What is PRETHIM?"), /technology company/i);
+  assert.match(composeCommerceKnowledge("What does PRETHIM do?"), /Adaptive Decision Infrastructure/i);
+  assert.match(composeCommerceKnowledge("Tell me your name"), /My name is REDEN/i);
+  assert.match(composeCommerceKnowledge("Who made you?"), /PRETHIM/i);
+  assert.match(composeCommerceKnowledge("What does REDEN stand for?"), /Revenue Decision Engine/i);
+});
+
+test("business redirection varies instead of repeating one generic fallback", () => {
+  const first = composeConversationResponse("general_help", "Tell me a joke", []);
+  const second = composeConversationResponse("general_help", "Tell me a joke", [
+    { answer: first }
+  ]);
+  assert.notEqual(first, second);
+  assert.match(first, /store/i);
+  assert.match(second, /commerce business/i);
+});
+
+test("contextual follow-up explains the previous answer rather than losing the topic", () => {
+  const answer = composeConversationResponse(
+    "contextual_follow_up",
+    "Tell me more",
+    [],
+    {
+      question: "How much did I make this week?",
+      answer: "Your store recorded 45,000 in sales this week.",
+      intents: ["weekly_revenue"],
+    }
+  );
+  assert.match(answer, /week-to-date sales figures/i);
+  assert.match(answer, /45,000 in sales/i);
 });
 
 test("commerce knowledge answers common definitions without inventing store facts", () => {

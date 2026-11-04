@@ -4,6 +4,8 @@
  * and business conclusions belong in the evidence/diagnostics layers.
  */
 
+import { detectFollowUpIntent } from "./conversationMemory.js";
+
 function normalizeQuestion(question) {
   return String(question ?? "")
     .slice(0, 2_000)
@@ -13,8 +15,18 @@ function normalizeQuestion(question) {
     .trim();
 }
 
-export function detectIntents(question) {
+export function detectIntents(question, previousTurn = null) {
   const q = normalizeQuestion(question);
+  const followUpIntents = detectFollowUpIntent(question, previousTurn);
+  if (followUpIntents) return followUpIntents;
+
+  // Weekly revenue questions need a week-to-date calculation, not today's snapshot.
+  if (
+    /\b(this week|week to date|so far this week|weekly)\b/.test(q) &&
+    /\b(revenue|income|sales|earned|earnings|make|made|money)\b/.test(q)
+  ) {
+    return ["weekly_revenue"];
+  }
 
   // Specific merchant growth requests must reach the growth advisor before the
   // broader product-value matcher below captures the phrase "how can REDEN help".
@@ -29,8 +41,12 @@ export function detectIntents(question) {
 
   // Conversational turns should not fall through to a merchant analytics report.
   // REDEN identity is distinct from the connected merchant store identity.
-  if (/\b(what is your name|what s your name|who are you|what is reden|what s reden|tell me about reden|who built you|who created you|which company (built|created) you)\b/.test(q)) {
+  if (/\b(what is your name|what s your name|tell me your name|what should i call you|who are you|what are you|what is your role|tell me about yourself|what does reden stand for|what is the full form of reden|what does reden mean|are you (a )?(bot|chatbot|ai)|what is reden|what s reden|tell me about reden|who built you|who created you|who made you|who developed you|which company (built|created|developed) you)\b/.test(q)) {
     return ["reden_identity"];
+  }
+
+  if (/\b(what is prethim|what s prethim|tell me about prethim|what does prethim do|what kind of company is prethim|what is prethim known for)\b/.test(q)) {
+    return ["prethim_identity"];
   }
 
   // Route REDEN's value and differentiation questions to its capability answer.
@@ -68,7 +84,7 @@ export function detectIntents(question) {
   if (/\b(what is my store called|what is my store name|what is this store called|which store is connected)\b/.test(q)) {
     return ["identity"];
   }
-  if (/^(hi|hello|hey|good morning|good afternoon|good evening|howdy|hiya)$/.test(q)) {
+  if (/^(hi|hello|hey|good morning|good afternoon|good evening|howdy|hiya|how are you|how are things)$/.test(q)) {
     return ["greeting"];
   }
 

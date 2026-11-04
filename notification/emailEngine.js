@@ -1,4 +1,5 @@
 import { Resend } from "resend";
+import { toMerchantLanguage } from "../orchestrator/intelligence/merchantLanguage.js";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -22,11 +23,27 @@ export async function sendEmail({
       reply_to: replyTo || "redenbydcore@gmail.com",
     });
 
-    console.log("[EMAIL SENT]", response.data?.id);
+    if (response.error) {
+      console.error("[EMAIL ERROR]", response.error);
+      return {
+        ok: false,
+        error: response.error.message || "email_send_failed",
+      };
+    }
+
+    if (!response.data?.id) {
+      console.error("[EMAIL ERROR] Provider returned no message ID");
+      return {
+        ok: false,
+        error: "email_provider_returned_no_message_id",
+      };
+    }
+
+    console.log("[EMAIL SENT]", response.data.id);
 
     return {
       ok: true,
-      id: response.data?.id,
+      id: response.data.id,
     };
   } catch (e) {
     console.error("[EMAIL ERROR]", e);
@@ -56,7 +73,11 @@ function formatNumber(value) {
 }
 
 function formatMoney(value) {
-  return Number(value || 0).toLocaleString(undefined, {
+  if (value === null || value === undefined || value === "") {
+    return "Not available";
+  }
+
+  return Number(value).toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
@@ -158,7 +179,7 @@ function emailShell({
           "
         >
           REDEN by DCORE<br />
-          Revenue intelligence infrastructure
+          Recorded sales intelligence infrastructure
         </div>
 
       </div>
@@ -211,7 +232,7 @@ function intelligenceCard(item) {
           letter-spacing:-0.02em;
         "
       >
-        ${escapeHtml(item?.title || "REDEN noticed something.")}
+        ${escapeHtml(toMerchantLanguage(item?.title || "REDEN noticed something."))}
       </h2>
 
       ${
@@ -225,7 +246,7 @@ function intelligenceCard(item) {
                 font-size:14px;
               "
             >
-              ${escapeHtml(item.summary)}
+              ${escapeHtml(toMerchantLanguage(item.summary))}
             </p>
           `
           : ""
@@ -254,7 +275,7 @@ function intelligenceCard(item) {
                   font-size:13px;
                 "
               >
-                ${escapeHtml(item.why_it_matters)}
+                ${escapeHtml(toMerchantLanguage(item.why_it_matters))}
               </div>
             </div>
           `
@@ -284,7 +305,7 @@ function intelligenceCard(item) {
                   font-size:13px;
                 "
               >
-                ${escapeHtml(item.likely_cause)}
+                ${escapeHtml(toMerchantLanguage(item.likely_cause))}
               </div>
             </div>
           `
@@ -322,7 +343,7 @@ function intelligenceCard(item) {
                   font-size:13px;
                 "
               >
-                ${escapeHtml(item.recommendation)}
+                ${escapeHtml(toMerchantLanguage(item.recommendation))}
               </div>
             </div>
           `
@@ -425,7 +446,7 @@ export async function sendMorningReport({
           >
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Evaluations
+                Visits
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatNumber(metrics.total)}
@@ -434,7 +455,7 @@ export async function sendMorningReport({
 
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Conversions
+                Purchases
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatNumber(metrics.conversions)}
@@ -443,7 +464,7 @@ export async function sendMorningReport({
 
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Revenue
+                Recorded sales
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatMoney(metrics.revenue)}
@@ -467,8 +488,8 @@ export async function sendMorningReport({
     to,
     subject:
       important.length > 0
-        ? "REDEN Morning Intelligence Brief"
-        : "REDEN Morning Brief — Nothing Requires Attention",
+        ? "REDEN Morning Store Brief"
+        : "REDEN Morning Brief — No Issues to Flag",
     html,
   });
 }
@@ -524,7 +545,7 @@ export async function sendEveningReport({
           >
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Evaluations
+                Visits
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatNumber(metrics.total)}
@@ -533,7 +554,7 @@ export async function sendEveningReport({
 
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Conversions
+                Purchases
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatNumber(metrics.conversions)}
@@ -542,7 +563,7 @@ export async function sendEveningReport({
 
             <tr>
               <td style="padding:8px 0;color:#71717a;">
-                Revenue
+                Recorded sales
               </td>
               <td style="padding:8px 0;text-align:right;">
                 ${formatMoney(metrics.revenue)}
@@ -566,8 +587,8 @@ export async function sendEveningReport({
     to,
     subject:
       important.length > 0
-        ? "REDEN Evening Intelligence Brief"
-        : "REDEN Evening Brief — Nothing Requires Attention",
+        ? "REDEN Evening Store Review"
+        : "REDEN Evening Review — No Issues to Flag",
     html,
   });
 }
