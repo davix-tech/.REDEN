@@ -398,7 +398,17 @@ app.use(express.urlencoded({ extended: true, limit: "100kb" }));
    TIMEOUT
 ========================================================= */
 
-app.use(timeout("15s"));
+const requestTimeout = timeout("15s");
+
+app.use((req, res, next) => {
+  // SSE connections are intentionally long-lived; all ordinary
+  // API requests retain the existing 15-second timeout.
+  if (req.path === "/api/v1/stream") {
+    return next();
+  }
+
+  return requestTimeout(req, res, next);
+});
 
 app.use((req, res, next) => {
   if (!req.timedout) {
@@ -1406,7 +1416,6 @@ app.get("/api/v1/stream", async (req, res) => {
     unsubscribe();
   };
 
-  req.on("close", cleanup);
   res.on("close", cleanup);
 });
 
