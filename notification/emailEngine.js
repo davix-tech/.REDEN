@@ -472,8 +472,8 @@ export async function sendMorningReport({
     to,
     subject:
       important.length > 0
-        ? "REDEN Morning Intelligence Brief"
-        : "REDEN Morning Brief — Nothing Requires Attention",
+        ? "REDEN Morning Store Brief"
+        : "REDEN Morning Brief — No Issues to Flag",
     html,
   });
 }
@@ -571,8 +571,8 @@ export async function sendEveningReport({
     to,
     subject:
       important.length > 0
-        ? "REDEN Evening Intelligence Brief"
-        : "REDEN Evening Brief — Nothing Requires Attention",
+        ? "REDEN Evening Store Review"
+        : "REDEN Evening Review — No Issues to Flag",
     html,
   });
 }
