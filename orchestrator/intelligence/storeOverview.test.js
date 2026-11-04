@@ -159,3 +159,14 @@ test("overview explains when customer identity coverage is unavailable", () => {
   assert.match(answer, /Repeat-customer analysis is unavailable/);
   assert.match(answer, /does not use customer email addresses/);
 });
+
+test("does not report a purchase-record average when some purchase amounts are missing", () => {
+  const answer = composeStoreOverview({
+    ...base,
+    purchaseRecords: 3,
+    pricedPurchaseRecords: 2,
+    identifiedOrders: 2,
+    unidentifiedPurchaseEvents: 1,
+  });
+  assert.doesNotMatch(answer, /per recorded purchase record on average/);
+});
