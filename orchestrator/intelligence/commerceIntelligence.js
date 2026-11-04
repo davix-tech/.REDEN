@@ -75,7 +75,7 @@ export async function loadCommerceIntelligence(db, { siteId, startUTC, endUTC })
       `,
       [siteId, startUTC, endUTC]
     ),
-    safeCommerceQuery(db,
+    db.query(
       `
         WITH product_events AS (
           SELECT el.event, el.payload AS item_data
@@ -133,181 +133,20 @@ export async function loadCommerceIntelligence(db, { siteId, startUTC, endUTC })
           COUNT(*) FILTER (WHERE event = 'PURCHASE')::INTEGER AS purchase_line_items,
           COUNT(*) FILTER (
             WHERE event = 'PURCHASE'
-              AND COALESCE(item_data->>'unit_price', item_data->>'price', '') ~ '^[0-9]+([.][0-9]+)?
-          COALESCE(SUM(
-            CASE WHEN event = 'ADD_TO_CART'
-              AND COALESCE(item_data->>'quantity', item_data->>'qty', '') ~ '^[0-9]+([.][0-9]+)?$'
-              THEN COALESCE(item_data->>'quantity', item_data->>'qty', '')::NUMERIC
-              ELSE 0 END
-          ), 0)::NUMERIC AS cart_quantity,
-          COALESCE(SUM(
-            CASE WHEN event = 'PURCHASE'
               AND COALESCE(item_data->>'unit_price', item_data->>'price', '') ~ '^[0-9]+([.][0-9]+)?$'
-              AND COALESCE(item_data->>'quantity', item_data->>'qty', '') ~ '^[0-9]+([.][0-9]+)?$'
-              THEN COALESCE(item_data->>'unit_price', item_data->>'price', '0')::NUMERIC
-                * COALESCE(item_data->>'quantity', item_data->>'qty', '')::NUMERIC
-              ELSE 0 END
-          ), 0)::NUMERIC AS item_revenue,
-          MAX(item_data->>'currency') AS currency
-        FROM product_events
-        WHERE COALESCE(NULLIF(item_data->>'product_id', ''), NULLIF(item_data->>'productId', '')) IS NOT NULL
-        GROUP BY 1
-        ORDER BY item_revenue DESC, purchase_line_items DESC, product_views DESC
-        LIMIT 20
-      `,
-      [siteId, startUTC, endUTC]
-    ),
-    safeCommerceQuery(db,
-      `
-        WITH current_customers AS (
-          SELECT DISTINCT customer_ref
-          FROM commerce_orders
-          WHERE site_id = $1 AND created_at >= $2 AND created_at < $3
-            AND customer_ref IS NOT NULL
-        ),
-        prior_customer_orders AS (
-          SELECT customer_ref, COUNT(*)::INTEGER AS prior_orders
-          FROM commerce_orders
-          WHERE site_id = $1 AND created_at < $2 AND customer_ref IS NOT NULL
-          GROUP BY customer_ref
-        )
-        SELECT
-          (SELECT COUNT(*) FROM current_customers)::INTEGER AS identified_customers,
-          COUNT(*) FILTER (WHERE COALESCE(p.prior_orders, 0) > 0)::INTEGER AS returning_customers,
-          COUNT(*) FILTER (WHERE COALESCE(p.prior_orders, 0) = 0)::INTEGER AS first_time_identified_customers
-        FROM current_customers c
-        LEFT JOIN prior_customer_orders p USING (customer_ref)
-      `,
-      [siteId, startUTC, endUTC]
-    ),
-  ]);
-
-  const purchase = purchaseResult.rows?.[0] || {};
-  const customer = customerResult.rows?.[0] || {};
-  return {
-    purchaseRevenue: Number(purchase.revenue || 0),
-    purchasedSessions: Number(purchase.purchased_sessions || 0),
-    purchaseRevenueAvailable: Number(purchase.priced_purchase_records || 0) > 0,
-    purchaseRecords: Number(purchase.purchase_records || 0),
-    identifiedOrders: Number(purchase.identified_orders || 0),
-    pricedPurchaseRecords: Number(purchase.priced_purchase_records || 0),
-    unidentifiedPurchaseEvents: Number(purchase.unidentified_purchase_events || 0),
-    productPerformance: (productResult.rows || []).map((row) => ({
-      productId: row.product_id,
-      name: row.product_name || null,
-      sku: row.sku || null,
-      category: row.category || null,
-      productViews: Number(row.product_views || 0),
-      addToCartEvents: Number(row.add_to_cart_events || 0),
-      purchaseLineItems: Number(row.purchase_line_items || 0),
-      cartQuantity: Number(row.cart_quantity || 0),
-      itemRevenue: Number(row.item_revenue || 0),
-      pricedPurchaseLines: Number(row.priced_purchase_lines || 0),
-      currency: row.currency || null,
-    })),
-    customerIntelligence: {
-      identifiedCustomers: Number(customer.identified_customers || 0),
-      returningCustomers: Number(customer.returning_customers || 0),
-      firstTimeIdentifiedCustomers: Number(customer.first_time_identified_customers || 0),
-      customerIdentityCoverage: "pseudonymous merchant-supplied customer_ref only",
-    },
-  };
-}
-
-              AND COALESCE(item_data->>'quantity', item_data->>'qty', '') ~ '^[0-9]+([.][0-9]+)?
-          COALESCE(SUM(
-            CASE WHEN event = 'ADD_TO_CART'
-              AND COALESCE(item_data->>'quantity', item_data->>'qty', '') ~ '^[0-9]+([.][0-9]+)?$'
-              THEN COALESCE(item_data->>'quantity', item_data->>'qty', '')::NUMERIC
-              ELSE 0 END
-          ), 0)::NUMERIC AS cart_quantity,
-          COALESCE(SUM(
-            CASE WHEN event = 'PURCHASE'
-              AND COALESCE(item_data->>'unit_price', item_data->>'price', '') ~ '^[0-9]+([.][0-9]+)?$'
-              AND COALESCE(item_data->>'quantity', item_data->>'qty', '') ~ '^[0-9]+([.][0-9]+)?$'
-              THEN COALESCE(item_data->>'unit_price', item_data->>'price', '0')::NUMERIC
-                * COALESCE(item_data->>'quantity', item_data->>'qty', '')::NUMERIC
-              ELSE 0 END
-          ), 0)::NUMERIC AS item_revenue,
-          MAX(item_data->>'currency') AS currency
-        FROM product_events
-        WHERE COALESCE(NULLIF(item_data->>'product_id', ''), NULLIF(item_data->>'productId', '')) IS NOT NULL
-        GROUP BY 1
-        ORDER BY item_revenue DESC, purchase_line_items DESC, product_views DESC
-        LIMIT 20
-      `,
-      [siteId, startUTC, endUTC]
-    ),
-    safeCommerceQuery(db,
-      `
-        WITH current_customers AS (
-          SELECT DISTINCT customer_ref
-          FROM commerce_orders
-          WHERE site_id = $1 AND created_at >= $2 AND created_at < $3
-            AND customer_ref IS NOT NULL
-        ),
-        prior_customer_orders AS (
-          SELECT customer_ref, COUNT(*)::INTEGER AS prior_orders
-          FROM commerce_orders
-          WHERE site_id = $1 AND created_at < $2 AND customer_ref IS NOT NULL
-          GROUP BY customer_ref
-        )
-        SELECT
-          (SELECT COUNT(*) FROM current_customers)::INTEGER AS identified_customers,
-          COUNT(*) FILTER (WHERE COALESCE(p.prior_orders, 0) > 0)::INTEGER AS returning_customers,
-          COUNT(*) FILTER (WHERE COALESCE(p.prior_orders, 0) = 0)::INTEGER AS first_time_identified_customers
-        FROM current_customers c
-        LEFT JOIN prior_customer_orders p USING (customer_ref)
-      `,
-      [siteId, startUTC, endUTC]
-    ),
-  ]);
-
-  const purchase = purchaseResult.rows?.[0] || {};
-  const customer = customerResult.rows?.[0] || {};
-  return {
-    purchaseRevenue: Number(purchase.revenue || 0),
-    purchasedSessions: Number(purchase.purchased_sessions || 0),
-    purchaseRevenueAvailable: Number(purchase.priced_purchase_records || 0) > 0,
-    purchaseRecords: Number(purchase.purchase_records || 0),
-    identifiedOrders: Number(purchase.identified_orders || 0),
-    pricedPurchaseRecords: Number(purchase.priced_purchase_records || 0),
-    unidentifiedPurchaseEvents: Number(purchase.unidentified_purchase_events || 0),
-    productPerformance: (productResult.rows || []).map((row) => ({
-      productId: row.product_id,
-      name: row.product_name || null,
-      sku: row.sku || null,
-      category: row.category || null,
-      productViews: Number(row.product_views || 0),
-      addToCartEvents: Number(row.add_to_cart_events || 0),
-      purchaseLineItems: Number(row.purchase_line_items || 0),
-      cartQuantity: Number(row.cart_quantity || 0),
-      itemRevenue: Number(row.item_revenue || 0),
-      pricedPurchaseLines: Number(row.priced_purchase_lines || 0),
-      currency: row.currency || null,
-    })),
-    customerIntelligence: {
-      identifiedCustomers: Number(customer.identified_customers || 0),
-      returningCustomers: Number(customer.returning_customers || 0),
-      firstTimeIdentifiedCustomers: Number(customer.first_time_identified_customers || 0),
-      customerIdentityCoverage: "pseudonymous merchant-supplied customer_ref only",
-    },
-  };
-}
-
           )::INTEGER AS priced_purchase_lines,
           COALESCE(SUM(
             CASE WHEN event = 'ADD_TO_CART'
-              AND COALESCE(item_data->>'quantity', item_data->>'qty', '') ~ '^[0-9]+([.][0-9]+)?$'
-              THEN COALESCE(item_data->>'quantity', item_data->>'qty', '')::NUMERIC
+              AND COALESCE(item_data->>'quantity', item_data->>'qty', '1') ~ '^[0-9]+([.][0-9]+)?$'
+              THEN COALESCE(item_data->>'quantity', item_data->>'qty', '1')::NUMERIC
               ELSE 0 END
           ), 0)::NUMERIC AS cart_quantity,
           COALESCE(SUM(
             CASE WHEN event = 'PURCHASE'
               AND COALESCE(item_data->>'unit_price', item_data->>'price', '') ~ '^[0-9]+([.][0-9]+)?$'
-              AND COALESCE(item_data->>'quantity', item_data->>'qty', '') ~ '^[0-9]+([.][0-9]+)?$'
+              AND COALESCE(item_data->>'quantity', item_data->>'qty', '1') ~ '^[0-9]+([.][0-9]+)?$'
               THEN COALESCE(item_data->>'unit_price', item_data->>'price', '0')::NUMERIC
-                * COALESCE(item_data->>'quantity', item_data->>'qty', '')::NUMERIC
+                * COALESCE(item_data->>'quantity', item_data->>'qty', '1')::NUMERIC
               ELSE 0 END
           ), 0)::NUMERIC AS item_revenue,
           MAX(item_data->>'currency') AS currency
@@ -319,7 +158,7 @@ export async function loadCommerceIntelligence(db, { siteId, startUTC, endUTC })
       `,
       [siteId, startUTC, endUTC]
     ),
-    safeCommerceQuery(db,
+    db.query(
       `
         WITH current_customers AS (
           SELECT DISTINCT customer_ref
