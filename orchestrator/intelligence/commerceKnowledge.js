@@ -52,7 +52,7 @@ export const ECOMMERCE_KNOWLEDGE = [
   },
   {
     id: "reden-name",
-    patterns: [/\b(what is your name|what s your name|who are you)\b/i],
+    patterns: [/\b(what is your name|what s your name|tell me your name|what should i call you|who are you|what are you|what is your role|are you (a )?(bot|chatbot|ai))\b/i],
     answer: "My name is REDEN. I’m PRETHIM’s commerce-intelligence assistant, designed to help merchants understand store performance and decide what to investigate or improve next."
   },
   {
@@ -64,7 +64,7 @@ export const ECOMMERCE_KNOWLEDGE = [
   },
   {
     id: "reden-maker",
-    patterns: [/\b(who built you|who created you|which company (built|created) you)\b/i],
+    patterns: [/\b(who built you|who created you|who made you|who developed you|which company (built|created|developed) you)\b/i],
     answer: "I’m being developed by PRETHIM, a technology company focused on using APIs and intelligent software systems to solve everyday technology problems."
   },
   {
