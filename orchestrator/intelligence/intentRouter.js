@@ -41,7 +41,7 @@ export function detectIntents(question, previousTurn = null) {
 
   // Conversational turns should not fall through to a merchant analytics report.
   // REDEN identity is distinct from the connected merchant store identity.
-  if (/\b(what is your name|what s your name|tell me your name|what should i call you|who are you|what are you|what is your role|are you (a )?(bot|chatbot|ai)|what is reden|what s reden|tell me about reden|who built you|who created you|who made you|who developed you|which company (built|created|developed) you)\b/.test(q)) {
+  if (/\b(what is your name|what s your name|tell me your name|what should i call you|who are you|what are you|what is your role|tell me about yourself|what does reden stand for|what is the full form of reden|what does reden mean|are you (a )?(bot|chatbot|ai)|what is reden|what s reden|tell me about reden|who built you|who created you|who made you|who developed you|which company (built|created|developed) you)\b/.test(q)) {
     return ["reden_identity"];
   }
 
