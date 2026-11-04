@@ -68,12 +68,15 @@ export function composeStoreOverview(evidence = {}) {
   const purchaseRecords = count(evidence.purchaseRecords ?? evidence.purchases);
   const identifiedOrders = count(evidence.identifiedOrders);
   const unidentifiedPurchaseEvents = count(evidence.unidentifiedPurchaseEvents);
+  const pricedPurchaseRecords = evidence.pricedPurchaseRecords === undefined
+    ? purchaseRecords
+    : count(evidence.pricedPurchaseRecords);
   const decisions = count(evidence.decisions);
   const conversions = count(evidence.conversions);
   const revenue = evidence.purchaseRevenueAvailable === false
     ? null
     : amount(evidence.purchaseRevenue);
-  const revenuePerPurchase = purchaseRecords > 0 && revenue !== null
+  const revenuePerPurchase = purchaseRecords > 0 && pricedPurchaseRecords === purchaseRecords && revenue !== null
     ? (count(evidence.purchaseRevenue) / purchaseRecords)
     : null;
 
