@@ -140,8 +140,10 @@ export async function loadWeeklyRevenue({
           periods.period,
           COUNT(DISTINCT normalized_events.session_id)
             FILTER (WHERE normalized_events.event = 'PAGE_VIEW')::INTEGER AS visits,
-          COUNT(DISTINCT normalized_events.session_id)
+          COUNT(normalized_events.session_id)
             FILTER (WHERE normalized_events.event = 'PURCHASE')::INTEGER AS purchases,
+          COUNT(DISTINCT normalized_events.session_id)
+            FILTER (WHERE normalized_events.event = 'PURCHASE')::INTEGER AS purchasing_sessions,
           COALESCE(
             SUM(normalized_events.amount)
               FILTER (WHERE normalized_events.event = 'PURCHASE'),
@@ -173,12 +175,14 @@ export async function loadWeeklyRevenue({
       periodLabel: `${dateLabel(startUTC)} through ${dateLabel(referenceDate)}`,
       visits: Number(current.visits || 0),
       purchases: Number(current.purchases || 0),
+      purchasingSessions: Number(current.purchasing_sessions || 0),
       revenue: Number(current.revenue || 0),
       revenueAvailable: Number(current.priced_purchases || 0) > 0,
       previous: previous
         ? {
             visits: Number(previous.visits || 0),
             purchases: Number(previous.purchases || 0),
+            purchasingSessions: Number(previous.purchasing_sessions || 0),
             revenue: Number(previous.revenue || 0),
             revenueAvailable: Number(previous.priced_purchases || 0) > 0,
           }
@@ -214,21 +218,22 @@ export function composeWeeklyRevenue(data = {}) {
     );
   } else if (revenue === null) {
     lines.push(
-      `For ${period}, REDEN recorded ${purchases ?? 0} purchasing session(s), but the purchase records do not contain usable order amounts. I cannot total recorded sales reliably yet.`
+      `For ${period}, REDEN recorded ${purchases ?? 0} purchase(s), but the records do not include usable order amounts. I cannot total your sales reliably yet.`
     );
   } else {
     lines.push(
-      `For ${period}, your store recorded ${formatAmount(revenue)} in sales. This is recorded sales revenue, not verified profit, and the store currency has not been confirmed.`
+      `For ${period}, your store recorded ${formatAmount(revenue)} in sales. This is sales before costs, not profit, and the store currency has not been confirmed.`
     );
     lines.push(
-      `REDEN recorded ${purchases ?? 0} purchasing session(s)${visits !== null ? ` from ${visits} store visits` : ""}.`
+      `REDEN recorded ${purchases ?? 0} purchase(s)${visits !== null ? ` from ${visits} store visits` : ""}.`
     );
   }
 
-  if (visits !== null && visits > 0 && purchases !== null) {
-    const rate = (purchases / visits) * 100;
+  const purchasingSessions = finiteNumber(data.purchasingSessions);
+  if (visits !== null && visits > 0 && purchasingSessions !== null) {
+    const rate = (purchasingSessions / visits) * 100;
     lines.push(
-      `About ${rate.toFixed(1)}% of recorded visits came from sessions with a purchase. This is a session-based measure, not a count of unique customers.`
+      `About ${rate.toFixed(1)}% of recorded visits ended in a session with a purchase. A returning shopper may be counted again if they start a new visit.`
     );
   }
 
