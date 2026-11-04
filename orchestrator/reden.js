@@ -1395,7 +1395,7 @@ app.get("/api/v1/stream", async (req, res) => {
   const unsubscribe = subscribeToSite(ticket.siteId, (event) => {
     if (res.writableEnded || res.destroyed) return;
 
-    res.write(`id: ${event.eventId}\n`);
+    // Do not place client-supplied event IDs in SSE framing headers.
     res.write("data: " + JSON.stringify(event) + "\n\n");
     res.flush?.();
   });
