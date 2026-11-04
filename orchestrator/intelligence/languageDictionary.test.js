@@ -5,10 +5,10 @@ import { detectIntents } from "./intentRouter.js";
 import { composeCommerceKnowledge } from "./commerceKnowledge.js";
 
 test("normalizes merchant synonyms", () => {
-  assert.match(normalizeMerchantQuestion("How have my takings changed?"), /\\brevenue\\b/);
-  assert.match(normalizeMerchantQuestion("What is basket abandonment?"), /\\bcart abandonment\\b/);
-  assert.match(normalizeMerchantQuestion("How much footfall did we get?"), /\\btraffic\\b/);
-  assert.match(normalizeMerchantQuestion("Explain buying interest"), /\\bpurchase intent\\b/);
+  assert.match(normalizeMerchantQuestion("How have my takings changed?"), /\brevenue\b/);
+  assert.match(normalizeMerchantQuestion("What is basket abandonment?"), /\bcart abandonment\b/);
+  assert.match(normalizeMerchantQuestion("How much footfall did we get?"), /\btraffic\b/);
+  assert.match(normalizeMerchantQuestion("Explain buying interest"), /\bpurchase intent\b/);
 });
 
 test("preserves ordinary question tokenization", () => {
