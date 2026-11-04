@@ -77,28 +77,31 @@ const ALIASES = LANGUAGE_DICTIONARY
   .flatMap((entry) => entry.aliases.map((alias) => ({ alias, canonical: entry.canonical })))
   .sort((a, b) => b.alias.length - a.alias.length);
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
+}
+
 export function normalizeMerchantQuestion(question) {
   let normalized = String(question ?? "").slice(0, 2_000).toLowerCase();
   normalized = normalized
     .replace(/[’']/g, "")
-    .replace(/[^\\w\\s$%.-]/g, " ")
-    .replace(/\\s+/g, " ")
+    .replace(/[^\w\s$%.-]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
   for (const { alias, canonical } of ALIASES) {
-    const escaped = alias.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&");
     normalized = normalized.replace(
-      new RegExp(`(^|\\\\b)${escaped}(?=$|\\\\b)`, "g"),
-      (match, prefix) => `${prefix}${canonical}`
+      new RegExp(\`(^|\\\\b)\${escapeRegExp(alias)}(?=$|\\\\b)\`, "g"),
+      (match, prefix) => \`\${prefix}\${canonical}\`
     );
   }
 
-  return normalized.replace(/\\s+/g, " ").trim();
+  return normalized.replace(/\s+/g, " ").trim();
 }
 
 export function findDictionaryEntry(question) {
   const normalized = normalizeMerchantQuestion(question);
   return LANGUAGE_DICTIONARY.find((entry) =>
-    new RegExp(`(^|\\\\b)${entry.canonical.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}(?=$|\\\\b)`).test(normalized)
+    new RegExp(\`(^|\\\\b)\${escapeRegExp(entry.canonical)}(?=$|\\\\b)\`).test(normalized)
   ) || null;
 }
