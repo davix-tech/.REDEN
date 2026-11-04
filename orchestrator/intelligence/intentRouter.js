@@ -119,7 +119,12 @@ export function detectIntents(question, previousTurn = null) {
 
   const intents = [];
 
-  if (/\b(who|identity|name|merchant|store|business|company)\b/.test(q)) {
+  // Only store-specific identity questions should return the connected store name.
+  // Generic "who..." questions must not be mistaken for merchant identity.
+  if (
+    /\b(store|business|merchant)\b/.test(q) &&
+    /\b(name|called|identity|which|connected)\b/.test(q)
+  ) {
     intents.push("identity");
   }
 
