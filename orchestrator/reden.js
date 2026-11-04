@@ -1033,15 +1033,20 @@ function composeAttribution(evidence) {
   return `Today's traffic by source: ${lines.join("; ")}.`;
 }
 
-function composeIntent(intent, evidence, site, question = "") {
+function composeIntent(intent, evidence, site, question = "", recentTurns = [], previousTurn = null) {
   switch (intent) {
     case "greeting":
     case "gratitude":
     case "capabilities":
     case "general_help":
+    case "greeting":
+    case "gratitude":
+    case "capabilities":
     case "reden_identity":
+    case "prethim_identity":
     case "commerce_knowledge":
-      return composeConversationResponse(intent, question);
+    case "contextual_follow_up":
+      return composeConversationResponse(intent, question, recentTurns, previousTurn);
 
     case "identity":
       return composeIdentity(site);
@@ -1615,6 +1620,18 @@ app.post("/api/v1/intelligence", async (req, res) => {
     req.body?.question,
     2_000
   );
+
+  const conversationId = normalizeString(
+    req.body?.conversationId,
+    100
+  );
+
+  if (
+    req.body?.conversationId != null &&
+    (!conversationId || !/^[a-zA-Z0-9_-]{8,100}$/.test(conversationId))
+  ) {
+    return failure(res, 400, "invalid_conversation_id");
+  }
 
   if (!siteId || !question) {
     return failure(
@@ -2287,7 +2304,24 @@ app.post("/api/v1/intelligence", async (req, res) => {
       eventCounts,
     };
 
-    let intents = detectIntents(question);
+    const conversationHistoryResult = conversationId
+      ? await safeAnalyticsQuery(
+          `
+            SELECT question, answer, intents, created_at
+            FROM intelligence_answers
+            WHERE site_id = $1
+              AND evidence->>'conversationId' = $2
+              AND created_at >= NOW() - INTERVAL '45 minutes'
+            ORDER BY created_at DESC
+            LIMIT 6
+          `,
+          [siteId, conversationId]
+        )
+      : { rows: [] };
+
+    const recentTurns = conversationHistoryResult.rows || [];
+    const previousTurn = recentTurns[0] || null;
+    let intents = detectIntents(question, previousTurn);
 
     if (intents.includes("weekly_revenue")) {
       evidence.weeklyRevenue = await loadWeeklyRevenue({
@@ -2310,7 +2344,9 @@ app.post("/api/v1/intelligence", async (req, res) => {
         intent,
         evidence,
         site,
-        question
+        question,
+        recentTurns,
+        previousTurn
       );
 
       if (section) {
@@ -2351,7 +2387,10 @@ app.post("/api/v1/intelligence", async (req, res) => {
           siteId,
           question,
           answer,
-          safeJson(evidence),
+          safeJson({
+            ...evidence,
+            ...(conversationId ? { conversationId } : {}),
+          }),
           safeJson(intents),
           latencyMs,
         ]
