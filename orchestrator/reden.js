@@ -2401,8 +2401,11 @@ app.post("/api/v1/intelligence", async (req, res) => {
             AND el.created_at >= $2
             AND el.created_at < $3
             AND NOT (
-              jsonb_typeof(el.payload->'items') = 'array'
-              AND jsonb_array_length(el.payload->'items') > 0
+              CASE
+                WHEN jsonb_typeof(el.payload->'items') = 'array'
+                THEN jsonb_array_length(el.payload->'items') > 0
+                ELSE FALSE
+              END
             )
           UNION ALL
           SELECT
@@ -2444,8 +2447,11 @@ app.post("/api/v1/intelligence", async (req, res) => {
               NULLIF(el.payload #>> '{order,id}', '')
             ) IS NULL
             AND NOT (
-              jsonb_typeof(el.payload->'items') = 'array'
-              AND jsonb_array_length(el.payload->'items') > 0
+              CASE
+                WHEN jsonb_typeof(el.payload->'items') = 'array'
+                THEN jsonb_array_length(el.payload->'items') > 0
+                ELSE FALSE
+              END
             )
           UNION ALL
           SELECT
