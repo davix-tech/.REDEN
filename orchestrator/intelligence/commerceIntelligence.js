@@ -1,3 +1,12 @@
+async function safeCommerceQuery(db, sql, params, label) {
+  try {
+    return await db.query(sql, params);
+  } catch (error) {
+    console.error("[COMMERCE INTELLIGENCE QUERY ERROR]", label, error);
+    return { rows: [] };
+  }
+}
+
 export async function recordIdentifiedOrder(client, order) {
   if (!order?.orderId) return false;
   const result = await client.query(
@@ -19,7 +28,7 @@ export async function recordIdentifiedOrder(client, order) {
 
 export async function loadCommerceIntelligence(db, { siteId, startUTC, endUTC }) {
   const [purchaseResult, productResult, customerResult] = await Promise.all([
-    db.query(
+    safeCommerceQuery(db,
       `
         WITH identified_orders AS (
           SELECT session_id, total AS amount, 'identified'::TEXT AS identity_type
