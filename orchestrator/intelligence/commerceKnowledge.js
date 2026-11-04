@@ -56,6 +56,13 @@ export const ECOMMERCE_KNOWLEDGE = [
     answer: "My name is REDEN. I’m PRETHIM’s commerce-intelligence assistant, designed to help merchants understand store performance and decide what to investigate or improve next."
   },
   {
+    id: "prethim-identity",
+    patterns: [
+      /\\b(what is prethim|what s prethim|tell me about prethim|what does prethim do|what kind of company is prethim|what is prethim known for)\\b/i
+    ],
+    answer: "PRETHIM is a technology company building Adaptive Decision Infrastructure: APIs and intelligent software that help applications understand what is happening and decide what to do next. Its focus is solving practical technology problems through adaptive systems. REDEN is PRETHIM's first product, focused on e-commerce."
+  },
+  {
     id: "reden-maker",
     patterns: [/\b(who built you|who created you|which company (built|created) you)\b/i],
     answer: "I’m being developed by PRETHIM, a technology company focused on using APIs and intelligent software systems to solve everyday technology problems."
