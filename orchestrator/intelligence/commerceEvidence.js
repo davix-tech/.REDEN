@@ -88,6 +88,8 @@ export function normalizeCommercePayload(event, payload = {}) {
   if (event === "PURCHASE" && number(source.revenue) === null && orderTotal !== null) {
     result.revenue = Math.min(orderTotal, 1_000_000_000);
   }
+  delete result.customer_ref;
+  delete result.customerRef;
   if (customerRef) result.customer_ref = customerRef;
   if (normalizedCurrency) result.currency = normalizedCurrency;
 
@@ -104,12 +106,17 @@ export function normalizeCommercePayload(event, payload = {}) {
 
   // Do not retain direct customer identifiers in the event payload.
   delete result.email;
+  delete result.email_address;
+  delete result.emailAddress;
   delete result.customer_email;
   delete result.customer_id;
   delete result.customerId;
   delete result.customer_name;
   delete result.phone;
   delete result.phone_number;
+  delete result.phoneNumber;
+  delete result.billing;
+  delete result.shipping;
   delete result.address;
   delete result.billing_address;
   delete result.shipping_address;
