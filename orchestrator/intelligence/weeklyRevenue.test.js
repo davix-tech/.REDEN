@@ -8,6 +8,7 @@ test("reports week-to-date recorded sales and distinguishes revenue from profit"
     periodLabel: "Monday through Wednesday",
     visits: 120,
     purchases: 6,
+    purchasingSessions: 6,
     revenue: 45000,
     revenueAvailable: true,
     previous: {
@@ -29,7 +30,7 @@ test("does not turn missing order amounts into zero revenue", () => {
     revenue: 0,
     revenueAvailable: false,
   });
-  assert.match(answer, /do not contain usable order amounts/i);
+  assert.match(answer, /do not include usable order amounts/i);
   assert.doesNotMatch(answer, /0\.00 in sales/i);
 });
 
