@@ -18,7 +18,8 @@ import {
 import { initRedis, redis } from "./infrastructure/redis.js";
 import {
   sendRecoveryEmail,
-  sendDailyReport,
+  sendMorningReport,
+  sendEveningReport,
 } from "./notification/emailEngine.js";
 import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
@@ -3202,11 +3203,14 @@ cron.schedule(
 );
 
 /* =========================================================
-   DAILY REPORT CRON
+   TWICE-DAILY MERCHANT REPORTS
+   Runs against each store's local timezone. Morning reports
+   cover the previous local day; evening reports cover today
+   so far. A sent log prevents duplicate delivery.
 ========================================================= */
 
 cron.schedule(
-  "0 8 * * *",
+  "* * * * *",
   async () => {
     const client = await db.connect();
 
@@ -3214,68 +3218,194 @@ cron.schedule(
       const lockResult = await client.query(
         `
           SELECT pg_try_advisory_lock(
-            hashtext('reden_daily_report')
+            hashtext('reden_twice_daily_reports')
           ) AS locked
         `
       );
 
-      if (!lockResult.rows[0]?.locked) {
-        return;
-      }
+      if (!lockResult.rows[0]?.locked) return;
 
       try {
-        const sitesResult = await client.query(`
-          SELECT
-            site_id,
-            name,
-            owner_email,
-            timezone
-          FROM sites
-          WHERE active = TRUE
-        `);
+        const sitesResult = await client.query(
+          `
+            SELECT site_id, name, owner_email, timezone
+            FROM sites
+            WHERE active = TRUE
+              AND owner_email IS NOT NULL
+              AND owner_email <> ''
+          `
+        );
+
+        const now = new Date();
 
         for (const site of sitesResult.rows) {
           try {
-            const metricsResult =
-              await client.query(
-                `
+            const timeZone = site.timezone || "Africa/Lagos";
+            const localParts = new Intl.DateTimeFormat("en-GB", {
+              timeZone,
+              hour: "2-digit",
+              minute: "2-digit",
+              hourCycle: "h23",
+            }).formatToParts(now);
+            const local = Object.fromEntries(
+              localParts
+                .filter((part) => part.type !== "literal")
+                .map((part) => [part.type, Number(part.value)])
+            );
+
+            const isMorningWindow =
+              local.hour === 8 && local.minute < 10;
+            const isEveningWindow =
+              local.hour === 18 && local.minute < 10;
+
+            if (!isMorningWindow && !isEveningWindow) continue;
+
+            const reportType = isMorningWindow
+              ? "MORNING_REPORT"
+              : "EVENING_REPORT";
+
+            const reportDayBounds = getSiteDayBounds(timeZone, now);
+            const alreadySent = await client.query(
+              `
+                SELECT 1
+                FROM email_logs
+                WHERE site_id = $1
+                  AND type = $2
+                  AND status = 'SENT'
+                  AND created_at >= $3
+                  AND created_at < $4
+                LIMIT 1
+              `,
+              [
+                site.site_id,
+                reportType,
+                reportDayBounds.startUTC,
+                reportDayBounds.endUTC,
+              ]
+            );
+
+            if (alreadySent.rowCount) continue;
+
+            // The morning briefing reviews yesterday. The evening
+            // review covers today's activity up to the send time.
+            const periodReference = isMorningWindow
+              ? new Date(now.getTime() - 24 * 60 * 60 * 1000)
+              : now;
+            const period = getSiteDayBounds(timeZone, periodReference);
+
+            const activityResult = await client.query(
+              `
+                WITH period_events AS (
                   SELECT
-                    COUNT(*)::INTEGER AS decisions,
-
-                    COUNT(*) FILTER (
-                      WHERE converted = TRUE
-                    )::INTEGER AS conversions,
-
-                    COALESCE(
-                      SUM(revenue),
-                      0
-                    )::NUMERIC AS revenue
-
-                  FROM decisions
+                    event,
+                    session_id,
+                    payload
+                  FROM event_logs
                   WHERE site_id = $1
-                    AND state = 'COMPLETED'
-                    AND completed_at >= NOW() - INTERVAL '24 hours'
-                `,
-                [site.site_id]
-              );
+                    AND created_at >= $2
+                    AND created_at < $3
+                ),
+                purchase_events AS (
+                  SELECT
+                    session_id,
+                    COALESCE(
+                      NULLIF(payload->>'revenue', ''),
+                      NULLIF(payload->>'total', ''),
+                      NULLIF(payload->>'value', ''),
+                      NULLIF(payload->>'order_total', ''),
+                      NULLIF(payload->>'orderTotal', ''),
+                      NULLIF(payload->>'amount', ''),
+                      NULLIF(payload->>'cart_value', ''),
+                      NULLIF(payload->>'cartValue', ''),
+                      NULLIF(payload #>> '{cart,value}', '')
+                    ) AS amount_text
+                  FROM period_events
+                  WHERE event = 'PURCHASE'
+                ),
+                normalized_purchases AS (
+                  SELECT
+                    session_id,
+                    CASE
+                      WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
+                      THEN amount_text::NUMERIC
+                      ELSE NULL
+                    END AS amount
+                  FROM purchase_events
+                )
+                SELECT
+                  (
+                    SELECT COUNT(DISTINCT session_id)::INTEGER
+                    FROM period_events
+                    WHERE event = 'PAGE_VIEW'
+                  ) AS visits,
+                  (
+                    SELECT COUNT(DISTINCT session_id)::INTEGER
+                    FROM normalized_purchases
+                  ) AS purchases,
+                  COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
+                  COUNT(amount)::INTEGER AS priced_purchases
+                FROM normalized_purchases
+              `,
+              [site.site_id, period.startUTC, period.endUTC]
+            );
 
-            const metrics =
-              metricsResult.rows[0];
+            const activity = activityResult.rows[0] || {};
+            const visits = Number(activity.visits || 0);
+            const purchases = Number(activity.purchases || 0);
+            const revenueAvailable = Number(activity.priced_purchases || 0) > 0;
+            const revenue = revenueAvailable
+              ? Number(activity.revenue || 0)
+              : null;
 
-            await sendDailyReport({
-              site,
-              metrics: {
-                decisions: Number(
-                  metrics.decisions || 0
-                ),
-                conversions: Number(
-                  metrics.conversions || 0
-                ),
-                revenue: Number(
-                  metrics.revenue || 0
-                ),
-              },
-            });
+            const periodLabel = isMorningWindow
+              ? `yesterday (${period.localDate})`
+              : `today (${period.localDate})`;
+
+            let intelligence;
+            if (visits === 0) {
+              intelligence = [{
+                priority: "high",
+                title: "REDEN did not record any store visits",
+                summary: `No store-visit activity was recorded for ${periodLabel}. This may mean there were no visits, or that store activity tracking needs checking.`,
+                recommendation: "Open your storefront and confirm that REDEN is receiving store activity before making business decisions.",
+              }];
+            } else if (purchases === 0) {
+              intelligence = [{
+                priority: "high",
+                title: "Visitors came to your store, but no purchases were recorded",
+                summary: `REDEN recorded ${visits} visits during ${periodLabel}, but no completed purchases. This does not identify the cause by itself.`,
+                recommendation: "Review product views, items added to carts and checkout activity to find where shoppers may be stopping.",
+              }];
+            } else {
+              intelligence = [{
+                priority: "normal",
+                title: `Your store recorded ${purchases} purchase${purchases === 1 ? "" : "s"}`,
+                summary: `REDEN recorded ${visits} visits and ${purchases} purchases during ${periodLabel}.${revenueAvailable ? ` Recorded sales were ${revenue.toLocaleString("en-NG", { maximumFractionDigits: 2 })}.` : " Purchase amounts were not available, so recorded sales could not be totalled."}`,
+                recommendation: "Keep monitoring visits, completed purchases and the steps shoppers take before buying. REDEN will flag meaningful changes when the evidence supports them.",
+              }];
+            }
+
+            const sendResult = await (isMorningWindow
+              ? sendMorningReport
+              : sendEveningReport)({
+                to: site.owner_email,
+                merchantName: site.name,
+                metrics: {
+                  total: visits,
+                  conversions: purchases,
+                  revenue,
+                },
+                intelligence,
+              });
+
+            if (!sendResult?.ok) {
+              console.error("[MERCHANT REPORT DELIVERY FAILED]", {
+                siteId: site.site_id,
+                reportType,
+                error: sendResult?.error || "unknown_email_error",
+              });
+              continue;
+            }
 
             await client.query(
               `
@@ -3285,46 +3415,33 @@ cron.schedule(
                   status,
                   created_at
                 )
-                VALUES (
-                  $1,
-                  'DAILY_REPORT',
-                  'SENT',
-                  NOW()
-                )
+                VALUES ($1, $2, 'SENT', NOW())
               `,
-              [site.site_id]
+              [site.site_id, reportType]
             );
-          } catch (error) {
-            console.error(
-              "[DAILY REPORT SITE ERROR]",
-              {
-                siteId: site.site_id,
-                error,
-              }
-            );
+          } catch (siteError) {
+            console.error("[MERCHANT REPORT SITE ERROR]", {
+              siteId: site.site_id,
+              error: siteError,
+            });
           }
         }
       } finally {
         await client.query(
           `
             SELECT pg_advisory_unlock(
-              hashtext('reden_daily_report')
+              hashtext('reden_twice_daily_reports')
             )
           `
         );
       }
     } catch (error) {
-      console.error(
-        "[DAILY REPORT CRON ERROR]",
-        error
-      );
+      console.error("[TWICE-DAILY REPORT CRON ERROR]", error);
     } finally {
       client.release();
     }
   },
-  {
-    timezone: "UTC",
-  }
+  { timezone: "UTC" }
 );
 
 /* =========================================================
