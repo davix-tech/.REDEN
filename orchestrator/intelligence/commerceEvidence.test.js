@@ -125,3 +125,12 @@ test("uses a purchase order total for session revenue and strips nested direct i
   assert.equal(result.phone, undefined);
   assert.equal(result.items[0].product_id, "p-1");
 });
+
+test("does not retain email-shaped customer_ref values", () => {
+  const result = normalizeCommercePayload("PURCHASE", {
+    order_id: "order-privacy",
+    customer_ref: "buyer@example.com",
+  });
+  assert.equal(result.customer_ref, undefined);
+  assert.equal(JSON.stringify(result).includes("buyer@example.com"), false);
+});
