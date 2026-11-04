@@ -23,11 +23,27 @@ export async function sendEmail({
       reply_to: replyTo || "redenbydcore@gmail.com",
     });
 
-    console.log("[EMAIL SENT]", response.data?.id);
+    if (response.error) {
+      console.error("[EMAIL ERROR]", response.error);
+      return {
+        ok: false,
+        error: response.error.message || "email_send_failed",
+      };
+    }
+
+    if (!response.data?.id) {
+      console.error("[EMAIL ERROR] Provider returned no message ID");
+      return {
+        ok: false,
+        error: "email_provider_returned_no_message_id",
+      };
+    }
+
+    console.log("[EMAIL SENT]", response.data.id);
 
     return {
       ok: true,
-      id: response.data?.id,
+      id: response.data.id,
     };
   } catch (e) {
     console.error("[EMAIL ERROR]", e);
