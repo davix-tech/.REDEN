@@ -32,6 +32,7 @@ import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 import { composeMerchantIntelligence } from "./intelligence/merchantIntelligence.js";
 import { publishSiteEvent, subscribeToSite } from "./infrastructure/realtime.js";
 import { composeStoreOverview } from "./intelligence/storeOverview.js";
+import { normalizeCommercePayload, normalizeAttribution, buildOrderRecord } from "./intelligence/commerceEvidence.js";
 
 dotenv.config();
 
@@ -2606,10 +2607,19 @@ app.post("/event", async (req, res) => {
     1_000_000_000
   );
 
+  const commercePayload = normalizeCommercePayload(event, payload);
   const sanitizedPayload = {
-    ...payload,
+    ...commercePayload,
     cart_value: boundedCartValue,
   };
+  const orderRecord = event === "PURCHASE"
+    ? buildOrderRecord({
+        siteId,
+        sessionId,
+        eventId: generatedEventId,
+        payload: sanitizedPayload,
+      })
+    : null;
 
   /*
    * Captured here so it's available regardless of which event
@@ -2628,37 +2638,29 @@ app.post("/event", async (req, res) => {
    * COALESCE so an existing traffic_source on the row is
    * never overwritten by a later event on the same session.
    */
+  const attribution = normalizeAttribution(sanitizedPayload, req.body?.path);
   const referrer = normalizeString(
     payload.referrer || payload.document_referrer,
     500
   );
-
   const utmSource = normalizeString(
-    payload.utm_source || payload.utmSource,
-    100
+    attribution.utm_source || payload.utmSource,
+    150
   );
-
   const utmMedium = normalizeString(
-    payload.utm_medium || payload.utmMedium,
-    100
+    attribution.utm_medium || payload.utmMedium,
+    150
   );
-
   const utmCampaign = normalizeString(
-    payload.utm_campaign || payload.utmCampaign,
+    attribution.utm_campaign || payload.utmCampaign,
     255
   );
-
-  const hasAttributionData = Boolean(
-    referrer || utmSource || utmCampaign
-  );
-
+  const hasAttributionData = Object.keys(attribution).length > 0;
   const trafficSource = hasAttributionData
-    ? classifyTrafficSource({
-        referrer,
-        utmSource,
-        utmMedium,
-      })
+    ? classifyTrafficSource({ referrer, utmSource, utmMedium })
     : null;
+  const customerRef = normalizeString(sanitizedPayload.customer_ref, 200);
+  const cartId = normalizeString(sanitizedPayload.cart_id, 200);
 
   const client = await db.connect();
 
@@ -2701,7 +2703,52 @@ app.post("/event", async (req, res) => {
       ]
     );
 
-    if (eventResult.rowCount) {
+    let orderInserted = false;
+    if (eventResult.rowCount && orderRecord) {
+      const orderResult = await client.query(
+        `
+          INSERT INTO commerce_orders (
+            site_id,
+            order_id,
+            session_id,
+            event_id,
+            cart_id,
+            customer_ref,
+            total,
+            currency,
+            status,
+            items,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW()
+          )
+          ON CONFLICT (site_id, order_id) DO NOTHING
+          RETURNING id
+        `,
+        [
+          siteId,
+          orderRecord.orderId,
+          orderRecord.sessionId,
+          orderRecord.eventId,
+          orderRecord.cartId,
+          orderRecord.customerRef,
+          orderRecord.total,
+          orderRecord.currency,
+          orderRecord.status,
+          safeJson(orderRecord.items),
+        ]
+      );
+      orderInserted = orderResult.rowCount > 0;
+    }
+
+    // A repeated order ID with a different event ID is logged for audit,
+    // but it must not increment session revenue or purchase state again.
+    if (
+      eventResult.rowCount &&
+      (!orderRecord || orderInserted)
+    ) {
       await updateSessionContext({
         siteId,
         sessionId,
@@ -2719,17 +2766,38 @@ app.post("/event", async (req, res) => {
      * session_id, so this always targets an existing row via
      * UPDATE and only sets the columns if they're still NULL.
      */
-    if (hasAttributionData) {
+    if (hasAttributionData || customerRef || cartId) {
       await client.query(
         `
           UPDATE session_summaries
           SET
             traffic_source = COALESCE(traffic_source, $3),
-            utm_campaign = COALESCE(utm_campaign, $4)
+            utm_campaign = COALESCE(utm_campaign, $4),
+            utm_source = COALESCE(utm_source, $5),
+            utm_medium = COALESCE(utm_medium, $6),
+            utm_term = COALESCE(utm_term, $7),
+            utm_content = COALESCE(utm_content, $8),
+            landing_page = COALESCE(landing_page, $9),
+            referrer_host = COALESCE(referrer_host, $10),
+            customer_ref = COALESCE(customer_ref, $11),
+            last_cart_id = COALESCE($12, last_cart_id)
           WHERE site_id = $1
             AND session_id = $2
         `,
-        [siteId, sessionId, trafficSource, utmCampaign || null]
+        [
+          siteId,
+          sessionId,
+          trafficSource,
+          attribution.utm_campaign || null,
+          attribution.utm_source || null,
+          attribution.utm_medium || null,
+          attribution.utm_term || null,
+          attribution.utm_content || null,
+          attribution.landing_page || null,
+          attribution.referrer_host || null,
+          customerRef || null,
+          cartId || null,
+        ]
       );
     }
 
@@ -2798,6 +2866,8 @@ app.post("/event", async (req, res) => {
     return success(res, {
       accepted: true,
       duplicate: eventResult.rowCount === 0,
+      duplicateOrder: Boolean(orderRecord && eventResult.rowCount && !orderInserted),
+      orderIdentified: Boolean(orderRecord),
       eventId: generatedEventId,
     });
   } catch (error) {
