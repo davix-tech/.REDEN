@@ -18,8 +18,8 @@ test("capability response distinguishes recorded revenue from profit", () => {
 
 test("general fallback does not invent an answer", () => {
   const answer = composeConversationResponse("general_help", "Who won an event yesterday?");
-  assert.match(answer, /not confident I can answer that reliably/);
-  assert.match(answer, /rather than guess/);
+  assert.match(answer, /can.t reliably answer that from my reviewed knowledge/);
+  assert.match(answer, /won.t make something up/);
 });
 
 test("response policy exposes versioned, structured principles", () => {
