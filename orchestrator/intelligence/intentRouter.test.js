@@ -18,6 +18,12 @@ test("routes revenue decline questions to revenue and diagnosis", () => {
   assert.deepEqual(detectIntents("Why has revenue dropped?"), ["diagnostic", "revenue"]);
 });
 
+test("does not mistake general who-questions for the connected store identity", () => {
+  assert.deepEqual(detectIntents("Who won an event yesterday?"), []);
+  assert.deepEqual(detectIntents("Who are you?"), ["reden_identity"]);
+  assert.deepEqual(detectIntents("What is my store called?"), ["identity"]);
+});
+
 test("returns no intent for an unrecognized question so the API can apply its fallback", () => {
   assert.deepEqual(detectIntents("Can you explain this?"), []);
 });
