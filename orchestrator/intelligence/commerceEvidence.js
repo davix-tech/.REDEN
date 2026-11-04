@@ -142,7 +142,9 @@ export function normalizeAttribution(payload = {}, pagePath = null) {
 export function buildOrderRecord({ siteId, sessionId, eventId, payload }) {
   const orderId = text(payload?.order_id, 200);
   if (!orderId) return null;
-  const items = Array.isArray(payload.items) ? payload.items : [];
+  const items = Array.isArray(payload.items) && payload.items.length
+    ? payload.items
+    : normalizeItem(payload) ? [normalizeItem(payload)] : [];
   return {
     siteId,
     sessionId,
