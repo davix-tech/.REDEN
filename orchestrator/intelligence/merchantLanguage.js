@@ -6,6 +6,19 @@
  * in customer-facing answers without changing evidence or decision logic.
  */
 const REPLACEMENTS = [
+  [/\\bhigh_purchase_intent\\b/gi, "strong signs that a shopper may buy"],
+  [/\\bmoderate_purchase_intent\\b/gi, "some signs that a shopper may buy"],
+  [/\\blow_purchase_intent\\b/gi, "few signs that a shopper may buy"],
+  [/\\bintent_score\\b/gi, "measure of buying interest"],
+  [/\\bbandit state\\b/gi, "REDEN's decision history"],
+  [/\\bbandit\\b/gi, "REDEN's decision process"],
+  [/\\bINCENTIVE_LOW\\b/g, "small targeted discount"],
+  [/\\bINCENTIVE_MEDIUM\\b/g, "moderate targeted discount"],
+  [/\\bINCENTIVE_HIGH\\b/g, "larger targeted discount"],
+  [/\\bRECOVERY_EMAIL\\b/g, "cart reminder email"],
+  [/\\bSESSION_START\\b/g, "a new store visit"],
+  [/\\bSESSION_END\\b/g, "a store visit ended"],
+  [/\\bRECOVERY_QUEUE\\b/g, "cart reminder list"],
   [/\\bPURCHASE_INTENT\\b/g, "signs that a shopper may be ready to buy"],
   [/\\bHIGH_INTENT\\b/g, "strong signs of wanting to buy"],
   [/\\bLOW_INTENT\\b/g, "limited signs of wanting to buy"],
