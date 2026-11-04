@@ -2055,7 +2055,17 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const purchaseResult = await safeAnalyticsQuery(
       `
-        WITH purchase_events AS (
+        WITH identified_orders AS (
+          SELECT
+            session_id,
+            total AS amount,
+            'identified'::TEXT AS identity_type
+          FROM commerce_orders
+          WHERE site_id = $1
+            AND created_at >= $2
+            AND created_at < $3
+        ),
+        legacy_purchase_events AS (
           SELECT
             session_id,
             COALESCE(
@@ -2074,37 +2084,51 @@ app.post("/api/v1/intelligence", async (req, res) => {
             AND event = 'PURCHASE'
             AND created_at >= $2
             AND created_at < $3
+            AND COALESCE(
+              NULLIF(payload->>'order_id', ''),
+              NULLIF(payload->>'orderId', ''),
+              NULLIF(payload #>> '{order,id}', '')
+            ) IS NULL
         ),
-        normalized_purchases AS (
+        normalized_legacy AS (
           SELECT
             session_id,
             CASE
               WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
               THEN amount_text::NUMERIC
               ELSE NULL
-            END AS amount
-          FROM purchase_events
+            END AS amount,
+            'unidentified'::TEXT AS identity_type
+          FROM legacy_purchase_events
+        ),
+        all_purchase_records AS (
+          SELECT * FROM identified_orders
+          UNION ALL
+          SELECT * FROM normalized_legacy
         )
         SELECT
           COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
           COUNT(DISTINCT session_id)::INTEGER AS purchased_sessions,
-          COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events
-        FROM normalized_purchases
+          COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events,
+          COUNT(*) FILTER (WHERE identity_type = 'identified')::INTEGER AS identified_orders,
+          COUNT(*) FILTER (WHERE identity_type = 'unidentified')::INTEGER AS unidentified_purchase_events,
+          COUNT(*)::INTEGER AS purchase_records
+        FROM all_purchase_records
       `,
       [siteId, startUTC, endUTC]
     );
 
     const purchaseRow = purchaseResult.rows[0] || {};
 
-    const purchaseRevenue = Number(
-      purchaseRow.revenue || 0
-    );
+    const purchaseRevenue = Number(purchaseRow.revenue || 0);
     const purchaseRevenueAvailable =
       Number(purchaseRow.priced_purchase_events || 0) > 0;
-
-    const purchasedSessions = Number(
-      purchaseRow.purchased_sessions || 0
+    const purchasedSessions = Number(purchaseRow.purchased_sessions || 0);
+    const identifiedOrders = Number(purchaseRow.identified_orders || 0);
+    const unidentifiedPurchaseEvents = Number(
+      purchaseRow.unidentified_purchase_events || 0
     );
+    const purchaseRecords = Number(purchaseRow.purchase_records || 0);
 
     const recoveryResult = await safeAnalyticsQuery(
       `
@@ -2388,6 +2412,9 @@ app.post("/api/v1/intelligence", async (req, res) => {
       purchases: Number(
         eventCounts.PURCHASE || 0
       ),
+      purchaseRecords,
+      identifiedOrders,
+      unidentifiedPurchaseEvents,
 
       decisions,
       conversions,
