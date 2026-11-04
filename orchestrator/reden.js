@@ -3295,7 +3295,7 @@ cron.schedule("* * * * *", async () => {
             )
             SELECT
               (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
-              (SELECT COUNT(DISTINCT session_id)::INTEGER FROM priced) AS purchases,
+              (SELECT COUNT(*)::INTEGER FROM priced) AS purchases,
               COALESCE(SUM(amount),0)::NUMERIC AS revenue,
               COUNT(amount)::INTEGER AS priced_purchases
             FROM priced
