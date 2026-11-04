@@ -16,6 +16,14 @@ function normalizeQuestion(question) {
 export function detectIntents(question) {
   const q = normalizeQuestion(question);
 
+  // Weekly revenue questions need a week-to-date calculation, not today's snapshot.
+  if (
+    /\\b(this week|week to date|so far this week|weekly)\\b/.test(q) &&
+    /\\b(revenue|income|sales|earned|earnings|made|money)\\b/.test(q)
+  ) {
+    return ["weekly_revenue"];
+  }
+
   // Specific merchant growth requests must reach the growth advisor before the
   // broader product-value matcher below captures the phrase "how can REDEN help".
   if (/\bhow can reden help (me|us|my store|our store) (increase|grow|boost) (sales|revenue|orders|profit)\b/.test(q)) {
