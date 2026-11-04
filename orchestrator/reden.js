@@ -2110,6 +2110,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
           COALESCE(SUM(amount), 0)::NUMERIC AS revenue,
           COUNT(DISTINCT session_id)::INTEGER AS purchased_sessions,
           COUNT(*) FILTER (WHERE amount IS NOT NULL)::INTEGER AS priced_purchase_events,
+          COUNT(*) FILTER (WHERE identity_type = 'identified' AND amount IS NOT NULL)::INTEGER AS priced_purchase_records,
           COUNT(*) FILTER (WHERE identity_type = 'identified')::INTEGER AS identified_orders,
           COUNT(*) FILTER (WHERE identity_type = 'unidentified')::INTEGER AS unidentified_purchase_events,
           COUNT(*)::INTEGER AS purchase_records
@@ -2125,6 +2126,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
       Number(purchaseRow.priced_purchase_events || 0) > 0;
     const purchasedSessions = Number(purchaseRow.purchased_sessions || 0);
     const identifiedOrders = Number(purchaseRow.identified_orders || 0);
+    const pricedPurchaseRecords = Number(purchaseRow.priced_purchase_records || 0);
     const unidentifiedPurchaseEvents = Number(
       purchaseRow.unidentified_purchase_events || 0
     );
@@ -2526,6 +2528,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
       ),
       purchaseRecords,
       identifiedOrders,
+      pricedPurchaseRecords,
       unidentifiedPurchaseEvents,
 
       decisions,
