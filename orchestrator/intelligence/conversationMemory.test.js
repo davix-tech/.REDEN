@@ -22,6 +22,8 @@ test("uses the previous weekly sales turn to understand short follow-ups", () =>
   assert.deepEqual(detectFollowUpIntent("And last week?", previousTurn), ["weekly_revenue"]);
   assert.deepEqual(detectFollowUpIntent("What about today?", previousTurn), ["revenue"]);
   assert.deepEqual(detectFollowUpIntent("Why?", previousTurn), ["weekly_revenue", "diagnostic"]);
+  assert.deepEqual(detectFollowUpIntent("What does that mean?", previousTurn), ["contextual_follow_up"]);
+  assert.deepEqual(detectFollowUpIntent("What about it?", previousTurn), ["contextual_follow_up"]);
 });
 
 test("asks for the previous context when none is available", () => {
