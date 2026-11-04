@@ -21,6 +21,18 @@ test("explains buying-intent language without exposing internal scoring terms", 
   assert.doesNotMatch(answer, /high-behavioural-intent|intent score|behavioural proxy/i);
 });
 
+test("translates internal REDEN state names into merchant language", () => {
+  const answer = toMerchantLanguage(
+    "PURCHASE_INTENT HIGH_INTENT LOW_INTENT ABANDONED_CART RECOVERY_SUCCESS BANDIT_STATE"
+  );
+  assert.match(answer, /ready to buy/i);
+  assert.match(answer, /strong signs of wanting to buy/i);
+  assert.match(answer, /limited signs of wanting to buy/i);
+  assert.match(answer, /cart with items left before purchase/i);
+  assert.match(answer, /sale recovered after a reminder/i);
+  assert.doesNotMatch(answer, /PURCHASE_INTENT|HIGH_INTENT|LOW_INTENT|ABANDONED_CART|RECOVERY_SUCCESS|BANDIT_STATE/);
+});
+
 test("translates internal decision lifecycle labels", () => {
   assert.equal(
     toMerchantLanguage("Check SCORED → ACTIONED → COMPLETED."),
