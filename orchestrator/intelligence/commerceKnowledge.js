@@ -1,3 +1,5 @@
+import { findDictionaryEntry, normalizeMerchantQuestion } from "./languageDictionary.js";
+
 /**
  * REDEN's version-controlled starter knowledge pack.
  *
@@ -17,28 +19,43 @@ export const REDEN_PRODUCT_PROFILE = {
 export const ECOMMERCE_KNOWLEDGE = [
   {
     id: "conversion-rate",
-    patterns: [/\bconversion rate\b/i],
+    patterns: [/\bconversion rate\b/i, /\bpurchase rate\b/i, /\bsales conversion rate\b/i],
     answer: "Conversion rate is the proportion of a defined group of visitors or sessions that complete a chosen goal. For purchases, a session-based rate is purchasing sessions divided by eligible sessions, multiplied by 100. Define the denominator and time window consistently; raw event counts can mislead."
   },
   {
     id: "purchase-intent",
-    patterns: [/\bpurchase intent\b/i],
+    patterns: [/\bpurchase intent\b/i, /\bbuying interest\b/i, /\bbuying intent\b/i, /\bintent to buy\b/i],
     answer: "Purchase intent is an estimate of a shopper's likelihood to buy, inferred from observed behavioural signals. It is probabilistic, not certainty. Use only events the integration actually records and do not trigger incentives without sufficient confidence, eligibility, and margin checks."
   },
   {
     id: "cart-abandonment",
-    patterns: [/\babandoned cart\b/i, /\bcart abandonment\b/i],
+    patterns: [/\babandoned cart\b/i, /\bcart abandonment\b/i, /\bbasket abandonment\b/i, /\bbasket drop off\b/i],
     answer: "Cart abandonment generally means a shopper adds an item to a cart but leaves without completing the purchase. Checkout-start events minus purchase events do not prove an abandonment count: link events to a shopper, session, or cart, deduplicate them, and account for delayed purchases and tracking failures."
   },
   {
     id: "average-order-value",
-    patterns: [/\baverage order value\b/i, /\baov\b/i],
+    patterns: [/\baverage order value\b/i, /\baov\b/i, /\baverage basket value\b/i, /\baverage purchase value\b/i],
     answer: "Average order value (AOV) is total order revenue divided by valid orders in the same period. It is not profit. Refunds, discounts, taxes, currency, and duplicate purchase events need consistent treatment before comparing AOV."
   },
   {
     id: "commerce-funnel",
     patterns: [/\be-?commerce funnel\b/i, /\bsales funnel\b/i],
     answer: "An e-commerce funnel tracks progression through stages such as store visit, product view, add to cart, checkout, and purchase. Each rate needs a clear denominator and consistent session/order identity. Missing events can indicate broken tracking rather than customer drop-off."
+  },
+  {
+    id: "revenue-definition",
+    patterns: [/\bwhat is revenue\b/i, /\bwhat does revenue mean\b/i, /\bdefine revenue\b/i, /\bmeaning of revenue\b/i],
+    answer: "Revenue is the value recorded from sales during a defined period before subtracting business costs. It is not the same as profit, cash received, or settled payment proceeds. The accounting basis, refunds, discounts, taxes and currency must be clear before comparing it."
+  },
+  {
+    id: "traffic-definition",
+    patterns: [/\bwhat is traffic\b/i, /\bwhat does traffic mean\b/i, /\bdefine traffic\b/i, /\bmeaning of traffic\b/i],
+    answer: "Store traffic means visits to your storefront. REDEN may count sessions or page-view events, but those are not automatically unique people. A reliable comparison needs consistent session identification and working PAGE_VIEW tracking."
+  },
+  {
+    id: "product-views-definition",
+    patterns: [/\bwhat are product views\b/i, /\bwhat is a product view\b/i, /\bwhat does product views mean\b/i],
+    answer: "A product view is a recorded visit to a product page. It can help show which products attract attention, but event counts do not necessarily represent distinct shoppers. Product-level analysis also needs reliable product identifiers."
   },
   {
     id: "revenue-versus-profit",
@@ -97,10 +114,15 @@ export const ECOMMERCE_KNOWLEDGE = [
 ];
 
 export function composeCommerceKnowledge(question = "") {
-  const q = String(question ?? "").slice(0, 2_000);
+  const q = normalizeMerchantQuestion(question);
   const match = ECOMMERCE_KNOWLEDGE.find((entry) =>
     entry.patterns.some((pattern) => pattern.test(q))
   );
   if (match) return match.answer;
+  const dictionaryEntry = findDictionaryEntry(question);
+  if (dictionaryEntry && /\b(what is|what does|define|meaning of|explain)\b/.test(q)) {
+    const label = dictionaryEntry.canonical.replace(/\b\w/g, (letter) => letter.toUpperCase());
+    return label + ": " + dictionaryEntry.meaning;
+  }
   return "I can explain REDEN and common e-commerce concepts from my reviewed knowledge. I don’t have enough information to answer that exact question reliably yet; ask about conversion rate, purchase intent, cart abandonment, average order value, the sales funnel, cart recovery, or revenue versus profit.";
 }
