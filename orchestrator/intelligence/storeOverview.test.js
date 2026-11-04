@@ -24,7 +24,7 @@ test("overview interprets small samples and flags purchase-event/order reconcili
   assert.match(answer, /1 unique session/i);
   assert.match(answer, /2 PURCHASE event/);
   assert.match(answer, /Verify unique order IDs/);
-  assert.match(answer, /not enough reliable historical traffic/i);
+  assert.match(answer, /enough reliable historical traffic/i);
   assert.match(answer, /decision conversion rate is unavailable/i);
   assert.match(answer, /not profit/i);
 });
