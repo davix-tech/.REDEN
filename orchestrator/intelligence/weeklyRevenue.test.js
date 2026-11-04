@@ -17,7 +17,7 @@ test("reports week-to-date recorded sales and distinguishes revenue from profit"
     },
   });
   assert.match(answer, /45,000\.00 in sales/i);
-  assert.match(answer, /not verified profit/i);
+  assert.match(answer, /not profit/i);
   assert.match(answer, /5\.0%/);
   assert.match(answer, /50\.0% higher/i);
 });
