@@ -2919,6 +2919,14 @@ app.post("/score", async (req, res) => {
       ]
     );
 
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId,
+      eventType: "DECISION_SCORED",
+      occurredAt: new Date().toISOString(),
+    });
+
     return success(res, {
       decisionId: result.rows[0].id,
       action,
@@ -2981,6 +2989,14 @@ app.post("/action", async (req, res) => {
         "Decision is not in SCORED state or does not belong to this site"
       );
     }
+
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: result.rows[0].session_id,
+      eventType: "DECISION_ACTIONED",
+      occurredAt: new Date().toISOString(),
+    });
 
     return success(res, {
       decision: result.rows[0],
@@ -3082,6 +3098,16 @@ app.post("/outcome", async (req, res) => {
 
     const decision =
       result.rows[0];
+
+    // The decision row is already committed by this standalone
+    // UPDATE, so notify dashboards before secondary learning work.
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: decision.session_id,
+      eventType: "DECISION_COMPLETED",
+      occurredAt: new Date().toISOString(),
+    });
 
     await updateBandit(
       siteId,
