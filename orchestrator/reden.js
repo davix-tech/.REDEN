@@ -2348,6 +2348,9 @@ app.post("/api/v1/intelligence", async (req, res) => {
       `
         SELECT
           COALESCE(traffic_source, 'unknown') AS traffic_source,
+          COALESCE(utm_source, 'unknown') AS utm_source,
+          COALESCE(utm_medium, 'unknown') AS utm_medium,
+          COALESCE(utm_campaign, 'unattributed') AS utm_campaign,
           COUNT(*)::INTEGER AS sessions,
           COUNT(*) FILTER (
             WHERE purchased = TRUE
@@ -2357,7 +2360,11 @@ app.post("/api/v1/intelligence", async (req, res) => {
         WHERE site_id = $1
           AND first_seen_at >= $2
           AND first_seen_at < $3
-        GROUP BY COALESCE(traffic_source, 'unknown')
+        GROUP BY
+          COALESCE(traffic_source, 'unknown'),
+          COALESCE(utm_source, 'unknown'),
+          COALESCE(utm_medium, 'unknown'),
+          COALESCE(utm_campaign, 'unattributed')
       `,
       [siteId, startUTC, endUTC]
     );
@@ -2368,13 +2375,4265 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
       return {
         trafficSource: row.traffic_source,
+        utmSource: row.utm_source,
+        utmMedium: row.utm_medium,
+        utmCampaign: row.utm_campaign,
         sessions: Number(row.sessions || 0),
-        purchases,
+        purchasedSessions: purchases,
         revenue,
-        avgOrderValue:
-          purchases > 0 ? revenue / purchases : 0,
       };
     });
+
+    /*
+     * Product evidence is derived from structured event payloads and the
+     * deduplicated order ledger. Events with line items use those items;
+     * single-product events use their top-level product fields.
+     */
+    const productEvidenceResult = await safeAnalyticsQuery(
+      `
+        WITH product_events AS (
+          SELECT
+            el.event,
+            el.payload AS item_data
+          FROM event_logs el
+          WHERE el.site_id = $1
+            AND el.event IN ('PRODUCT_VIEW', 'ADD_TO_CART')
+            AND el.created_at >= $2
+            AND el.created_at < $3
+            AND NOT (
+              jsonb_typeof(el.payload->'items') = 'array'
+              AND jsonb_array_length(el.payload->'items') > 0
+            )
+          UNION ALL
+          SELECT
+            el.event,
+            item AS item_data
+          FROM event_logs el
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+              WHEN jsonb_typeof(el.payload->'items') = 'array'
+              THEN el.payload->'items'
+              ELSE '[]'::jsonb
+            END
+          ) AS item
+          WHERE el.site_id = $1
+            AND el.event IN ('PRODUCT_VIEW', 'ADD_TO_CART')
+            AND el.created_at >= $2
+            AND el.created_at < $3
+          UNION ALL
+          SELECT
+            'PURCHASE'::TEXT AS event,
+            item AS item_data
+          FROM commerce_orders co
+          CROSS JOIN LATERAL jsonb_array_elements(co.items) AS item
+          WHERE co.site_id = $1
+            AND co.created_at >= $2
+            AND co.created_at < $3
+          UNION ALL
+          SELECT
+            el.event,
+            el.payload AS item_data
+          FROM event_logs el
+          WHERE el.site_id = $1
+            AND el.event = 'PURCHASE'
+            AND el.created_at >= $2
+            AND el.created_at < $3
+            AND COALESCE(
+              NULLIF(el.payload->>'order_id', ''),
+              NULLIF(el.payload->>'orderId', ''),
+              NULLIF(el.payload #>> '{order,id}', '')
+            ) IS NULL
+            AND NOT (
+              jsonb_typeof(el.payload->'items') = 'array'
+              AND jsonb_array_length(el.payload->'items') > 0
+            )
+          UNION ALL
+          SELECT
+            el.event,
+            item AS item_data
+          FROM event_logs el
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+              WHEN jsonb_typeof(el.payload->'items') = 'array'
+              THEN el.payload->'items'
+              ELSE '[]'::jsonb
+            END
+          ) AS item
+          WHERE el.site_id = $1
+            AND el.event = 'PURCHASE'
+            AND el.created_at >= $2
+            AND el.created_at < $3
+            AND COALESCE(
+              NULLIF(el.payload->>'order_id', ''),
+              NULLIF(el.payload->>'orderId', ''),
+              NULLIF(el.payload #>> '{order,id}', '')
+            ) IS NULL
+        )
+        SELECT
+          COALESCE(
+            NULLIF(item_data->>'product_id', ''),
+            NULLIF(item_data->>'productId', '')
+          ) AS product_id,
+          MAX(COALESCE(item_data->>'product_name', item_data->>'name', item_data->>'title')) AS product_name,
+          MAX(item_data->>'sku') AS sku,
+          MAX(item_data->>'category') AS category,
+          COUNT(*) FILTER (WHERE event = 'PRODUCT_VIEW')::INTEGER AS product_views,
+          COUNT(*) FILTER (WHERE event = 'ADD_TO_CART')::INTEGER AS add_to_cart_events,
+          COUNT(*) FILTER (WHERE event = 'PURCHASE')::INTEGER AS purchase_line_items,
+          COALESCE(SUM(
+            CASE
+              WHEN event = 'ADD_TO_CART'
+                AND COALESCE(item_data->>'quantity', item_data->>'qty', '1') ~ '^[0-9]+([.][0-9]+)?      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+      purchaseRecords,
+      identifiedOrders,
+      unidentifiedPurchaseEvents,
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+      purchaseRevenueAvailable,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+      productPerformance,
+      customerIntelligence,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    const conversationHistoryResult = conversationId
+      ? await safeAnalyticsQuery(
+          `
+            SELECT question, answer, intents, created_at
+            FROM intelligence_answers
+            WHERE site_id = $1
+              AND evidence->>'conversationId' = $2
+              AND created_at >= NOW() - INTERVAL '45 minutes'
+            ORDER BY created_at DESC
+            LIMIT 6
+          `,
+          [siteId, conversationId]
+        )
+      : { rows: [] };
+
+    const recentTurns = conversationHistoryResult.rows || [];
+    const previousTurn = recentTurns[0] || null;
+    let intents = detectIntents(question, previousTurn);
+
+    if (intents.includes("weekly_revenue")) {
+      evidence.weeklyRevenue = await loadWeeklyRevenue({
+        db,
+        siteId,
+        timeZone,
+        referenceDate: referenceNow,
+      });
+    }
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question,
+        recentTurns,
+        previousTurn
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = toMerchantLanguage(sections.join("\n\n"));
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson({
+            ...evidence,
+            ...(conversationId ? { conversationId } : {}),
+          }),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const commercePayload = normalizeCommercePayload(event, payload);
+  const sanitizedPayload = {
+    ...commercePayload,
+    cart_value: boundedCartValue,
+  };
+  const orderRecord = event === "PURCHASE"
+    ? buildOrderRecord({
+        siteId,
+        sessionId,
+        eventId: generatedEventId,
+        payload: sanitizedPayload,
+      })
+    : null;
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const attribution = normalizeAttribution(sanitizedPayload, req.body?.path);
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+  const utmSource = normalizeString(
+    attribution.utm_source || payload.utmSource,
+    150
+  );
+  const utmMedium = normalizeString(
+    attribution.utm_medium || payload.utmMedium,
+    150
+  );
+  const utmCampaign = normalizeString(
+    attribution.utm_campaign || payload.utmCampaign,
+    255
+  );
+  const hasAttributionData = Object.keys(attribution).length > 0;
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({ referrer, utmSource, utmMedium })
+    : null;
+  const customerRef = normalizeString(sanitizedPayload.customer_ref, 200);
+  const cartId = normalizeString(sanitizedPayload.cart_id, 200);
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    let orderInserted = false;
+    if (eventResult.rowCount && orderRecord) {
+      const orderResult = await client.query(
+        `
+          INSERT INTO commerce_orders (
+            site_id,
+            order_id,
+            session_id,
+            event_id,
+            cart_id,
+            customer_ref,
+            total,
+            currency,
+            status,
+            items,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW()
+          )
+          ON CONFLICT (site_id, order_id) DO NOTHING
+          RETURNING id
+        `,
+        [
+          siteId,
+          orderRecord.orderId,
+          orderRecord.sessionId,
+          orderRecord.eventId,
+          orderRecord.cartId,
+          orderRecord.customerRef,
+          orderRecord.total,
+          orderRecord.currency,
+          orderRecord.status,
+          safeJson(orderRecord.items),
+        ]
+      );
+      orderInserted = orderResult.rowCount > 0;
+    }
+
+    // A repeated order ID with a different event ID is logged for audit,
+    // but it must not increment session revenue or purchase state again.
+    if (
+      eventResult.rowCount &&
+      (!orderRecord || orderInserted)
+    ) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData || customerRef || cartId) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4),
+            utm_source = COALESCE(utm_source, $5),
+            utm_medium = COALESCE(utm_medium, $6),
+            utm_term = COALESCE(utm_term, $7),
+            utm_content = COALESCE(utm_content, $8),
+            landing_page = COALESCE(landing_page, $9),
+            referrer_host = COALESCE(referrer_host, $10),
+            customer_ref = COALESCE(customer_ref, $11),
+            last_cart_id = COALESCE($12, last_cart_id)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [
+          siteId,
+          sessionId,
+          trafficSource,
+          attribution.utm_campaign || null,
+          attribution.utm_source || null,
+          attribution.utm_medium || null,
+          attribution.utm_term || null,
+          attribution.utm_content || null,
+          attribution.landing_page || null,
+          attribution.referrer_host || null,
+          customerRef || null,
+          cartId || null,
+        ]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    // Publish only newly committed events. Duplicate SDK retries
+    // are acknowledged but never broadcast twice.
+    if (eventResult.rowCount) {
+      publishSiteEvent(siteId, {
+        event: "commerce.event",
+        eventId: generatedEventId,
+        sessionId,
+        eventType: event,
+        occurredAt: new Date().toISOString(),
+      });
+    }
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      duplicateOrder: Boolean(orderRecord && eventResult.rowCount && !orderInserted),
+      orderIdentified: Boolean(orderRecord),
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId,
+      eventType: "DECISION_SCORED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: result.rows[0].session_id,
+      eventType: "DECISION_ACTIONED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    // The decision row is already committed by this standalone
+    // UPDATE, so notify dashboards before secondary learning work.
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: decision.session_id,
+      eventType: "DECISION_COMPLETED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   TWICE-DAILY MERCHANT REPORTS
+   Morning covers yesterday; evening covers today so far.
+   Each store is scheduled in its own timezone.
+========================================================= */
+
+cron.schedule("* * * * *", async () => {
+  const client = await db.connect();
+
+  try {
+    const lock = await client.query(
+      "SELECT pg_try_advisory_lock(hashtext('reden_twice_daily_reports')) AS locked"
+    );
+    if (!lock.rows[0]?.locked) return;
+
+    try {
+      const sites = await client.query(`
+        SELECT site_id, name, owner_email, timezone
+        FROM sites
+        WHERE active = TRUE
+          AND owner_email IS NOT NULL
+          AND owner_email <> ''
+      `);
+
+      const now = new Date();
+
+      for (const site of sites.rows) {
+        try {
+          const timeZone = site.timezone || "Africa/Lagos";
+          const parts = new Intl.DateTimeFormat("en-GB", {
+            timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+          }).formatToParts(now);
+          const local = Object.fromEntries(
+            parts.filter((part) => part.type !== "literal")
+              .map((part) => [part.type, Number(part.value)])
+          );
+
+          const morning = local.hour === 8 && local.minute < 10;
+          const evening = local.hour === 18 && local.minute < 10;
+          if (!morning && !evening) continue;
+
+          const type = morning ? "MORNING_REPORT" : "EVENING_REPORT";
+          const localDay = getSiteDayBounds(timeZone, now);
+          const sent = await client.query(`
+            SELECT 1 FROM email_logs
+            WHERE site_id = $1 AND type = $2 AND status = 'SENT'
+              AND created_at >= $3 AND created_at < $4
+            LIMIT 1
+          `, [site.site_id, type, localDay.startUTC, localDay.endUTC]);
+          if (sent.rowCount) continue;
+
+          const period = getSiteDayBounds(
+            timeZone,
+            morning ? new Date(now.getTime() - 86400000) : now
+          );
+          const result = await client.query(`
+            WITH events AS (
+              SELECT event, session_id, payload
+              FROM event_logs
+              WHERE site_id = $1 AND created_at >= $2 AND created_at < $3
+            ),
+            purchases AS (
+              SELECT session_id,
+                COALESCE(
+                  NULLIF(payload->>'revenue',''), NULLIF(payload->>'total',''),
+                  NULLIF(payload->>'value',''), NULLIF(payload->>'order_total',''),
+                  NULLIF(payload->>'orderTotal',''), NULLIF(payload->>'amount',''),
+                  NULLIF(payload->>'cart_value',''), NULLIF(payload->>'cartValue',''),
+                  NULLIF(payload #>> '{cart,value}','')
+                ) AS amount_text
+              FROM events WHERE event = 'PURCHASE'
+            ),
+            priced AS (
+              SELECT session_id,
+                CASE WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
+                  THEN amount_text::NUMERIC ELSE NULL END AS amount
+              FROM purchases
+            )
+            SELECT
+              (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
+              (SELECT COUNT(*)::INTEGER FROM priced) AS purchases,
+              COALESCE(SUM(amount),0)::NUMERIC AS revenue,
+              COUNT(amount)::INTEGER AS priced_purchases
+            FROM priced
+          `, [site.site_id, period.startUTC, period.endUTC]);
+
+          const row = result.rows[0] || {};
+          const visits = Number(row.visits || 0);
+          const purchases = Number(row.purchases || 0);
+          const revenueAvailable = Number(row.priced_purchases || 0) > 0;
+          const revenue = revenueAvailable ? Number(row.revenue || 0) : null;
+          const periodName = morning ? "yesterday" : "today";
+
+          const intelligence = visits === 0
+            ? [{
+                priority: "high",
+                title: "REDEN did not record any store visits",
+                summary: `No store visits were recorded for ${periodName}. This may mean there were no visits, or that store activity tracking needs checking.`,
+                recommendation: "Open your storefront and confirm that REDEN is receiving store activity before making business decisions."
+              }]
+            : purchases === 0
+              ? [{
+                  priority: "high",
+                  title: "Visitors came to your store, but no purchases were recorded",
+                  summary: `REDEN recorded ${visits} visits for ${periodName}, but no completed purchases. These figures alone do not identify the cause.`,
+                  recommendation: "Review product views, items added to carts and checkout activity to find where shoppers may be stopping."
+                }]
+              : [{
+                  priority: "normal",
+                  title: `Your store recorded ${purchases} purchase${purchases === 1 ? "" : "s"}`,
+                  summary: `REDEN recorded ${visits} visits and ${purchases} purchases for ${periodName}.${revenueAvailable ? ` Recorded sales were ${revenue.toLocaleString("en-NG", { maximumFractionDigits: 2 })}.` : " Purchase amounts were unavailable, so sales could not be totalled."}`,
+                  recommendation: "Keep monitoring visits, purchases and the steps shoppers take before buying. REDEN will flag meaningful changes when the evidence supports them."
+                }];
+
+          const send = morning ? sendMorningReport : sendEveningReport;
+          const sentResult = await send({
+            to: site.owner_email,
+            merchantName: site.name,
+            metrics: { total: visits, conversions: purchases, revenue },
+            intelligence
+          });
+
+          if (!sentResult?.ok) {
+            console.error("[MERCHANT REPORT DELIVERY FAILED]", {
+              siteId: site.site_id, type, error: sentResult?.error
+            });
+            continue;
+          }
+
+          await client.query(`
+            INSERT INTO email_logs (site_id, type, status, created_at)
+            VALUES ($1, $2, 'SENT', NOW())
+          `, [site.site_id, type]);
+        } catch (siteError) {
+          console.error("[MERCHANT REPORT SITE ERROR]", {
+            siteId: site.site_id, error: siteError
+          });
+        }
+      }
+    } finally {
+      await client.query(
+        "SELECT pg_advisory_unlock(hashtext('reden_twice_daily_reports'))"
+      );
+    }
+  } catch (error) {
+    console.error("[TWICE-DAILY REPORT CRON ERROR]", error);
+  } finally {
+    client.release();
+  }
+}, { timezone: "UTC" });
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+
+              THEN COALESCE(item_data->>'quantity', item_data->>'qty', '1')::NUMERIC
+              ELSE 0
+            END
+          ), 0)::NUMERIC AS cart_quantity,
+          COALESCE(SUM(
+            CASE
+              WHEN event = 'PURCHASE'
+                AND COALESCE(item_data->>'unit_price', item_data->>'price', '0') ~ '^[0-9]+([.][0-9]+)?      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+      purchaseRecords,
+      identifiedOrders,
+      unidentifiedPurchaseEvents,
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+      purchaseRevenueAvailable,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    const conversationHistoryResult = conversationId
+      ? await safeAnalyticsQuery(
+          `
+            SELECT question, answer, intents, created_at
+            FROM intelligence_answers
+            WHERE site_id = $1
+              AND evidence->>'conversationId' = $2
+              AND created_at >= NOW() - INTERVAL '45 minutes'
+            ORDER BY created_at DESC
+            LIMIT 6
+          `,
+          [siteId, conversationId]
+        )
+      : { rows: [] };
+
+    const recentTurns = conversationHistoryResult.rows || [];
+    const previousTurn = recentTurns[0] || null;
+    let intents = detectIntents(question, previousTurn);
+
+    if (intents.includes("weekly_revenue")) {
+      evidence.weeklyRevenue = await loadWeeklyRevenue({
+        db,
+        siteId,
+        timeZone,
+        referenceDate: referenceNow,
+      });
+    }
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question,
+        recentTurns,
+        previousTurn
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = toMerchantLanguage(sections.join("\n\n"));
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson({
+            ...evidence,
+            ...(conversationId ? { conversationId } : {}),
+          }),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const commercePayload = normalizeCommercePayload(event, payload);
+  const sanitizedPayload = {
+    ...commercePayload,
+    cart_value: boundedCartValue,
+  };
+  const orderRecord = event === "PURCHASE"
+    ? buildOrderRecord({
+        siteId,
+        sessionId,
+        eventId: generatedEventId,
+        payload: sanitizedPayload,
+      })
+    : null;
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const attribution = normalizeAttribution(sanitizedPayload, req.body?.path);
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+  const utmSource = normalizeString(
+    attribution.utm_source || payload.utmSource,
+    150
+  );
+  const utmMedium = normalizeString(
+    attribution.utm_medium || payload.utmMedium,
+    150
+  );
+  const utmCampaign = normalizeString(
+    attribution.utm_campaign || payload.utmCampaign,
+    255
+  );
+  const hasAttributionData = Object.keys(attribution).length > 0;
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({ referrer, utmSource, utmMedium })
+    : null;
+  const customerRef = normalizeString(sanitizedPayload.customer_ref, 200);
+  const cartId = normalizeString(sanitizedPayload.cart_id, 200);
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    let orderInserted = false;
+    if (eventResult.rowCount && orderRecord) {
+      const orderResult = await client.query(
+        `
+          INSERT INTO commerce_orders (
+            site_id,
+            order_id,
+            session_id,
+            event_id,
+            cart_id,
+            customer_ref,
+            total,
+            currency,
+            status,
+            items,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW()
+          )
+          ON CONFLICT (site_id, order_id) DO NOTHING
+          RETURNING id
+        `,
+        [
+          siteId,
+          orderRecord.orderId,
+          orderRecord.sessionId,
+          orderRecord.eventId,
+          orderRecord.cartId,
+          orderRecord.customerRef,
+          orderRecord.total,
+          orderRecord.currency,
+          orderRecord.status,
+          safeJson(orderRecord.items),
+        ]
+      );
+      orderInserted = orderResult.rowCount > 0;
+    }
+
+    // A repeated order ID with a different event ID is logged for audit,
+    // but it must not increment session revenue or purchase state again.
+    if (
+      eventResult.rowCount &&
+      (!orderRecord || orderInserted)
+    ) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData || customerRef || cartId) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4),
+            utm_source = COALESCE(utm_source, $5),
+            utm_medium = COALESCE(utm_medium, $6),
+            utm_term = COALESCE(utm_term, $7),
+            utm_content = COALESCE(utm_content, $8),
+            landing_page = COALESCE(landing_page, $9),
+            referrer_host = COALESCE(referrer_host, $10),
+            customer_ref = COALESCE(customer_ref, $11),
+            last_cart_id = COALESCE($12, last_cart_id)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [
+          siteId,
+          sessionId,
+          trafficSource,
+          attribution.utm_campaign || null,
+          attribution.utm_source || null,
+          attribution.utm_medium || null,
+          attribution.utm_term || null,
+          attribution.utm_content || null,
+          attribution.landing_page || null,
+          attribution.referrer_host || null,
+          customerRef || null,
+          cartId || null,
+        ]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    // Publish only newly committed events. Duplicate SDK retries
+    // are acknowledged but never broadcast twice.
+    if (eventResult.rowCount) {
+      publishSiteEvent(siteId, {
+        event: "commerce.event",
+        eventId: generatedEventId,
+        sessionId,
+        eventType: event,
+        occurredAt: new Date().toISOString(),
+      });
+    }
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      duplicateOrder: Boolean(orderRecord && eventResult.rowCount && !orderInserted),
+      orderIdentified: Boolean(orderRecord),
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId,
+      eventType: "DECISION_SCORED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: result.rows[0].session_id,
+      eventType: "DECISION_ACTIONED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    // The decision row is already committed by this standalone
+    // UPDATE, so notify dashboards before secondary learning work.
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: decision.session_id,
+      eventType: "DECISION_COMPLETED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   TWICE-DAILY MERCHANT REPORTS
+   Morning covers yesterday; evening covers today so far.
+   Each store is scheduled in its own timezone.
+========================================================= */
+
+cron.schedule("* * * * *", async () => {
+  const client = await db.connect();
+
+  try {
+    const lock = await client.query(
+      "SELECT pg_try_advisory_lock(hashtext('reden_twice_daily_reports')) AS locked"
+    );
+    if (!lock.rows[0]?.locked) return;
+
+    try {
+      const sites = await client.query(`
+        SELECT site_id, name, owner_email, timezone
+        FROM sites
+        WHERE active = TRUE
+          AND owner_email IS NOT NULL
+          AND owner_email <> ''
+      `);
+
+      const now = new Date();
+
+      for (const site of sites.rows) {
+        try {
+          const timeZone = site.timezone || "Africa/Lagos";
+          const parts = new Intl.DateTimeFormat("en-GB", {
+            timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+          }).formatToParts(now);
+          const local = Object.fromEntries(
+            parts.filter((part) => part.type !== "literal")
+              .map((part) => [part.type, Number(part.value)])
+          );
+
+          const morning = local.hour === 8 && local.minute < 10;
+          const evening = local.hour === 18 && local.minute < 10;
+          if (!morning && !evening) continue;
+
+          const type = morning ? "MORNING_REPORT" : "EVENING_REPORT";
+          const localDay = getSiteDayBounds(timeZone, now);
+          const sent = await client.query(`
+            SELECT 1 FROM email_logs
+            WHERE site_id = $1 AND type = $2 AND status = 'SENT'
+              AND created_at >= $3 AND created_at < $4
+            LIMIT 1
+          `, [site.site_id, type, localDay.startUTC, localDay.endUTC]);
+          if (sent.rowCount) continue;
+
+          const period = getSiteDayBounds(
+            timeZone,
+            morning ? new Date(now.getTime() - 86400000) : now
+          );
+          const result = await client.query(`
+            WITH events AS (
+              SELECT event, session_id, payload
+              FROM event_logs
+              WHERE site_id = $1 AND created_at >= $2 AND created_at < $3
+            ),
+            purchases AS (
+              SELECT session_id,
+                COALESCE(
+                  NULLIF(payload->>'revenue',''), NULLIF(payload->>'total',''),
+                  NULLIF(payload->>'value',''), NULLIF(payload->>'order_total',''),
+                  NULLIF(payload->>'orderTotal',''), NULLIF(payload->>'amount',''),
+                  NULLIF(payload->>'cart_value',''), NULLIF(payload->>'cartValue',''),
+                  NULLIF(payload #>> '{cart,value}','')
+                ) AS amount_text
+              FROM events WHERE event = 'PURCHASE'
+            ),
+            priced AS (
+              SELECT session_id,
+                CASE WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
+                  THEN amount_text::NUMERIC ELSE NULL END AS amount
+              FROM purchases
+            )
+            SELECT
+              (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
+              (SELECT COUNT(*)::INTEGER FROM priced) AS purchases,
+              COALESCE(SUM(amount),0)::NUMERIC AS revenue,
+              COUNT(amount)::INTEGER AS priced_purchases
+            FROM priced
+          `, [site.site_id, period.startUTC, period.endUTC]);
+
+          const row = result.rows[0] || {};
+          const visits = Number(row.visits || 0);
+          const purchases = Number(row.purchases || 0);
+          const revenueAvailable = Number(row.priced_purchases || 0) > 0;
+          const revenue = revenueAvailable ? Number(row.revenue || 0) : null;
+          const periodName = morning ? "yesterday" : "today";
+
+          const intelligence = visits === 0
+            ? [{
+                priority: "high",
+                title: "REDEN did not record any store visits",
+                summary: `No store visits were recorded for ${periodName}. This may mean there were no visits, or that store activity tracking needs checking.`,
+                recommendation: "Open your storefront and confirm that REDEN is receiving store activity before making business decisions."
+              }]
+            : purchases === 0
+              ? [{
+                  priority: "high",
+                  title: "Visitors came to your store, but no purchases were recorded",
+                  summary: `REDEN recorded ${visits} visits for ${periodName}, but no completed purchases. These figures alone do not identify the cause.`,
+                  recommendation: "Review product views, items added to carts and checkout activity to find where shoppers may be stopping."
+                }]
+              : [{
+                  priority: "normal",
+                  title: `Your store recorded ${purchases} purchase${purchases === 1 ? "" : "s"}`,
+                  summary: `REDEN recorded ${visits} visits and ${purchases} purchases for ${periodName}.${revenueAvailable ? ` Recorded sales were ${revenue.toLocaleString("en-NG", { maximumFractionDigits: 2 })}.` : " Purchase amounts were unavailable, so sales could not be totalled."}`,
+                  recommendation: "Keep monitoring visits, purchases and the steps shoppers take before buying. REDEN will flag meaningful changes when the evidence supports them."
+                }];
+
+          const send = morning ? sendMorningReport : sendEveningReport;
+          const sentResult = await send({
+            to: site.owner_email,
+            merchantName: site.name,
+            metrics: { total: visits, conversions: purchases, revenue },
+            intelligence
+          });
+
+          if (!sentResult?.ok) {
+            console.error("[MERCHANT REPORT DELIVERY FAILED]", {
+              siteId: site.site_id, type, error: sentResult?.error
+            });
+            continue;
+          }
+
+          await client.query(`
+            INSERT INTO email_logs (site_id, type, status, created_at)
+            VALUES ($1, $2, 'SENT', NOW())
+          `, [site.site_id, type]);
+        } catch (siteError) {
+          console.error("[MERCHANT REPORT SITE ERROR]", {
+            siteId: site.site_id, error: siteError
+          });
+        }
+      }
+    } finally {
+      await client.query(
+        "SELECT pg_advisory_unlock(hashtext('reden_twice_daily_reports'))"
+      );
+    }
+  } catch (error) {
+    console.error("[TWICE-DAILY REPORT CRON ERROR]", error);
+  } finally {
+    client.release();
+  }
+}, { timezone: "UTC" });
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+
+                AND COALESCE(item_data->>'quantity', item_data->>'qty', '1') ~ '^[0-9]+([.][0-9]+)?      period: "today",
+      localDate,
+      timeZone,
+
+      periodStart: startUTC.toISOString(),
+      periodEnd: endUTC.toISOString(),
+
+      uniqueSessions,
+      trafficBaseline,
+      revenueBaseline: historicalBaselines.revenueBaseline,
+      funnelBaseline: historicalBaselines.funnelBaseline,
+      totalEvents: Object.values(eventCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+
+      pageViews: Number(
+        eventCounts.PAGE_VIEW || 0
+      ),
+
+      productViews: Number(
+        eventCounts.PRODUCT_VIEW || 0
+      ),
+
+      addToCart: Number(
+        eventCounts.ADD_TO_CART || 0
+      ),
+
+      checkoutStarted: Number(
+        eventCounts.CHECKOUT_STARTED || 0
+      ),
+
+      purchases: Number(
+        eventCounts.PURCHASE || 0
+      ),
+      purchaseRecords,
+      identifiedOrders,
+      unidentifiedPurchaseEvents,
+
+      decisions,
+      conversions,
+
+      decisionRevenue,
+      purchaseRevenue,
+      purchaseRevenueAvailable,
+
+      purchasedSessions,
+
+      recovery,
+      emails,
+
+      bandit,
+
+      attribution,
+
+      intentSummary,
+      interventionOutcomes,
+
+      eventCounts,
+    };
+
+    const conversationHistoryResult = conversationId
+      ? await safeAnalyticsQuery(
+          `
+            SELECT question, answer, intents, created_at
+            FROM intelligence_answers
+            WHERE site_id = $1
+              AND evidence->>'conversationId' = $2
+              AND created_at >= NOW() - INTERVAL '45 minutes'
+            ORDER BY created_at DESC
+            LIMIT 6
+          `,
+          [siteId, conversationId]
+        )
+      : { rows: [] };
+
+    const recentTurns = conversationHistoryResult.rows || [];
+    const previousTurn = recentTurns[0] || null;
+    let intents = detectIntents(question, previousTurn);
+
+    if (intents.includes("weekly_revenue")) {
+      evidence.weeklyRevenue = await loadWeeklyRevenue({
+        db,
+        siteId,
+        timeZone,
+        referenceDate: referenceNow,
+      });
+    }
+
+    if (!intents.length) {
+      // Unknown/general questions must not be misrepresented as a store overview.
+      intents = ["general_help"];
+    }
+
+    const sections = [];
+
+    for (const intent of intents) {
+      const section = composeIntent(
+        intent,
+        evidence,
+        site,
+        question,
+        recentTurns,
+        previousTurn
+      );
+
+      if (section) {
+        sections.push(section);
+      }
+    }
+
+    let answer = toMerchantLanguage(sections.join("\n\n"));
+
+    if (!answer) {
+      answer =
+        "I could not produce an evidence-backed answer from the available REDEN data.";
+    }
+
+    const latencyMs = Date.now() - startedAt;
+
+    try {
+      await safeAnalyticsQuery(
+        `
+          INSERT INTO intelligence_answers (
+            site_id,
+            question,
+            answer,
+            evidence,
+            intents,
+            latency_ms
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4::jsonb,
+            $5::jsonb,
+            $6
+          )
+        `,
+        [
+          siteId,
+          question,
+          answer,
+          safeJson({
+            ...evidence,
+            ...(conversationId ? { conversationId } : {}),
+          }),
+          safeJson(intents),
+          latencyMs,
+        ]
+      );
+    } catch (auditError) {
+      console.error(
+        "[INTELLIGENCE AUDIT ERROR]",
+        auditError
+      );
+    }
+
+    return success(res, {
+      answer,
+
+      site: {
+        siteId: site.site_id,
+        name: site.name,
+        plan: site.plan,
+        subscriptionStatus:
+          site.subscription_status,
+        timezone: site.timezone,
+      },
+
+      evidence,
+      intents,
+
+      latencyMs,
+    });
+  } catch (error) {
+    console.error("[INTELLIGENCE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to process intelligence request"
+    );
+  }
+});
+
+/* =========================================================
+   EVENT
+========================================================= */
+
+app.post("/event", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const eventId = normalizeString(
+    req.body?.event_id ||
+      req.body?.eventId,
+    200
+  );
+
+  const event = normalizeString(
+    req.body?.event,
+    100
+  ).toUpperCase();
+
+  const payload = safePayload(
+    req.body?.payload
+  );
+
+  if (!sessionId || !event) {
+    return failure(
+      res,
+      400,
+      "session_id and event are required"
+    );
+  }
+
+  const VALID_EVENTS = new Set([
+    "PAGE_VIEW",
+    "PRODUCT_VIEW",
+    "ADD_TO_CART",
+    "CHECKOUT_STARTED",
+    "PURCHASE",
+    "SESSION_START",
+    "SESSION_END",
+    "BEHAVIOR",
+  ]);
+
+  if (!VALID_EVENTS.has(event)) {
+    return failure(
+      res,
+      400,
+      "Invalid event"
+    );
+  }
+
+  const generatedEventId =
+    eventId || crypto.randomUUID();
+
+  const cartValue = validateNumber(
+    payload.cart_value ??
+      payload.cartValue ??
+      payload.cart?.value,
+    0
+  );
+
+  const boundedCartValue = Math.min(
+    Math.max(0, cartValue),
+    1_000_000_000
+  );
+
+  const commercePayload = normalizeCommercePayload(event, payload);
+  const sanitizedPayload = {
+    ...commercePayload,
+    cart_value: boundedCartValue,
+  };
+  const orderRecord = event === "PURCHASE"
+    ? buildOrderRecord({
+        siteId,
+        sessionId,
+        eventId: generatedEventId,
+        payload: sanitizedPayload,
+      })
+    : null;
+
+  /*
+   * Captured here so it's available regardless of which event
+   * type triggered this request. A CHECKOUT_STARTED payload
+   * is the expected source of an email, but this doesn't
+   * assume it's the only one.
+   */
+  const customerEmail = normalizeEmail(
+    payload.email || payload.customer_email
+  );
+
+  /*
+   * Traffic source is only ever WRITTEN when the incoming
+   * payload actually carries referrer/UTM data (the SDK sends
+   * this once, at session start). The SQL below uses
+   * COALESCE so an existing traffic_source on the row is
+   * never overwritten by a later event on the same session.
+   */
+  const attribution = normalizeAttribution(sanitizedPayload, req.body?.path);
+  const referrer = normalizeString(
+    payload.referrer || payload.document_referrer,
+    500
+  );
+  const utmSource = normalizeString(
+    attribution.utm_source || payload.utmSource,
+    150
+  );
+  const utmMedium = normalizeString(
+    attribution.utm_medium || payload.utmMedium,
+    150
+  );
+  const utmCampaign = normalizeString(
+    attribution.utm_campaign || payload.utmCampaign,
+    255
+  );
+  const hasAttributionData = Object.keys(attribution).length > 0;
+  const trafficSource = hasAttributionData
+    ? classifyTrafficSource({ referrer, utmSource, utmMedium })
+    : null;
+  const customerRef = normalizeString(sanitizedPayload.customer_ref, 200);
+  const cartId = normalizeString(sanitizedPayload.cart_id, 200);
+
+  const client = await db.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `
+        INSERT INTO event_logs (
+          site_id,
+          session_id,
+          event_id,
+          event,
+          payload,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::jsonb,
+          NOW()
+        )
+        ON CONFLICT (
+          site_id,
+          event_id
+        )
+        DO NOTHING
+        RETURNING
+          id,
+          created_at
+      `,
+      [
+        siteId,
+        sessionId,
+        generatedEventId,
+        event,
+        safeJson(sanitizedPayload),
+      ]
+    );
+
+    let orderInserted = false;
+    if (eventResult.rowCount && orderRecord) {
+      const orderResult = await client.query(
+        `
+          INSERT INTO commerce_orders (
+            site_id,
+            order_id,
+            session_id,
+            event_id,
+            cart_id,
+            customer_ref,
+            total,
+            currency,
+            status,
+            items,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW()
+          )
+          ON CONFLICT (site_id, order_id) DO NOTHING
+          RETURNING id
+        `,
+        [
+          siteId,
+          orderRecord.orderId,
+          orderRecord.sessionId,
+          orderRecord.eventId,
+          orderRecord.cartId,
+          orderRecord.customerRef,
+          orderRecord.total,
+          orderRecord.currency,
+          orderRecord.status,
+          safeJson(orderRecord.items),
+        ]
+      );
+      orderInserted = orderResult.rowCount > 0;
+    }
+
+    // A repeated order ID with a different event ID is logged for audit,
+    // but it must not increment session revenue or purchase state again.
+    if (
+      eventResult.rowCount &&
+      (!orderRecord || orderInserted)
+    ) {
+      await updateSessionContext({
+        siteId,
+        sessionId,
+        event,
+        payload: sanitizedPayload,
+      });
+    }
+
+    /*
+     * Attribution write is independent of updateSessionContext
+     * because it must apply the FIRST time we see attribution
+     * data for this session, regardless of which event carried
+     * it. A plain INSERT here would fail if
+     * updateSessionContext already created the row for this
+     * session_id, so this always targets an existing row via
+     * UPDATE and only sets the columns if they're still NULL.
+     */
+    if (hasAttributionData || customerRef || cartId) {
+      await client.query(
+        `
+          UPDATE session_summaries
+          SET
+            traffic_source = COALESCE(traffic_source, $3),
+            utm_campaign = COALESCE(utm_campaign, $4),
+            utm_source = COALESCE(utm_source, $5),
+            utm_medium = COALESCE(utm_medium, $6),
+            utm_term = COALESCE(utm_term, $7),
+            utm_content = COALESCE(utm_content, $8),
+            landing_page = COALESCE(landing_page, $9),
+            referrer_host = COALESCE(referrer_host, $10),
+            customer_ref = COALESCE(customer_ref, $11),
+            last_cart_id = COALESCE($12, last_cart_id)
+          WHERE site_id = $1
+            AND session_id = $2
+        `,
+        [
+          siteId,
+          sessionId,
+          trafficSource,
+          attribution.utm_campaign || null,
+          attribution.utm_source || null,
+          attribution.utm_medium || null,
+          attribution.utm_term || null,
+          attribution.utm_content || null,
+          attribution.landing_page || null,
+          attribution.referrer_host || null,
+          customerRef || null,
+          cartId || null,
+        ]
+      );
+    }
+
+    /*
+     * CHECKOUT_STARTED enters recovery processing.
+     *
+     * customer_email is stored on the queue row itself so
+     * sendRecoveryEmail() (called later, from the cron) has
+     * an actual recipient. Without this, the recovery
+     * pipeline silently has nothing to send to.
+     *
+     * ON CONFLICT (site_id, session_id) matches db.js's
+     * UNIQUE (site_id, session_id) constraint on
+     * recovery_queue, and backfills customer_email on a
+     * repeat CHECKOUT_STARTED if the first one didn't have
+     * an email but a later one does.
+     */
+    if (
+      event === "CHECKOUT_STARTED" &&
+      eventResult.rowCount
+    ) {
+      await client.query(
+        `
+          INSERT INTO recovery_queue (
+            site_id,
+            session_id,
+            customer_email,
+            status,
+            discount_percent,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            'PENDING',
+            10,
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT (site_id, session_id) DO UPDATE
+          SET customer_email = COALESCE(
+            EXCLUDED.customer_email,
+            recovery_queue.customer_email
+          )
+        `,
+        [siteId, sessionId, customerEmail || null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    // Publish only newly committed events. Duplicate SDK retries
+    // are acknowledged but never broadcast twice.
+    if (eventResult.rowCount) {
+      publishSiteEvent(siteId, {
+        event: "commerce.event",
+        eventId: generatedEventId,
+        sessionId,
+        eventType: event,
+        occurredAt: new Date().toISOString(),
+      });
+    }
+
+    return success(res, {
+      accepted: true,
+      duplicate: eventResult.rowCount === 0,
+      duplicateOrder: Boolean(orderRecord && eventResult.rowCount && !orderInserted),
+      orderIdentified: Boolean(orderRecord),
+      eventId: generatedEventId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("[EVENT ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record event"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   SCORE
+========================================================= */
+
+app.post("/score", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const sessionId = normalizeString(
+    req.body?.session_id ||
+      req.body?.sessionId,
+    128
+  );
+
+  const cartValue = validateNumber(
+    req.body?.cart_value ??
+      req.body?.cartValue,
+    0
+  );
+
+  const behavior = safePayload(
+    req.body?.behavior
+  );
+
+  if (!sessionId) {
+    return failure(
+      res,
+      400,
+      "session_id is required"
+    );
+  }
+
+  try {
+    const context = await getSessionContext(
+      siteId,
+      sessionId
+    );
+
+    const action = await pickAction({
+      site_id: siteId,
+      session_id: sessionId,
+      cart_value: Math.max(0, cartValue),
+      behavior: context || behavior,
+    });
+
+    const actionMap = {
+      NONE: 0,
+      INCENTIVE_LOW: 5,
+      INCENTIVE_MED: 10,
+      INCENTIVE_HIGH: 20,
+    };
+
+    const score =
+      actionMap[action] ?? 0;
+
+    const result = await db.query(
+      `
+        INSERT INTO decisions (
+          site_id,
+          session_id,
+          action,
+          score,
+          state,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          'SCORED',
+          NOW()
+        )
+        RETURNING id
+      `,
+      [
+        siteId,
+        sessionId,
+        action,
+        score,
+      ]
+    );
+
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId,
+      eventType: "DECISION_SCORED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    return success(res, {
+      decisionId: result.rows[0].id,
+      action,
+      score,
+    });
+  } catch (error) {
+    console.error("[SCORE ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to score session"
+    );
+  }
+});
+
+/* =========================================================
+   ACTION
+========================================================= */
+
+app.post("/action", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'ACTIONED',
+          actioned_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'SCORED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          state
+      `,
+      [decisionId, siteId]
+    );
+
+    if (!result.rowCount) {
+      return failure(
+        res,
+        409,
+        "Decision is not in SCORED state or does not belong to this site"
+      );
+    }
+
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: result.rows[0].session_id,
+      eventType: "DECISION_ACTIONED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    return success(res, {
+      decision: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[ACTION ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to action decision"
+    );
+  }
+});
+
+/* =========================================================
+   OUTCOME
+========================================================= */
+
+app.post("/outcome", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  const decisionId = Number(
+    req.body?.decision_id ??
+      req.body?.decisionId
+  );
+
+  const converted = normalizeBoolean(
+    req.body?.converted
+  );
+
+  const revenue = Math.max(
+    0,
+    validateNumber(req.body?.revenue, 0)
+  );
+
+  if (!Number.isInteger(decisionId)) {
+    return failure(
+      res,
+      400,
+      "Valid decision_id is required"
+    );
+  }
+
+  try {
+    const result = await db.query(
+      `
+        UPDATE decisions
+        SET
+          state = 'COMPLETED',
+          converted = $3,
+          revenue = $4,
+          completed_at = NOW()
+        WHERE id = $1
+          AND site_id = $2
+          AND state = 'ACTIONED'
+        RETURNING
+          id,
+          session_id,
+          action,
+          converted,
+          revenue,
+          completed_at
+      `,
+      [
+        decisionId,
+        siteId,
+        converted,
+        revenue,
+      ]
+    );
+
+    if (!result.rowCount) {
+      const existing = await db.query(
+        `
+          SELECT id, state
+          FROM decisions
+          WHERE id = $1
+            AND site_id = $2
+          LIMIT 1
+        `,
+        [decisionId, siteId]
+      );
+
+      if (!existing.rowCount) {
+        return failure(
+          res,
+          404,
+          "Decision not found"
+        );
+      }
+
+      return failure(
+        res,
+        409,
+        "Decision is not in ACTIONED state"
+      );
+    }
+
+    const decision =
+      result.rows[0];
+
+    // The decision row is already committed by this standalone
+    // UPDATE, so notify dashboards before secondary learning work.
+    publishSiteEvent(siteId, {
+      event: "commerce.event",
+      eventId: crypto.randomUUID(),
+      sessionId: decision.session_id,
+      eventType: "DECISION_COMPLETED",
+      occurredAt: new Date().toISOString(),
+    });
+
+    await updateBandit(
+      siteId,
+      decision.action,
+      converted
+    );
+
+    return success(res, {
+      decision,
+    });
+  } catch (error) {
+    console.error("[OUTCOME ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to record outcome"
+    );
+  }
+});
+
+/* =========================================================
+   METRICS
+========================================================= */
+
+app.get("/metrics", async (req, res) => {
+  const siteId = req.site.site_id;
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          COUNT(*)::INTEGER AS decisions,
+
+          COUNT(*) FILTER (
+            WHERE converted = TRUE
+          )::INTEGER AS conversions,
+
+          COALESCE(
+            SUM(revenue),
+            0
+          )::NUMERIC AS revenue
+
+        FROM decisions
+        WHERE site_id = $1
+          AND state = 'COMPLETED'
+      `,
+      [siteId]
+    );
+
+    const row = result.rows[0] || {};
+    let events = {};
+    let totalEvents = 0;
+
+    try {
+      const eventResult = await db.query(
+        `
+          SELECT
+            event,
+            COUNT(*)::INTEGER AS count
+          FROM event_logs
+          WHERE site_id = $1
+            AND created_at >= NOW() - INTERVAL '30 days'
+          GROUP BY event
+        `,
+        [siteId]
+      );
+
+      for (const eventRow of eventResult.rows) {
+        const count = Number(eventRow.count || 0);
+        events[eventRow.event] = count;
+        totalEvents += count;
+      }
+    } catch (eventError) {
+      console.error("[METRICS EVENT QUERY ERROR]", {
+        message: eventError?.message,
+        code: eventError?.code,
+      });
+    }
+
+    return success(res, {
+      decisions: Number(row.decisions || 0),
+      conversions: Number(row.conversions || 0),
+      revenue: Number(row.revenue || 0),
+      events,
+      totalEvents,
+      eventsWindow: "last_30_days",
+    });
+  } catch (error) {
+    console.error("[METRICS ERROR]", error);
+
+    return failure(
+      res,
+      500,
+      "Unable to load metrics"
+    );
+  }
+});
+
+/* =========================================================
+   RECOVERY CRON
+========================================================= */
+
+cron.schedule(
+  "*/15 * * * *",
+  async () => {
+    const client = await db.connect();
+
+    try {
+      await client.query(`
+        UPDATE recovery_queue
+        SET
+          status = 'PENDING',
+          updated_at = NOW()
+        WHERE status = 'PROCESSING'
+          AND updated_at < NOW() - INTERVAL '30 minutes'
+      `);
+
+      await client.query("BEGIN");
+
+      const jobs = await client.query(
+        `
+          SELECT
+            id,
+            site_id,
+            session_id,
+            customer_email,
+            discount_percent
+          FROM recovery_queue
+          WHERE status = 'PENDING'
+          ORDER BY created_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      for (const job of jobs.rows) {
+        await client.query(
+          `
+            UPDATE recovery_queue
+            SET
+              status = 'PROCESSING',
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [job.id]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      for (const job of jobs.rows) {
+        try {
+          const converted = await db.query(
+            `
+              SELECT id
+              FROM decisions
+              WHERE site_id = $1
+                AND session_id = $2
+                AND converted = TRUE
+                AND state = 'COMPLETED'
+              LIMIT 1
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+
+          if (converted.rowCount) {
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'COMPLETED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          /*
+           * No email captured on this session -- nothing to
+           * send to. Mark FAILED rather than retrying this
+           * job every 15 minutes forever.
+           */
+          if (!job.customer_email) {
+            console.warn(
+              "[RECOVERY] No customer_email on job, skipping:",
+              { jobId: job.id, siteId: job.site_id }
+            );
+
+            await db.query(
+              `
+                UPDATE recovery_queue
+                SET
+                  status = 'FAILED',
+                  updated_at = NOW()
+                WHERE id = $1
+              `,
+              [job.id]
+            );
+
+            continue;
+          }
+
+          const siteResult = await db.query(
+            `
+              SELECT
+                site_id,
+                name,
+                owner_email
+              FROM sites
+              WHERE site_id = $1
+                AND active = TRUE
+              LIMIT 1
+            `,
+            [job.site_id]
+          );
+
+          if (!siteResult.rowCount) {
+            throw new Error(
+              `Site ${job.site_id} not found`
+            );
+          }
+
+          const site =
+            siteResult.rows[0];
+
+          await sendRecoveryEmail({
+            site,
+            sessionId: job.session_id,
+            customerEmail: job.customer_email,
+            discountPercent:
+              job.discount_percent,
+          });
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'SENT',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+
+          await db.query(
+            `
+              INSERT INTO email_logs (
+                site_id,
+                session_id,
+                type,
+                status,
+                created_at
+              )
+              VALUES (
+                $1,
+                $2,
+                'RECOVERY',
+                'SENT',
+                NOW()
+              )
+            `,
+            [
+              job.site_id,
+              job.session_id,
+            ]
+          );
+        } catch (error) {
+          console.error(
+            "[RECOVERY JOB ERROR]",
+            {
+              jobId: job.id,
+              error,
+            }
+          );
+
+          await db.query(
+            `
+              UPDATE recovery_queue
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
+              WHERE id = $1
+            `,
+            [job.id]
+          );
+        }
+      }
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+
+      console.error(
+        "[RECOVERY CRON ERROR]",
+        error
+      );
+    } finally {
+      client.release();
+    }
+  },
+  {
+    timezone: "UTC",
+  }
+);
+
+/* =========================================================
+   TWICE-DAILY MERCHANT REPORTS
+   Morning covers yesterday; evening covers today so far.
+   Each store is scheduled in its own timezone.
+========================================================= */
+
+cron.schedule("* * * * *", async () => {
+  const client = await db.connect();
+
+  try {
+    const lock = await client.query(
+      "SELECT pg_try_advisory_lock(hashtext('reden_twice_daily_reports')) AS locked"
+    );
+    if (!lock.rows[0]?.locked) return;
+
+    try {
+      const sites = await client.query(`
+        SELECT site_id, name, owner_email, timezone
+        FROM sites
+        WHERE active = TRUE
+          AND owner_email IS NOT NULL
+          AND owner_email <> ''
+      `);
+
+      const now = new Date();
+
+      for (const site of sites.rows) {
+        try {
+          const timeZone = site.timezone || "Africa/Lagos";
+          const parts = new Intl.DateTimeFormat("en-GB", {
+            timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+          }).formatToParts(now);
+          const local = Object.fromEntries(
+            parts.filter((part) => part.type !== "literal")
+              .map((part) => [part.type, Number(part.value)])
+          );
+
+          const morning = local.hour === 8 && local.minute < 10;
+          const evening = local.hour === 18 && local.minute < 10;
+          if (!morning && !evening) continue;
+
+          const type = morning ? "MORNING_REPORT" : "EVENING_REPORT";
+          const localDay = getSiteDayBounds(timeZone, now);
+          const sent = await client.query(`
+            SELECT 1 FROM email_logs
+            WHERE site_id = $1 AND type = $2 AND status = 'SENT'
+              AND created_at >= $3 AND created_at < $4
+            LIMIT 1
+          `, [site.site_id, type, localDay.startUTC, localDay.endUTC]);
+          if (sent.rowCount) continue;
+
+          const period = getSiteDayBounds(
+            timeZone,
+            morning ? new Date(now.getTime() - 86400000) : now
+          );
+          const result = await client.query(`
+            WITH events AS (
+              SELECT event, session_id, payload
+              FROM event_logs
+              WHERE site_id = $1 AND created_at >= $2 AND created_at < $3
+            ),
+            purchases AS (
+              SELECT session_id,
+                COALESCE(
+                  NULLIF(payload->>'revenue',''), NULLIF(payload->>'total',''),
+                  NULLIF(payload->>'value',''), NULLIF(payload->>'order_total',''),
+                  NULLIF(payload->>'orderTotal',''), NULLIF(payload->>'amount',''),
+                  NULLIF(payload->>'cart_value',''), NULLIF(payload->>'cartValue',''),
+                  NULLIF(payload #>> '{cart,value}','')
+                ) AS amount_text
+              FROM events WHERE event = 'PURCHASE'
+            ),
+            priced AS (
+              SELECT session_id,
+                CASE WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
+                  THEN amount_text::NUMERIC ELSE NULL END AS amount
+              FROM purchases
+            )
+            SELECT
+              (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
+              (SELECT COUNT(*)::INTEGER FROM priced) AS purchases,
+              COALESCE(SUM(amount),0)::NUMERIC AS revenue,
+              COUNT(amount)::INTEGER AS priced_purchases
+            FROM priced
+          `, [site.site_id, period.startUTC, period.endUTC]);
+
+          const row = result.rows[0] || {};
+          const visits = Number(row.visits || 0);
+          const purchases = Number(row.purchases || 0);
+          const revenueAvailable = Number(row.priced_purchases || 0) > 0;
+          const revenue = revenueAvailable ? Number(row.revenue || 0) : null;
+          const periodName = morning ? "yesterday" : "today";
+
+          const intelligence = visits === 0
+            ? [{
+                priority: "high",
+                title: "REDEN did not record any store visits",
+                summary: `No store visits were recorded for ${periodName}. This may mean there were no visits, or that store activity tracking needs checking.`,
+                recommendation: "Open your storefront and confirm that REDEN is receiving store activity before making business decisions."
+              }]
+            : purchases === 0
+              ? [{
+                  priority: "high",
+                  title: "Visitors came to your store, but no purchases were recorded",
+                  summary: `REDEN recorded ${visits} visits for ${periodName}, but no completed purchases. These figures alone do not identify the cause.`,
+                  recommendation: "Review product views, items added to carts and checkout activity to find where shoppers may be stopping."
+                }]
+              : [{
+                  priority: "normal",
+                  title: `Your store recorded ${purchases} purchase${purchases === 1 ? "" : "s"}`,
+                  summary: `REDEN recorded ${visits} visits and ${purchases} purchases for ${periodName}.${revenueAvailable ? ` Recorded sales were ${revenue.toLocaleString("en-NG", { maximumFractionDigits: 2 })}.` : " Purchase amounts were unavailable, so sales could not be totalled."}`,
+                  recommendation: "Keep monitoring visits, purchases and the steps shoppers take before buying. REDEN will flag meaningful changes when the evidence supports them."
+                }];
+
+          const send = morning ? sendMorningReport : sendEveningReport;
+          const sentResult = await send({
+            to: site.owner_email,
+            merchantName: site.name,
+            metrics: { total: visits, conversions: purchases, revenue },
+            intelligence
+          });
+
+          if (!sentResult?.ok) {
+            console.error("[MERCHANT REPORT DELIVERY FAILED]", {
+              siteId: site.site_id, type, error: sentResult?.error
+            });
+            continue;
+          }
+
+          await client.query(`
+            INSERT INTO email_logs (site_id, type, status, created_at)
+            VALUES ($1, $2, 'SENT', NOW())
+          `, [site.site_id, type]);
+        } catch (siteError) {
+          console.error("[MERCHANT REPORT SITE ERROR]", {
+            siteId: site.site_id, error: siteError
+          });
+        }
+      }
+    } finally {
+      await client.query(
+        "SELECT pg_advisory_unlock(hashtext('reden_twice_daily_reports'))"
+      );
+    }
+  } catch (error) {
+    console.error("[TWICE-DAILY REPORT CRON ERROR]", error);
+  } finally {
+    client.release();
+  }
+}, { timezone: "UTC" });
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+
+              THEN COALESCE(item_data->>'unit_price', item_data->>'price', '0')::NUMERIC
+                 * COALESCE(item_data->>'quantity', item_data->>'qty', '1')::NUMERIC
+              ELSE 0
+            END
+          ), 0)::NUMERIC AS item_revenue,
+          MAX(item_data->>'currency') AS currency
+        FROM product_events
+        WHERE COALESCE(
+          NULLIF(item_data->>'product_id', ''),
+          NULLIF(item_data->>'productId', '')
+        ) IS NOT NULL
+        GROUP BY 1
+        ORDER BY item_revenue DESC, purchase_line_items DESC, product_views DESC
+        LIMIT 20
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const productPerformance = (productEvidenceResult.rows || []).map((row) => ({
+      productId: row.product_id,
+      name: row.product_name || null,
+      sku: row.sku || null,
+      category: row.category || null,
+      productViews: Number(row.product_views || 0),
+      addToCartEvents: Number(row.add_to_cart_events || 0),
+      purchaseLineItems: Number(row.purchase_line_items || 0),
+      cartQuantity: Number(row.cart_quantity || 0),
+      itemRevenue: Number(row.item_revenue || 0),
+      currency: row.currency || null,
+    }));
+
+    const customerEvidenceResult = await safeAnalyticsQuery(
+      `
+        WITH current_customers AS (
+          SELECT DISTINCT customer_ref
+          FROM commerce_orders
+          WHERE site_id = $1
+            AND created_at >= $2
+            AND created_at < $3
+            AND customer_ref IS NOT NULL
+        ),
+        prior_customer_orders AS (
+          SELECT customer_ref, COUNT(*)::INTEGER AS prior_orders
+          FROM commerce_orders
+          WHERE site_id = $1
+            AND created_at < $2
+            AND customer_ref IS NOT NULL
+          GROUP BY customer_ref
+        )
+        SELECT
+          (SELECT COUNT(*) FROM current_customers)::INTEGER AS identified_customers,
+          COUNT(*) FILTER (WHERE COALESCE(p.prior_orders, 0) > 0)::INTEGER AS returning_customers,
+          COUNT(*) FILTER (WHERE COALESCE(p.prior_orders, 0) = 0)::INTEGER AS first_time_identified_customers
+        FROM current_customers c
+        LEFT JOIN prior_customer_orders p USING (customer_ref)
+      `,
+      [siteId, startUTC, endUTC]
+    );
+
+    const customerEvidenceRow = customerEvidenceResult.rows[0] || {};
+    const customerIntelligence = {
+      identifiedCustomers: Number(customerEvidenceRow.identified_customers || 0),
+      returningCustomers: Number(customerEvidenceRow.returning_customers || 0),
+      firstTimeIdentifiedCustomers: Number(
+        customerEvidenceRow.first_time_identified_customers || 0
+      ),
+      customerIdentityCoverage: "pseudonymous merchant-supplied customer_ref only",
+    };
 
     const evidence = {
       period: "today",
