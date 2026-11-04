@@ -75,7 +75,7 @@ export async function loadCommerceIntelligence(db, { siteId, startUTC, endUTC })
       `,
       [siteId, startUTC, endUTC]
     ),
-    db.query(
+    safeCommerceQuery(db,
       `
         WITH product_events AS (
           SELECT el.event, el.payload AS item_data
@@ -158,7 +158,7 @@ export async function loadCommerceIntelligence(db, { siteId, startUTC, endUTC })
       `,
       [siteId, startUTC, endUTC]
     ),
-    db.query(
+    safeCommerceQuery(db,
       `
         WITH current_customers AS (
           SELECT DISTINCT customer_ref
