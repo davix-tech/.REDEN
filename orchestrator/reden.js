@@ -30,6 +30,7 @@ import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
 import { composeGrowthAdvice } from "./intelligence/growthAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
 import { composeMerchantIntelligence } from "./intelligence/merchantIntelligence.js";
+import { publishSiteEvent, subscribeToSite } from "./infrastructure/realtime.js";
 
 dotenv.config();
 
@@ -283,6 +284,7 @@ const PUBLIC_CORS_PATHS = new Set([
   "/outcome",
   "/sdk.js",
   "/api/v1/verify",
+  "/api/v1/stream",
 ]);
 
 function isPublicAsset(req) {
@@ -319,7 +321,11 @@ function isPublicRoute(req) {
  * every handler that reads req.site.site_id.
  */
 function isAuthExempt(req) {
-  return isPublicAsset(req) || req.path === "/api/v1/verify";
+  return (
+    isPublicAsset(req) ||
+    req.path === "/api/v1/verify" ||
+    req.path === "/api/v1/stream"
+  );
 }
 
 app.use((req, res, next) => {
@@ -1286,6 +1292,122 @@ app.get("/", async (req, res) => {
     operational: true,
     redis: redisHealthy,
   });
+});
+
+/* =========================================================
+   AUTHENTICATED REAL-TIME STREAM
+========================================================= */
+
+/*
+ * PRETHIM issues short-lived, site-scoped HMAC tickets after
+ * authenticating the merchant. The permanent site API key and
+ * REDEN admin secret are never exposed to the browser.
+ */
+function verifyStreamTicket(token) {
+  if (typeof token !== "string" || token.length > 2_048) {
+    return null;
+  }
+
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+
+  const [encodedPayload, suppliedSignature] = parts;
+  const expectedSignature = crypto
+    .createHmac("sha256", ADMIN_SECRET)
+    .update(encodedPayload)
+    .digest("base64url");
+
+  const supplied = Buffer.from(suppliedSignature);
+  const expected = Buffer.from(expectedSignature);
+
+  if (
+    supplied.length !== expected.length ||
+    !crypto.timingSafeEqual(supplied, expected)
+  ) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(
+      Buffer.from(encodedPayload, "base64url").toString("utf8")
+    );
+    const now = Math.floor(Date.now() / 1000);
+
+    if (
+      typeof payload.siteId !== "string" ||
+      !/^[a-zA-Z0-9._-]{1,100}$/.test(payload.siteId) ||
+      !Number.isInteger(payload.exp) ||
+      payload.exp <= now ||
+      payload.exp > now + 60 * 60 * 2
+    ) {
+      return null;
+    }
+
+    return { siteId: payload.siteId };
+  } catch {
+    return null;
+  }
+}
+
+app.get("/api/v1/stream", async (req, res) => {
+  const ticket = verifyStreamTicket(req.query.token);
+
+  if (!ticket) {
+    return failure(res, 401, "Invalid or expired stream ticket");
+  }
+
+  try {
+    const siteResult = await db.query(
+      "SELECT site_id FROM sites WHERE site_id = $1 AND active = TRUE LIMIT 1",
+      [ticket.siteId]
+    );
+
+    if (!siteResult.rowCount) {
+      return failure(res, 401, "Inactive or unknown storefront");
+    }
+  } catch (error) {
+    console.error("[STREAM AUTH ERROR]", error);
+    return failure(res, 503, "Unable to authorize live stream");
+  }
+
+  res.status(200);
+  res.set({
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders?.();
+
+  // Tell EventSource that the connection is established.
+  res.write(": REDEN live stream connected\n\n");
+
+  const unsubscribe = subscribeToSite(ticket.siteId, (event) => {
+    if (res.writableEnded || res.destroyed) return;
+
+    res.write(`id: ${event.eventId}\n`);
+    res.write("data: " + JSON.stringify(event) + "\n\n");
+    res.flush?.();
+  });
+
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded || res.destroyed) {
+      clearInterval(heartbeat);
+      unsubscribe();
+      return;
+    }
+
+    res.write(`: heartbeat ${Date.now()}\n\n`);
+    res.flush?.();
+  }, 20_000);
+
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  };
+
+  req.on("close", cleanup);
+  res.on("close", cleanup);
 });
 
 /* =========================================================
@@ -2673,6 +2795,18 @@ app.post("/event", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    // Publish only newly committed events. Duplicate SDK retries
+    // are acknowledged but never broadcast twice.
+    if (eventResult.rowCount) {
+      publishSiteEvent(siteId, {
+        event: "commerce.event",
+        eventId: generatedEventId,
+        sessionId,
+        eventType: event,
+        occurredAt: new Date().toISOString(),
+      });
+    }
 
     return success(res, {
       accepted: true,
