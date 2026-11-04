@@ -25,7 +25,7 @@ function first(...values) {
 
 function normalizeItem(item) {
   if (!item || typeof item !== "object" || Array.isArray(item)) return null;
-  const productId = text(first(item.product_id, item.productId, item.id), 200);
+  const productId = text(first(item.product_id, item.productId, item.product?.id), 200);
   const sku = text(item.sku, 100);
   const name = text(first(item.product_name, item.productName, item.name, item.title), 255);
   const variantId = text(first(item.variant_id, item.variantId, item.variant?.id), 200);
@@ -85,6 +85,9 @@ export function normalizeCommercePayload(event, payload = {}) {
   if (cartId) result.cart_id = cartId;
   if (orderId) result.order_id = orderId;
   if (orderTotal !== null) result.order_total = Math.min(orderTotal, 1_000_000_000);
+  if (event === "PURCHASE" && number(source.revenue) === null && orderTotal !== null) {
+    result.revenue = Math.min(orderTotal, 1_000_000_000);
+  }
   if (customerRef) result.customer_ref = customerRef;
   if (normalizedCurrency) result.currency = normalizedCurrency;
 
