@@ -11,7 +11,7 @@ const REFERENTIAL_FOLLOW_UP = /^(and why|why though|why is that|why did that hap
 
 const SEMANTIC_PATTERNS = [
   {
-    pattern: /\b(nobody|no one|not many people|people are not|people aren't|customers are not|customers aren't)\s+(buying|purchasing|checking out)\b|\b(sales are not moving|sales aren't moving|nothing is selling|visitors but no (sales|orders|purchases))\b/i,
+    pattern: /\b(nobody|no one|not many people|people are not|people aren't|customers are not|customers aren't)\s+(?:(?:is|are)\s+)?(buying|purchasing|checking out)\b|\b(sales are not moving|sales aren't moving|nothing is selling|visitors but no (sales|orders|purchases))\b/i,
     intents: ["diagnostic", "traffic", "purchases"],
   },
   {
@@ -61,13 +61,14 @@ function unique(values) {
 
 export function resolveReasoningIntents(question, detectedIntents = [], previousTurn = null) {
   const text = String(question ?? "").trim();
+  const normalized = text.toLowerCase().replace(/[?!.,]+$/g, "").trim();
   const intents = [...parseIntents(detectedIntents)];
 
   for (const item of SEMANTIC_PATTERNS) {
     if (item.pattern.test(text)) intents.push(...item.intents);
   }
 
-  if (REFERENTIAL_FOLLOW_UP.test(text) && previousTurn?.question && previousTurn?.answer) {
+  if (REFERENTIAL_FOLLOW_UP.test(normalized) && previousTurn?.question && previousTurn?.answer) {
     const previous = parseIntents(previousTurn.intents);
     if (/^(and why|why though|why is that|why did that happen|what caused it|what caused that|can you explain why|explain why)$/i.test(text)) {
       if (previous.includes("weekly_revenue")) intents.push("weekly_revenue", "diagnostic");
@@ -78,7 +79,7 @@ export function resolveReasoningIntents(question, detectedIntents = [], previous
       } else {
         intents.push("contextual_follow_up");
       }
-    } else if (/^(what should i do about it|how do i fix that|how can i improve it|would that help|will that help|would that work|will that work)$/i.test(text)) {
+    } else if (/^(what should i do about it|how do i fix that|how can i improve it|would that help|will that help|would that work|will that work)$/i.test(normalized)) {
       intents.push("merchant_priority");
     } else {
       intents.push("contextual_follow_up");
