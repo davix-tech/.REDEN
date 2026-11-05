@@ -70,7 +70,7 @@ export function resolveReasoningIntents(question, detectedIntents = [], previous
 
   if (REFERENTIAL_FOLLOW_UP.test(normalized) && previousTurn?.question && previousTurn?.answer) {
     const previous = parseIntents(previousTurn.intents);
-    if (/^(and why|why though|why is that|why did that happen|what caused it|what caused that|can you explain why|explain why)$/i.test(text)) {
+    if (/^(and why|why though|why is that|why did that happen|what caused it|what caused that|can you explain why|explain why)$/i.test(normalized)) {
       if (previous.includes("weekly_revenue")) intents.push("weekly_revenue", "diagnostic");
       else if (previous.some((intent) => ["revenue", "sales", "purchases", "overview"].includes(intent))) {
         intents.push("diagnostic", "revenue");
