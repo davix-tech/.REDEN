@@ -26,6 +26,7 @@ import { composeWeeklyRevenue, loadWeeklyRevenue } from "./intelligence/weeklyRe
 import { diagnoseSales } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
 import { composeConversationResponse } from "./intelligence/responsePolicy.js";
+import { resolveReasoningIntents, composeReasonedResponse } from "./intelligence/reasoningLayer.js";
 import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
 import { composeGrowthAdvice } from "./intelligence/growthAdvisor.js";
 import { loadHistoricalBaselines } from "./intelligence/historicalBaselines.js";
@@ -2404,7 +2405,11 @@ app.post("/api/v1/intelligence", async (req, res) => {
 
     const recentTurns = conversationHistoryResult.rows || [];
     const previousTurn = recentTurns[0] || null;
-    let intents = detectIntents(question, previousTurn);
+    let intents = resolveReasoningIntents(
+      question,
+      detectIntents(question, previousTurn),
+      previousTurn
+    );
 
     if (intents.includes("weekly_revenue")) {
       evidence.weeklyRevenue = await loadWeeklyRevenue({
@@ -2437,7 +2442,9 @@ app.post("/api/v1/intelligence", async (req, res) => {
       }
     }
 
-    let answer = toMerchantLanguage(sections.join("\n\n"));
+    let answer = toMerchantLanguage(
+      composeReasonedResponse({ question, intents, sections })
+    );
 
     if (!answer) {
       answer =
