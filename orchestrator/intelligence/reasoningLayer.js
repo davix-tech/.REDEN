@@ -34,6 +34,36 @@ const SEMANTIC_PATTERNS = [
     pattern: /\b(get|bring|attract)\s+more\s+(buyers|customers|orders|sales)\b|\b(turn|convert)\s+(more\s+)?visitors into (buyers|customers)\b/i,
     intents: ["growth", "traffic", "conversion"],
   },
+
+  // Merchants often describe outcomes rather than use analytics terminology.
+  {
+    pattern: /\b(store|website|shop)\b.*\b(busy|getting visitors|lots of people)\b.*\b(no one|nobody|not)\b.*\b(buying|orders|sales|purchasing)\b|\b(visitors|people)\b.*\b(browse|look around|visit)\b.*\b(but|yet)\b.*\b(no one|nobody|not)\b.*\b(buy|buying|purchase|purchasing)\b/i,
+    intents: ["diagnostic", "traffic", "purchases"],
+  },
+  {
+    pattern: /\b(people|shoppers|customers|visitors)\b.*\b(look at|view|browse)\b.*\b(products|items)\b.*\b(but|yet)\b.*\b(don.t|do not|never)\b.*\b(add|put)\b.*\b(cart|basket)\b/i,
+    intents: ["diagnostic", "product_interest", "cart"],
+  },
+  {
+    pattern: /\b(add|put)\b.*\b(cart|basket)\b.*\b(disappear|leave|go away|drop off|back out)\b.*\b(pay|payment|checkout|buy)\b|\b(cart|basket)\b.*\b(full|items)\b.*\b(no|zero)\b.*\b(order|purchase|sale)\b/i,
+    intents: ["diagnostic", "cart", "funnel"],
+  },
+  {
+    pattern: /\b(where|which step|what point)\b.*\b(give up|drop off|leave|quit|stop)\b.*\b(shop|buy|purchase|checkout|order)\b|\b(why|how come)\b.*\b(people|shoppers|customers)\b.*\b(not finishing|not completing|never complete)\b.*\b(order|purchase|checkout)\b/i,
+    intents: ["diagnostic", "funnel", "cart"],
+  },
+  {
+    pattern: /\b(which|what)\b.*\b(items|products|things)\b.*\b(moving fastest|selling fastest|getting attention|people want|popular)\b|\bwhat.s selling\b|\bwhat is moving\b/i,
+    intents: ["product_interest", "purchases"],
+  },
+  {
+    pattern: /\b(get|bring in|attract|find)\b.*\b(more|new)\b.*\b(buyers|customers|shoppers|orders)\b|\bturn more visitors into (buyers|customers)\b/i,
+    intents: ["growth", "traffic", "conversion"],
+  },
+  {
+    pattern: /\b(what|how much)\b.*\b(money|cash|sales)\b.*\b(came in|came through|brought in|we brought in)\b/i,
+    intents: ["revenue"],
+  },
 ];
 
 const ACTION_INTENTS = new Set([

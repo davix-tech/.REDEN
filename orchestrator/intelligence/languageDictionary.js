@@ -11,21 +11,21 @@ export const LANGUAGE_DICTIONARY = [
   {
     id: "revenue",
     canonical: "revenue",
-    aliases: ["turnover", "takings", "gross takings", "sales income", "money made", "money earned"],
+    aliases: ["turnover", "takings", "gross takings", "sales income", "money made", "money earned", "money coming in", "cash from sales", "sales coming in", "what we brought in"],
     meaning: "The value recorded from sales during a defined period, before subtracting business costs.",
     intent: "revenue",
   },
   {
     id: "traffic",
     canonical: "traffic",
-    aliases: ["footfall", "foot traffic", "store traffic", "site traffic", "website traffic"],
+    aliases: ["footfall", "foot traffic", "store traffic", "site traffic", "website traffic", "people visiting", "people coming to the store", "visits to my site", "store visits"],
     meaning: "Visits to a storefront. Traffic counts must distinguish sessions, people and page-view events.",
     intent: "traffic",
   },
   {
     id: "cart",
     canonical: "cart",
-    aliases: ["basket", "shopping basket", "shopping bag"],
+    aliases: ["basket", "shopping basket", "shopping bag", "shopping cart"],
     meaning: "A collection of products a shopper intends to purchase.",
     intent: "cart",
   },
@@ -39,7 +39,7 @@ export const LANGUAGE_DICTIONARY = [
   {
     id: "product-views",
     canonical: "product views",
-    aliases: ["product page views", "product-page views", "product visits"],
+    aliases: ["product page views", "product-page views", "product visits", "product browsing", "browsing products"],
     meaning: "Recorded views of product pages. These are events, not necessarily unique shoppers.",
     intent: "product_interest",
   },
