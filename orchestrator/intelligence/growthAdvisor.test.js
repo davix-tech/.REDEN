@@ -2,91 +2,51 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { composeGrowthAdvice } from "./growthAdvisor.js";
 
-test("growth advice prioritizes checkout friction when checkout events exist without purchases", () => {
-  const answer = composeGrowthAdvice({ purchaseRevenue: 370000, purchases: 0, uniqueSessions: 80, productViews: 40, addToCart: 12, checkoutStarted: 5 });
-  assert.match(answer, /370000\.00 in sales revenue/);
-  assert.match(answer, /remove checkout friction/);
-  assert.match(answer, /payment success\/failure/);
-  assert.match(answer, /contribution profit/);
-  assert.doesNotMatch(answer, /fewer than five of the previous seven days/);
-});
-
-test("growth advice prioritizes product-page improvements when product views have no cart events", () => {
-  const answer = composeGrowthAdvice({ uniqueSessions: 30, productViews: 20, addToCart: 0, checkoutStarted: 0, purchases: 0, purchaseRevenue: 0 });
-  assert.match(answer, /improve product-page purchase intent/);
-  assert.match(answer, /delivery cost and timing/);
-});
-
-test("growth advice uses a safe baseline-first plan when no events exist", () => {
+test("does not prescribe a store-specific intervention without a supported diagnosis", () => {
   const answer = composeGrowthAdvice({});
-  assert.match(answer, /establish a trustworthy baseline/);
-  assert.match(answer, /test purchase/);
-  assert.match(answer, /cannot responsibly choose/);
+  assert.match(answer, /sufficiently supported diagnosis or comparable historical baseline/i);
+  assert.doesNotMatch(answer, /run a test purchase|run a test order|offer a discount|launch a campaign/i);
 });
 
-test("growth advice never equates revenue with profit or promises uplift", () => {
-  const answer = composeGrowthAdvice({ purchaseRevenue: 370000, purchases: 1 });
-  assert.match(answer, /Revenue is not profit/);
-  assert.match(answer, /until the comparison supports it/);
+test("reports recorded revenue and purchase count without calling revenue profit", () => {
+  const answer = composeGrowthAdvice({ purchaseRevenue: 370000, purchases: 2 });
+  assert.match(answer, /370,000 in purchase revenue from 2 purchase event/i);
+  assert.match(answer, /Revenue is not profit/i);
 });
 
-
-test("growth advice prioritizes a measured funnel regression over same-day heuristics", () => {
+test("uses a measured funnel regression as the basis for a recommendation", () => {
   const answer = composeGrowthAdvice({
-    uniqueSessions: 100,
-    productViews: 50,
-    addToCart: 10,
-    checkoutStarted: 8,
     purchases: 2,
     purchaseRevenue: 500,
     funnelBaseline: {
       status: "below_baseline",
-      lowStages: ["checkout", "addToCart"],
-      current: { rates: { checkout: 0.25, addToCart: 0.2 } },
-      averages: { checkout: 0.6, addToCart: 0.35 }
+      lowStages: ["checkout"],
+      current: { rates: { checkout: 0.25 } },
+      averages: { checkout: 0.6 }
     }
   });
+  assert.match(answer, /Evidence-backed priority/i);
   assert.match(answer, /cart-to-checkout progression/i);
   assert.match(answer, /25.0% versus 60.0% in comparable periods/);
-  assert.match(answer, /shipping costs and delivery details/);
 });
 
-
-test("growth advice prioritizes a measured funnel regression over same-day heuristics", () => {
+test("does not convert small same-day samples into arbitrary commercial advice", () => {
   const answer = composeGrowthAdvice({
-    uniqueSessions: 100,
-    productViews: 50,
-    addToCart: 10,
-    checkoutStarted: 8,
-    purchases: 2,
-    purchaseRevenue: 500,
-    funnelBaseline: {
-      status: "below_baseline",
-      lowStages: ["checkout", "addToCart"],
-      current: { rates: { checkout: 0.25, addToCart: 0.2 } },
-      averages: { checkout: 0.6, addToCart: 0.35 }
-    }
-  });
-  assert.match(answer, /cart-to-checkout progression/i);
-  assert.match(answer, /25.0% versus 60.0% in comparable periods/);
-  assert.match(answer, /shipping costs and delivery details/);
-});
-
-
-test("growth advice asks to validate ambiguous zero-event stages before recommending commercial changes", () => {
-  const answer = composeGrowthAdvice({
-    uniqueSessions: 20,
-    productViews: 0,
+    uniqueSessions: 30,
+    productViews: 20,
     addToCart: 0,
     checkoutStarted: 0,
     purchases: 0,
-    funnelBaseline: {
-      status: "available",
-      trackingValidationStages: ["productView", "addToCart", "checkout", "purchase"],
-      lowStages: []
-    }
+    purchaseRevenue: 0
   });
-  assert.match(answer, /missing tracking/i);
-  assert.match(answer, /real drop-off or missing tracking/i);
-  assert.match(answer, /before changing ads, prices or discounts/i);
+  assert.match(answer, /do not establish which intervention will improve sales/i);
+  assert.doesNotMatch(answer, /improve product-page purchase intent|test a relevant product bundle/i);
+});
+
+
+test("does not report missing purchase revenue as zero", () => {
+  const answer = composeGrowthAdvice({ purchases: 2, purchaseRevenue: null });
+  assert.match(answer, /2 purchase event/i);
+  assert.match(answer, /purchase revenue is unavailable/i);
+  assert.doesNotMatch(answer, /purchase revenue is 0/i);
 });

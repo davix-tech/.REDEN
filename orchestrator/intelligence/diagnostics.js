@@ -19,7 +19,7 @@ function count(value) {
 const STAGES = {
   productView: {
     label: "product-page discovery",
-    action: "Check landing-page relevance, navigation, product availability and PRODUCT_VIEW tracking.",
+    action: "Inspect PAGE_VIEW and PRODUCT_VIEW event-delivery logs and records, then check landing-page relevance, navigation and product availability.",
   },
   addToCart: {
     label: "product-to-cart progression",
@@ -31,7 +31,7 @@ const STAGES = {
   },
   purchase: {
     label: "checkout-to-purchase completion",
-    action: "Test mobile checkout, payment failures, shipping fees and purchase-event delivery.",
+    action: "Inspect checkout completion records and payment-provider failure logs before attributing the gap to checkout friction.",
   },
 };
 
@@ -65,15 +65,15 @@ export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
   if (Array.isArray(funnel.trackingValidationStages) && funnel.trackingValidationStages.length) {
     const stage = DOWNSTREAM_FIRST.find((candidate) => funnel.trackingValidationStages.includes(candidate))
       || funnel.trackingValidationStages[0];
-    return `REDEN sees upstream visits but no recorded ${stageLabel(stage)} events. This could be a real drop-off or missing tracking. ${STAGES[stage]?.action || "Run a test journey and verify the event reaches REDEN."} Do this before changing ads, prices or discounts.`;
+    return `REDEN sees upstream visits but no recorded ${stageLabel(stage)} events. This could be a real drop-off or missing tracking. ${STAGES[stage]?.action || "inspect the relevant SDK event-delivery logs and confirm whether the event is being received."} Do this before changing ads, prices or discounts.`;
   }
 
   if (revenueBaseline.status === "purchase_summary_mismatch") {
-    return "Purchase events and purchased-session records do not agree, so the revenue comparison is not reliable. Run a test order and verify that the PURCHASE event and purchased session are both recorded before changing ads or offers.";
+    return "Purchase events and purchased-session records do not agree, so the revenue comparison is not reliable. inspect the underlying purchase-event and session records before treating this comparison as reliable.";
   }
 
   if (revenueBaseline.status === "purchase_tracking_unconfirmed") {
-    return "REDEN has no confirmed purchase event for this period. That could mean no orders or missing purchase tracking. Run a test order first; if tracking works, check visits, add-to-cart activity and checkout to find where shoppers stop before increasing ad spend.";
+    return "REDEN has no confirmed purchase event for this period. That could mean no orders or missing purchase tracking. inspect purchase-event delivery and order records first. Until tracking is confirmed, REDEN cannot distinguish zero orders from missing purchase data.";
   }
 
   if (traffic.status === "below_baseline") {
@@ -85,7 +85,7 @@ export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
     const funnelStage = DOWNSTREAM_FIRST.find((stage) => Array.isArray(funnel.lowStages) && funnel.lowStages.includes(stage));
     const conversionNote = funnelStage
       ? ` REDEN also flags ${stageLabel(funnelStage)}; investigate that step if visits recover but purchases do not.`
-      : " First confirm the storefront is reachable and PAGE_VIEW tracking works.";
+      : " Check recorded storefront availability and PAGE_VIEW delivery before attributing the decline to acquisition.";
     return `Fewer people are visiting your store than usual${comparison}, so fewer potential buyers are entering the funnel. Check ad delivery, traffic sources and broken links; if tracking is healthy, test a targeted campaign for qualified shoppers.${conversionNote}`;
   }
 

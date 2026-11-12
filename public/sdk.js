@@ -8,6 +8,7 @@
   const MAX_SITE_ID_LENGTH = 200;
   const MAX_API_KEY_LENGTH = 500;
   const MAX_SESSION_ID_LENGTH = 128;
+  const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
   const MAX_SELECTOR_LENGTH = 300;
   const MAX_CLASS_LENGTH = 100;
   const MAX_VALUE_LENGTH = 2000;
@@ -152,7 +153,10 @@
     }
 
     try {
-      localStorage.setItem(config.sessionKey, id);
+      localStorage.setItem(
+        config.sessionKey,
+        JSON.stringify({ id, lastSeenAt: now() })
+      );
     } catch {
       // Storage can be unavailable in privacy-restricted browsers.
     }
@@ -160,24 +164,41 @@
 
   function getStoredSession() {
     try {
-      const value = localStorage.getItem(config.sessionKey);
+      const raw = localStorage.getItem(config.sessionKey);
+      if (!raw) return null;
 
-      return isValidSessionId(value) ? value : null;
+      // Legacy plain-string IDs have no reliable activity timestamp.
+      // Start a fresh session rather than reusing them indefinitely.
+      let stored;
+      try {
+        stored = JSON.parse(raw);
+      } catch {
+        return null;
+      }
+
+      if (
+        !stored ||
+        !isValidSessionId(stored.id) ||
+        !Number.isFinite(stored.lastSeenAt)
+      ) {
+        return null;
+      }
+
+      const inactiveFor = now() - stored.lastSeenAt;
+      if (inactiveFor < 0 || inactiveFor >= SESSION_TIMEOUT_MS) {
+        return null;
+      }
+
+      return stored.id;
     } catch {
       return null;
     }
   }
 
   function ensureSession() {
-    let sid = getStoredSession();
-
-    if (!sid) {
-      sid = uuid();
-      persistSession(sid);
-    }
-
+    const sid = getStoredSession() || uuid();
+    persistSession(sid);
     state.sessionId = sid;
-
     return sid;
   }
 
