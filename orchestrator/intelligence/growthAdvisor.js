@@ -6,10 +6,15 @@ import { diagnoseSales } from "./diagnostics.js";
  * a particular commercial intervention will help.
  */
 export function composeGrowthAdvice(evidence = {}) {
-  const purchases = Number(evidence.purchases);
-  const revenue = Number(evidence.purchaseRevenue);
-  const hasPurchaseCount = Number.isFinite(purchases);
-  const hasRevenue = Number.isFinite(revenue);
+  const numericEvidence = (value) => {
+    if (value === null || value === undefined || value === "") return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const purchases = numericEvidence(evidence.purchases);
+  const revenue = numericEvidence(evidence.purchaseRevenue);
+  const hasPurchaseCount = purchases !== null;
+  const hasRevenue = revenue !== null;
   const lines = [];
 
   if (hasPurchaseCount || hasRevenue) {
