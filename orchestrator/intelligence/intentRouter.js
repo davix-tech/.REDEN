@@ -16,7 +16,7 @@ export function detectIntents(question, previousTurn = null) {
 
   // Keep plain-language period revenue questions focused on the revenue
   // answer instead of appending a generic overview because "today" is present.
-  if (/\\bhow much\\b.*\\brevenue\\b.*\\b(came in|came through|brought in|made|earned)\\b/.test(q)) {
+  if (/\bhow much\b.*\brevenue\b.*\b(came in|came through|brought in|made|earned)\b/.test(q)) {
     return ["revenue"];
   }
 
