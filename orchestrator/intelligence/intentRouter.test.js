@@ -172,3 +172,8 @@ test("routes next-best-action questions to evidence-aware prioritization", () =>
 test("keeps the purchase-intent definition in reviewed commerce knowledge", () => {
   assert.deepEqual(detectIntents("What is purchase intent?"), ["commerce_knowledge"]);
 });
+
+test("routes everyday sales and traffic wording through the language dictionary", () => {
+  assert.deepEqual(detectIntents("How much cash from sales came in today?"), ["revenue"]);
+  assert.deepEqual(detectIntents("How many people visited my store today?"), ["traffic", "overview"]);
+});
