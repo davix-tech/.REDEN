@@ -68,3 +68,33 @@ test("deduplicates repeated sections and admits when evidence is unavailable", (
   );
   assert.match(composeReasonedResponse({ sections: [] }), /don't have enough reliable store evidence/);
 });
+
+
+test("understands everyday descriptions of store performance without analytics terms", () => {
+  assert.deepEqual(
+    resolveReasoningIntents("My shop is busy but nobody is buying"),
+    ["diagnostic", "traffic", "purchases"]
+  );
+  assert.deepEqual(
+    resolveReasoningIntents("People look at products but don't put anything in the basket"),
+    ["diagnostic", "product_interest", "cart"]
+  );
+});
+
+test("understands checkout drop-off described as shoppers disappearing before payment", () => {
+  assert.deepEqual(
+    resolveReasoningIntents("People add items to their basket then disappear before paying"),
+    ["diagnostic", "cart", "funnel"]
+  );
+});
+
+test("understands product demand and customer acquisition in ordinary language", () => {
+  assert.deepEqual(
+    resolveReasoningIntents("Which items are moving fastest?"),
+    ["product_interest", "purchases"]
+  );
+  assert.deepEqual(
+    resolveReasoningIntents("How do I bring in more buyers?"),
+    ["growth", "traffic", "conversion"]
+  );
+});
