@@ -19,7 +19,7 @@ function count(value) {
 const STAGES = {
   productView: {
     label: "product-page discovery",
-    action: "Inspect PAGE_VIEW and PRODUCT_VIEW delivery records, then check landing-page relevance, navigation and product availability.",
+    action: "Inspect PAGE_VIEW and PRODUCT_VIEW event-delivery logs and records, then check landing-page relevance, navigation and product availability.",
   },
   addToCart: {
     label: "product-to-cart progression",
