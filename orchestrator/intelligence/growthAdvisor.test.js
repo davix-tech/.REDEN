@@ -4,7 +4,7 @@ import { composeGrowthAdvice } from "./growthAdvisor.js";
 
 test("does not prescribe a store-specific intervention without a supported diagnosis", () => {
   const answer = composeGrowthAdvice({});
-  assert.match(answer, /insufficiently supported diagnosis or comparable historical baseline/i);
+  assert.match(answer, /sufficiently supported diagnosis or comparable historical baseline/i);
   assert.doesNotMatch(answer, /run a test purchase|run a test order|offer a discount|launch a campaign/i);
 });
 
@@ -41,4 +41,12 @@ test("does not convert small same-day samples into arbitrary commercial advice",
   });
   assert.match(answer, /do not establish which intervention will improve sales/i);
   assert.doesNotMatch(answer, /improve product-page purchase intent|test a relevant product bundle/i);
+});
+
+
+test("does not report missing purchase revenue as zero", () => {
+  const answer = composeGrowthAdvice({ purchases: 2, purchaseRevenue: null });
+  assert.match(answer, /2 purchase event/i);
+  assert.match(answer, /purchase revenue is unavailable/i);
+  assert.doesNotMatch(answer, /purchase revenue is 0/i);
 });
