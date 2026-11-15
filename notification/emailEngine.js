@@ -616,12 +616,7 @@ export async function sendDailyReport({
    WELCOME EMAIL
 ───────────────────────────────────────────── */
 
-export async function sendWelcomeEmail({
-  to,
-  siteId,
-  apiKey,
-  plan = "basic",
-}) {
+export async function sendWelcomeEmail({ to }) {
   const html = `
     <div style="margin:0;padding:32px 20px;background:#ffffff;color:#242424;font-family:Arial,Helvetica,sans-serif;">
       <div style="max-width:560px;margin:0 auto;font-size:15px;line-height:1.75;">
@@ -630,7 +625,7 @@ export async function sendWelcomeEmail({
         <p style="margin:0 0 18px;">Hello,</p>
 
         <h1 style="margin:0 0 20px;font-size:25px;line-height:1.3;font-weight:600;color:#171717;">
-          Congratulations on taking this step for your business.
+          Congratulations on taking this step for your business. 🎊
         </h1>
 
         <p style="margin:0 0 16px;">
@@ -647,12 +642,6 @@ export async function sendWelcomeEmail({
 
         <p style="margin:0 0 4px;">Welcome aboard,</p>
         <p style="margin:0 0 28px;font-weight:600;color:#171717;">The REDEN Team</p>
-
-        <div style="padding-top:18px;border-top:1px solid #e8e8e8;color:#777777;font-size:12px;line-height:1.7;">
-          <p style="margin:0 0 8px;">Your account details</p>
-          <p style="margin:0;">Site ID: <span style="color:#333333;">${escapeHtml(siteId)}</span></p>
-          <p style="margin:0;">API key: <span style="color:#333333;word-break:break-all;">${escapeHtml(apiKey)}</span></p>
-        </div>
 
         <p style="margin:24px 0 0;color:#999999;font-size:12px;">REDEN by PRETHIM</p>
       </div>
