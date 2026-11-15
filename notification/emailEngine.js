@@ -16,7 +16,7 @@ export async function sendEmail({
 }) {
   try {
     const response = await resend.emails.send({
-      from: from || "REDEN <noreply@dcore.name.ng>",
+      from: from || "REDEN <noreply@prethim.site>",
       to,
       subject,
       html,
