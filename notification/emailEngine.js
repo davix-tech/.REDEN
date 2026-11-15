@@ -622,147 +622,47 @@ export async function sendWelcomeEmail({
   apiKey,
   plan = "basic",
 }) {
+  const html = `
+    <div style="margin:0;padding:32px 20px;background:#ffffff;color:#242424;font-family:Arial,Helvetica,sans-serif;">
+      <div style="max-width:560px;margin:0 auto;font-size:15px;line-height:1.75;">
+        <p style="margin:0 0 24px;color:#777777;font-size:13px;letter-spacing:0.04em;">REDEN</p>
+
+        <p style="margin:0 0 18px;">Hello,</p>
+
+        <h1 style="margin:0 0 20px;font-size:25px;line-height:1.3;font-weight:600;color:#171717;">
+          Congratulations on taking this step for your business.
+        </h1>
+
+        <p style="margin:0 0 16px;">
+          Welcome to REDEN. Your account is ready, and we're glad you've chosen to bring a clearer understanding of your store's activity into the way you run your business.
+        </p>
+
+        <p style="margin:0 0 16px;">
+          As REDEN begins receiving activity from your store, it will help you make sense of what is happening across your commerce journey — from customer visits and buying behaviour to sales and opportunities that deserve your attention.
+        </p>
+
+        <p style="margin:0 0 24px;">
+          Building a business takes good decisions, and better decisions start with better understanding. We're looking forward to being part of that journey.
+        </p>
+
+        <p style="margin:0 0 4px;">Welcome aboard,</p>
+        <p style="margin:0 0 28px;font-weight:600;color:#171717;">The REDEN Team</p>
+
+        <div style="padding-top:18px;border-top:1px solid #e8e8e8;color:#777777;font-size:12px;line-height:1.7;">
+          <p style="margin:0 0 8px;">Your account details</p>
+          <p style="margin:0;">Site ID: <span style="color:#333333;">${escapeHtml(siteId)}</span></p>
+          <p style="margin:0;">API key: <span style="color:#333333;word-break:break-all;">${escapeHtml(apiKey)}</span></p>
+        </div>
+
+        <p style="margin:24px 0 0;color:#999999;font-size:12px;">REDEN by PRETHIM</p>
+      </div>
+    </div>
+  `;
+
   return sendEmail({
     to,
-    subject: "Your REDEN Infrastructure Is Ready",
-    html: `
-      <div
-        style="
-          background:#05070b;
-          color:#ffffff;
-          padding:40px;
-          font-family:Inter,Arial,sans-serif;
-        "
-      >
-        <div style="max-width:680px;margin:0 auto;">
-
-          <h1
-            style="
-              font-size:32px;
-              margin-bottom:10px;
-              letter-spacing:-0.04em;
-            "
-          >
-            REDEN Operational
-          </h1>
-
-          <p
-            style="
-              color:#9ca3af;
-              line-height:1.7;
-            "
-          >
-            Your REDEN infrastructure has been provisioned
-            successfully under the
-            <strong>${escapeHtml(plan)}</strong> tier.
-          </p>
-
-          <div
-            style="
-              margin-top:30px;
-              padding:20px;
-              border:1px solid #1f2937;
-              border-radius:14px;
-              background:#0b0f17;
-            "
-          >
-            <p style="margin:0 0 5px;color:#9ca3af;">
-              <strong>Site ID</strong>
-            </p>
-
-            <code
-              style="
-                color:#38bdf8;
-                font-family:monospace;
-                font-size:14px;
-              "
-            >
-              ${escapeHtml(siteId)}
-            </code>
-
-            <br /><br />
-
-            <p style="margin:0 0 5px;color:#9ca3af;">
-              <strong>API Key</strong>
-            </p>
-
-            <code
-              style="
-                color:#34d399;
-                font-family:monospace;
-                font-size:14px;
-              "
-            >
-              ${escapeHtml(apiKey)}
-            </code>
-          </div>
-
-          <div style="margin-top:30px;">
-            <p style="color:#9ca3af;">
-              SDK Integration Code:
-            </p>
-
-            <pre
-              style="
-                background:#0b0f17;
-                padding:15px;
-                border:1px solid #1f2937;
-                border-radius:8px;
-                overflow-x:auto;
-              "
-            ><code
-              style="
-                color:#e2e8f0;
-                font-size:12px;
-              "
-            >&lt;script
-  src="https://api.dcore.name.ng/sdk.js"
-  data-site-id="${escapeHtml(siteId)}"
-  data-api-key="${escapeHtml(apiKey)}"
-&gt;&lt;/script&gt;</code></pre>
-          </div>
-
-          <div
-            style="
-              margin-top:40px;
-              border-top:1px solid #1f2937;
-              padding-top:30px;
-            "
-          >
-            <h3
-              style="
-                font-size:18px;
-                color:#ffffff;
-              "
-            >
-              What to do next
-            </h3>
-
-            <ol
-              style="
-                color:#9ca3af;
-                line-height:1.8;
-              "
-            >
-              <li>
-                Install the REDEN SDK on your website.
-              </li>
-
-              <li>
-                Load the website and allow REDEN to
-                verify the first telemetry event.
-              </li>
-
-              <li>
-                Connect checkout events so REDEN can
-                understand purchase intent and outcomes.
-              </li>
-            </ol>
-          </div>
-
-        </div>
-      </div>
-    `,
+    subject: "Welcome to REDEN — congratulations on your next step",
+    html,
   });
 }
 
