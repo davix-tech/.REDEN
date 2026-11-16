@@ -3392,6 +3392,17 @@ cron.schedule(
   }
 );
 
+function buildMerchantBriefObservation(metrics, period) {
+  const {total:visits,productViews:views,addToCarts:carts,checkoutStarts:checkouts,conversions:purchases,revenue,currency}=metrics;
+  const sales=Number.isFinite(revenue)?(currency?new Intl.NumberFormat("en",{style:"currency",currency,maximumFractionDigits:2}).format(revenue):revenue.toLocaleString("en",{maximumFractionDigits:2})+" (currency not provided)"):"unavailable";
+  if(!visits)return {title:`REDEN did not record store visits for ${period}`,summary:"No page-view sessions were recorded. This may mean the store received no visits, or that tracking did not capture them. The available data cannot distinguish between those explanations.",recommendation:"Open your storefront and confirm that the REDEN installation is active and recording page views before drawing conclusions about demand."};
+  if(!views)return {title:"Visitors arrived, but no product views were recorded",summary:`REDEN recorded ${visits.toLocaleString()} visiting sessions, but no product views for ${period}.`,why_it_matters:"The recorded activity shows visitors reaching the store without a recorded product-page view. There is not enough evidence to tell whether shoppers found the products they wanted or whether product-view tracking is missing.",recommendation:"Review how visitors reach product listings and confirm that product pages send PRODUCT_VIEW events."};
+  if(!carts)return {title:"Shoppers viewed products, but no items were added to carts",summary:`The store recorded ${views.toLocaleString()} product views, but no add-to-cart events for ${period}.`,why_it_matters:"Product discovery is happening, but the recorded journey does not show shoppers progressing to a cart. Product fit, pricing, product information or event tracking may be contributing factors; the data does not identify which.",recommendation:"Review the most-viewed product pages, prices, availability and add-to-cart functionality. Confirm that ADD_TO_CART events are being tracked."};
+  if(!checkouts)return {title:"Items were added to carts, but no checkout starts were recorded",summary:`REDEN recorded ${carts.toLocaleString()} add-to-cart events, but no checkout starts for ${period}.`,why_it_matters:"Shoppers showed buying interest, but the recorded journey did not progress to checkout. Cart costs, delivery information, account requirements or checkout tracking may be contributing factors.",recommendation:"Review the cart-to-checkout journey, including delivery charges and unexpected fees. Confirm that CHECKOUT_STARTED events are being recorded."};
+  if(!purchases)return {title:"Checkout activity was recorded, but no purchases were completed",summary:`REDEN recorded ${checkouts.toLocaleString()} checkout starts and ${carts.toLocaleString()} add-to-cart events, but no purchases for ${period}.`,why_it_matters:"Shoppers reached checkout, but no completed purchase was recorded. Payment failures, checkout friction or missing purchase events could explain the gap; the available data does not establish the cause.",recommendation:"Test the full checkout and payment process, and confirm that successful orders trigger PURCHASE events."};
+  return {title:`Your store recorded ${purchases.toLocaleString()} purchase${purchases===1?"":"s"} for ${period}`,summary:`REDEN recorded ${visits.toLocaleString()} visiting sessions, ${views.toLocaleString()} product views, ${carts.toLocaleString()} add-to-cart events, ${checkouts.toLocaleString()} checkout starts and ${purchases.toLocaleString()} purchases. Recorded sales: ${sales}.`,why_it_matters:"The recorded events show activity across the shopping journey. Comparing these stages over time can reveal where more shoppers progress or drop off; one reporting period alone does not establish a trend.",recommendation:"Keep the product, cart and checkout journey working smoothly. Compare the next report with this one to see whether purchase activity and the steps leading to it are increasing or declining."};
+}
+
 /* =========================================================
    TWICE-DAILY MERCHANT REPORTS
    Morning covers yesterday; evening covers today so far.
@@ -3461,13 +3472,163 @@ cron.schedule("* * * * *", async () => {
                   NULLIF(payload->>'orderTotal',''), NULLIF(payload->>'amount',''),
                   NULLIF(payload->>'cart_value',''), NULLIF(payload->>'cartValue',''),
                   NULLIF(payload #>> '{cart,value}','')
-                ) AS amount_text
+                ) AS amount_text,
+                UPPER(COALESCE(NULLIF(payload->>'currency',''),NULLIF(payload->>'currency_code',''),NULLIF(payload->>'currencyCode',''),NULLIF(payload #>> '{cart,currency}',''))) AS currency_text
               FROM events WHERE event = 'PURCHASE'
             ),
             priced AS (
               SELECT session_id,
-                CASE WHEN amount_text ~ '^[0-9]+([.][0-9]+)?$'
-                  THEN amount_text::NUMERIC ELSE NULL END AS amount
+                CASE WHEN amount_text ~ '^[0-9]+([.][0-9]+)?
+            )
+            SELECT
+              (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
+              (SELECT COUNT(*)::INTEGER FROM events WHERE event='PRODUCT_VIEW') AS product_views,
+              (SELECT COUNT(*)::INTEGER FROM events WHERE event='ADD_TO_CART') AS add_to_carts,
+              (SELECT COUNT(*)::INTEGER FROM events WHERE event='CHECKOUT_STARTED') AS checkout_starts,
+              (SELECT COUNT(*)::INTEGER FROM priced) AS purchases,
+              COALESCE(SUM(amount),0)::NUMERIC AS revenue,
+              COUNT(amount)::INTEGER AS priced_purchases,
+              MAX(NULLIF(currency_text,'')) AS currency
+            FROM priced
+          `, [site.site_id, period.startUTC, period.endUTC]);
+
+          const row=result.rows[0]||{};
+          const visits=Number(row.visits||0),productViews=Number(row.product_views||0),addToCarts=Number(row.add_to_carts||0),checkoutStarts=Number(row.checkout_starts||0),purchases=Number(row.purchases||0);
+          const revenueAvailable=Number(row.priced_purchases||0)>0;
+          const revenue=revenueAvailable?Number(row.revenue||0):null;
+          const currency=typeof row.currency==="string"&&/^[A-Z]{3}$/.test(row.currency)?row.currency:null;
+          const periodName=morning?"yesterday":"today";
+          const metrics={total:visits,productViews,addToCarts,checkoutStarts,conversions:purchases,revenue,currency};
+          const intelligence=[{priority:visits>0&&purchases===0?"high":"normal",...buildMerchantBriefObservation(metrics,periodName)}];
+
+          const send = morning ? sendMorningReport : sendEveningReport;
+          const sentResult = await send({
+            to: site.owner_email,
+            merchantName: site.name,
+            metrics,
+            intelligence
+          });
+
+          if (!sentResult?.ok) {
+            console.error("[MERCHANT REPORT DELIVERY FAILED]", {
+              siteId: site.site_id, type, error: sentResult?.error
+            });
+            continue;
+          }
+
+          await client.query(`
+            INSERT INTO email_logs (site_id, type, status, created_at)
+            VALUES ($1, $2, 'SENT', NOW())
+          `, [site.site_id, type]);
+        } catch (siteError) {
+          console.error("[MERCHANT REPORT SITE ERROR]", {
+            siteId: site.site_id, error: siteError
+          });
+        }
+      }
+    } finally {
+      await client.query(
+        "SELECT pg_advisory_unlock(hashtext('reden_twice_daily_reports'))"
+      );
+    }
+  } catch (error) {
+    console.error("[TWICE-DAILY REPORT CRON ERROR]", error);
+  } finally {
+    client.release();
+  }
+}, { timezone: "UTC" });
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+
+                  THEN amount_text::NUMERIC ELSE NULL END AS amount,
+                currency_text
               FROM purchases
             )
             SELECT
