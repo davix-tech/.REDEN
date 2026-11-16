@@ -1113,6 +1113,7 @@ function composeIntent(intent, evidence, site, question = "", recentTurns = [], 
 const ADMIN_ROUTES = new Set([
   "/api/v1/intelligence",
   "/api/v1/onboard",
+  "/api/v1/name-availability",
 ]);
 
 async function authenticate(req, res, next) {
@@ -1420,6 +1421,50 @@ app.get("/health", async (req, res) => {
 });
 
 /* =========================================================
+   STOREFRONT NAME AVAILABILITY
+========================================================= */
+
+app.post("/api/v1/name-availability", async (req, res) => {
+  const name = normalizeString(req.body?.name, 255);
+  const ownerEmail = normalizeEmail(req.body?.owner_email);
+
+  if (!name || !ownerEmail) {
+    return failure(res, 400, "name and owner_email are required");
+  }
+
+  try {
+    const result = await db.query(
+      `
+        SELECT
+          EXISTS (
+            SELECT 1 FROM sites
+            WHERE LOWER(name) = LOWER($1)
+              AND LOWER(owner_email) = LOWER($2)
+          ) AS owned_by_requester,
+          EXISTS (
+            SELECT 1 FROM sites
+            WHERE LOWER(name) = LOWER($1)
+              AND LOWER(owner_email) IS DISTINCT FROM LOWER($2)
+          ) AS used_by_another_owner
+      `,
+      [name, ownerEmail]
+    );
+
+    const row = result.rows[0] || {};
+    const taken = row.used_by_another_owner === true;
+
+    return success(res, {
+      available: !taken,
+      existing: row.owned_by_requester === true,
+      reason: taken ? "name_taken" : null,
+    });
+  } catch (error) {
+    console.error("[NAME AVAILABILITY ERROR]", error);
+    return failure(res, 500, "Unable to check storefront name availability");
+  }
+});
+
+/* =========================================================
    ONBOARD
 ========================================================= */
 
@@ -1442,12 +1487,9 @@ app.post("/api/v1/onboard", async (req, res) => {
 
     await client.query(
       `
-        SELECT pg_advisory_xact_lock(
-          hashtext($1),
-          hashtext($2)
-        )
+        SELECT pg_advisory_xact_lock(hashtext($1))
       `,
-      [ownerEmail, name.toLowerCase()]
+      [name.toLowerCase()]
     );
 
     const existing = await client.query(
@@ -1478,6 +1520,22 @@ app.post("/api/v1/onboard", async (req, res) => {
         existing: true,
         site: existing.rows[0],
       });
+    }
+
+    const nameConflict = await client.query(
+      `
+        SELECT 1
+        FROM sites
+        WHERE LOWER(name) = LOWER($1)
+          AND LOWER(owner_email) IS DISTINCT FROM LOWER($2)
+        LIMIT 1
+      `,
+      [name, ownerEmail]
+    );
+
+    if (nameConflict.rowCount) {
+      await client.query("ROLLBACK");
+      return failure(res, 409, "This storefront name is already in use. Choose another name.");
     }
 
     const siteId = generateSiteId();
