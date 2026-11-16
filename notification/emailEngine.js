@@ -20,7 +20,7 @@ export async function sendEmail({
       to,
       subject,
       html,
-      reply_to: replyTo || "redenbydcore@gmail.com",
+      ...(replyTo ? { reply_to: replyTo } : {}),
     });
 
     if (response.error) {
@@ -72,326 +72,48 @@ function formatNumber(value) {
   return Number(value || 0).toLocaleString();
 }
 
-function formatMoney(value) {
-  if (value === null || value === undefined || value === "") {
-    return "Not available";
+function formatMoney(value, currency) {
+  if (value === null || value === undefined || value === "") return "Not available";
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "Not available";
+  if (typeof currency === "string" && /^[A-Z]{3}$/.test(currency)) {
+    try { return new Intl.NumberFormat("en", {style:"currency",currency,maximumFractionDigits:2}).format(amount); } catch {}
   }
-
-  return Number(value).toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+  return `${amount.toLocaleString("en",{minimumFractionDigits:2,maximumFractionDigits:2})} (currency not provided)`;
 }
 
 /* ─────────────────────────────────────────────
    REDEN EMAIL SHELL
 ───────────────────────────────────────────── */
 
-function emailShell({
-  merchantName,
-  eyebrow,
-  title,
-  intro,
-  content,
-}) {
-  return `
-    <div
-      style="
-        background:#05070b;
-        color:#ffffff;
-        padding:40px 24px;
-        font-family:Inter,Arial,sans-serif;
-      "
-    >
-      <div
-        style="
-          max-width:680px;
-          margin:0 auto;
-        "
-      >
-
-        <div
-          style="
-            font-size:12px;
-            letter-spacing:0.12em;
-            text-transform:uppercase;
-            color:#6b7280;
-            margin-bottom:18px;
-          "
-        >
-          ${escapeHtml(eyebrow || "REDEN")}
-        </div>
-
-        <h1
-          style="
-            font-size:30px;
-            line-height:1.15;
-            letter-spacing:-0.04em;
-            margin:0 0 12px 0;
-          "
-        >
-          ${escapeHtml(title)}
-        </h1>
-
-        ${
-          merchantName
-            ? `
-              <p
-                style="
-                  color:#6b7280;
-                  margin:0 0 22px 0;
-                  font-size:14px;
-                "
-              >
-                ${escapeHtml(merchantName)}
-              </p>
-            `
-            : ""
-        }
-
-        ${
-          intro
-            ? `
-              <p
-                style="
-                  color:#a1a1aa;
-                  line-height:1.75;
-                  font-size:15px;
-                  margin:0 0 28px 0;
-                "
-              >
-                ${intro}
-              </p>
-            `
-            : ""
-        }
-
-        ${content}
-
-        <div
-          style="
-            margin-top:40px;
-            padding-top:20px;
-            border-top:1px solid #1f2937;
-            color:#52525b;
-            font-size:12px;
-            line-height:1.6;
-          "
-        >
-          REDEN by DCORE<br />
-          Recorded sales intelligence infrastructure
-        </div>
-
-      </div>
-    </div>
-  `;
+function emailShell({ merchantName, eyebrow, title, intro, content }) {
+  return `<div style="margin:0;padding:28px 18px;background:#ffffff;color:#202124;font-family:Arial,Helvetica,sans-serif;"><div style="max-width:640px;margin:0 auto;font-size:15px;line-height:1.7;">
+    <p style="margin:0 0 18px;color:#555;font-size:12px;letter-spacing:.04em;text-transform:uppercase;">${escapeHtml(eyebrow||"REDEN")}</p>
+    <h1 style="margin:0 0 8px;color:#171717;font-size:25px;line-height:1.3;font-weight:600;">${escapeHtml(title)}</h1>
+    ${merchantName?`<p style="margin:0 0 20px;color:#666;">${escapeHtml(merchantName)}</p>`:""}
+    ${intro?`<p style="margin:0 0 24px;color:#333;">${intro}</p>`:""}
+    ${content}
+    <p style="margin:30px 0 0;padding-top:16px;border-top:1px solid #e5e5e5;color:#666;font-size:12px;">REDEN by PRETHIM<br/>Adaptive commerce intelligence</p>
+  </div></div>`;
 }
 
-/* ─────────────────────────────────────────────
-   INTELLIGENCE CARD
-───────────────────────────────────────────── */
-
-function intelligenceCard(item) {
-  const priority = item?.priority || "normal";
-
-  const priorityLabel = {
-    critical: "Requires attention",
-    high: "Worth your attention",
-    normal: "REDEN noticed",
-    low: "Observation",
-  }[priority] || "REDEN noticed";
-
-  return `
-    <div
-      style="
-        margin-bottom:18px;
-        padding:24px;
-        background:#0b0f17;
-        border:1px solid #1f2937;
-        border-radius:14px;
-      "
-    >
-
-      <div
-        style="
-          font-size:11px;
-          letter-spacing:0.08em;
-          text-transform:uppercase;
-          color:#6b7280;
-          margin-bottom:10px;
-        "
-      >
-        ${escapeHtml(priorityLabel)}
-      </div>
-
-      <h2
-        style="
-          margin:0 0 12px 0;
-          font-size:19px;
-          line-height:1.35;
-          letter-spacing:-0.02em;
-        "
-      >
-        ${escapeHtml(toMerchantLanguage(item?.title || "REDEN noticed something."))}
-      </h2>
-
-      ${
-        item?.summary
-          ? `
-            <p
-              style="
-                color:#d4d4d8;
-                line-height:1.7;
-                margin:0 0 18px 0;
-                font-size:14px;
-              "
-            >
-              ${escapeHtml(toMerchantLanguage(item.summary))}
-            </p>
-          `
-          : ""
-      }
-
-      ${
-        item?.why_it_matters
-          ? `
-            <div style="margin-top:16px;">
-              <div
-                style="
-                  color:#71717a;
-                  font-size:11px;
-                  text-transform:uppercase;
-                  letter-spacing:0.08em;
-                  margin-bottom:6px;
-                "
-              >
-                Why it matters
-              </div>
-
-              <div
-                style="
-                  color:#a1a1aa;
-                  line-height:1.6;
-                  font-size:13px;
-                "
-              >
-                ${escapeHtml(toMerchantLanguage(item.why_it_matters))}
-              </div>
-            </div>
-          `
-          : ""
-      }
-
-      ${
-        item?.likely_cause
-          ? `
-            <div style="margin-top:16px;">
-              <div
-                style="
-                  color:#71717a;
-                  font-size:11px;
-                  text-transform:uppercase;
-                  letter-spacing:0.08em;
-                  margin-bottom:6px;
-                "
-              >
-                What REDEN thinks is happening
-              </div>
-
-              <div
-                style="
-                  color:#a1a1aa;
-                  line-height:1.6;
-                  font-size:13px;
-                "
-              >
-                ${escapeHtml(toMerchantLanguage(item.likely_cause))}
-              </div>
-            </div>
-          `
-          : ""
-      }
-
-      ${
-        item?.recommendation
-          ? `
-            <div
-              style="
-                margin-top:20px;
-                padding:16px;
-                background:#080b11;
-                border:1px dashed #374151;
-                border-radius:10px;
-              "
-            >
-              <div
-                style="
-                  color:#71717a;
-                  font-size:11px;
-                  text-transform:uppercase;
-                  letter-spacing:0.08em;
-                  margin-bottom:7px;
-                "
-              >
-                REDEN recommends
-              </div>
-
-              <div
-                style="
-                  color:#ffffff;
-                  line-height:1.6;
-                  font-size:13px;
-                "
-              >
-                ${escapeHtml(toMerchantLanguage(item.recommendation))}
-              </div>
-            </div>
-          `
-          : ""
-      }
-
-    </div>
-  `;
+function intelligenceText(item) {
+  const title=escapeHtml(toMerchantLanguage(item?.title||"Store activity overview"));
+  const paragraphs=[item?.summary,item?.why_it_matters,item?.likely_cause?`Possible explanation: ${item.likely_cause}`:null,item?.recommendation?`Recommended next step: ${item.recommendation}`:null].filter(Boolean);
+  return `<section style="margin:0 0 22px;"><h2 style="margin:0 0 8px;color:#171717;font-size:18px;line-height:1.4;font-weight:600;">${title}</h2>${paragraphs.map(p=>`<p style="margin:0 0 10px;color:#333;">${escapeHtml(toMerchantLanguage(p))}</p>`).join("")}</section>`;
 }
-
-/* ─────────────────────────────────────────────
-   NO-INTELLIGENCE STATE
-───────────────────────────────────────────── */
-
-function nothingRequiresAttention() {
-  return `
-    <div
-      style="
-        padding:30px 24px;
-        background:#0b0f17;
-        border:1px solid #1f2937;
-        border-radius:14px;
-        text-align:center;
-      "
-    >
-      <h2
-        style="
-          margin:0 0 10px 0;
-          font-size:19px;
-          letter-spacing:-0.02em;
-        "
-      >
-        Nothing requires your attention right now.
-      </h2>
-
-      <p
-        style="
-          color:#71717a;
-          line-height:1.7;
-          margin:0;
-          font-size:14px;
-        "
-      >
-        REDEN is continuing to watch the business.
-        If something materially changes, we'll bring it to you.
-      </p>
-    </div>
-  `;
+function reportEvidence(metrics={},heading="Store activity") {
+  const rows=[["Visits",formatNumber(metrics.total)],["Product views",formatNumber(metrics.productViews)],["Items added to cart",formatNumber(metrics.addToCarts)],["Checkout starts",formatNumber(metrics.checkoutStarts)],["Purchases",formatNumber(metrics.conversions)],["Recorded sales",formatMoney(metrics.revenue,metrics.currency)]];
+  return `<section style="margin:26px 0 0;"><h2 style="margin:0 0 10px;color:#171717;font-size:16px;font-weight:600;">${escapeHtml(heading)}</h2><table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;">${rows.map(([label,value])=>`<tr><td style="padding:7px 12px 7px 0;border-bottom:1px solid #eee;color:#555;">${label}</td><td style="padding:7px 0;border-bottom:1px solid #eee;text-align:right;color:#202124;font-weight:600;">${escapeHtml(value)}</td></tr>`).join("")}</table></section>`;
+}
+function defaultObservation(metrics={},period="this period") {
+  const visits=Number(metrics.total||0),views=Number(metrics.productViews||0),carts=Number(metrics.addToCarts||0),checkouts=Number(metrics.checkoutStarts||0),purchases=Number(metrics.conversions||0);
+  if(!visits)return {title:`REDEN did not record store visits for ${period}`,summary:"No page-view sessions were recorded. This may mean the store received no visits, or that tracking did not capture them. The available data cannot distinguish between those explanations.",recommendation:"Open your storefront and confirm that the REDEN installation is active and recording page views before drawing conclusions about demand."};
+  if(!views)return {title:"Visitors arrived, but no product views were recorded",summary:`REDEN recorded ${formatNumber(visits)} visiting sessions, but no product views for ${period}.`,why_it_matters:"The recorded activity shows visitors reaching the store without a recorded product-page view. There is not enough evidence to tell whether shoppers found the products they wanted or whether product-view tracking is missing.",recommendation:"Review how visitors reach product listings and confirm that product pages send PRODUCT_VIEW events."};
+  if(!carts)return {title:"Shoppers viewed products, but no items were added to carts",summary:`The store recorded ${formatNumber(views)} product views, but no add-to-cart events for ${period}.`,why_it_matters:"Product discovery is happening, but the recorded journey does not show shoppers progressing to a cart. Product fit, pricing, product information or event tracking may be contributing factors; the data does not identify which.",recommendation:"Review the most-viewed product pages, prices, availability and add-to-cart functionality. Confirm that ADD_TO_CART events are being tracked."};
+  if(!checkouts)return {title:"Items were added to carts, but no checkout starts were recorded",summary:`REDEN recorded ${formatNumber(carts)} add-to-cart events, but no checkout starts for ${period}.`,why_it_matters:"Shoppers showed buying interest, but the recorded journey did not progress to checkout. Cart costs, delivery information, account requirements or checkout tracking may be contributing factors.",recommendation:"Review the cart-to-checkout journey, including delivery charges and unexpected fees. Confirm that CHECKOUT_STARTED events are being recorded."};
+  if(!purchases)return {title:"Checkout activity was recorded, but no purchases were completed",summary:`REDEN recorded ${formatNumber(checkouts)} checkout starts and ${formatNumber(carts)} add-to-cart events, but no purchases for ${period}.`,why_it_matters:"Shoppers reached checkout, but no completed purchase was recorded. Payment failures, checkout friction or missing purchase events could explain the gap; the available data does not establish the cause.",recommendation:"Test the full checkout and payment process, and confirm that successful orders trigger PURCHASE events."};
+  return {title:`Your store recorded ${formatNumber(purchases)} purchase${purchases===1?"":"s"} for ${period}`,summary:`REDEN recorded ${formatNumber(visits)} visiting sessions, ${formatNumber(views)} product views, ${formatNumber(carts)} add-to-cart events, ${formatNumber(checkouts)} checkout starts and ${formatNumber(purchases)} purchases. Recorded sales: ${formatMoney(metrics.revenue,metrics.currency)}.`,why_it_matters:"The recorded events show activity across the shopping journey. Comparing these stages over time can reveal where more shoppers progress or drop off; one reporting period alone does not establish a trend.",recommendation:"Keep the product, cart and checkout journey working smoothly. Compare the next report with this one to see whether purchase activity and the steps leading to it are increasing or declining."};
 }
 
 /* ─────────────────────────────────────────────
@@ -410,70 +132,8 @@ export async function sendMorningReport({
       item?.status !== "resolved"
   );
 
-  const content =
-    important.length > 0
-      ? `
-        ${important
-          .map(intelligenceCard)
-          .join("")}
-
-        <div
-          style="
-            margin-top:26px;
-            padding:20px;
-            background:#0b0f17;
-            border:1px solid #1f2937;
-            border-radius:14px;
-          "
-        >
-          <div
-            style="
-              color:#71717a;
-              font-size:11px;
-              text-transform:uppercase;
-              letter-spacing:0.08em;
-              margin-bottom:14px;
-            "
-          >
-            Evidence
-          </div>
-
-          <table
-            style="
-              width:100%;
-              border-collapse:collapse;
-            "
-          >
-            <tr>
-              <td style="padding:8px 0;color:#71717a;">
-                Visits
-              </td>
-              <td style="padding:8px 0;text-align:right;">
-                ${formatNumber(metrics.total)}
-              </td>
-            </tr>
-
-            <tr>
-              <td style="padding:8px 0;color:#71717a;">
-                Purchases
-              </td>
-              <td style="padding:8px 0;text-align:right;">
-                ${formatNumber(metrics.conversions)}
-              </td>
-            </tr>
-
-            <tr>
-              <td style="padding:8px 0;color:#71717a;">
-                Recorded sales
-              </td>
-              <td style="padding:8px 0;text-align:right;">
-                ${formatMoney(metrics.revenue)}
-              </td>
-            </tr>
-          </table>
-        </div>
-      `
-      : nothingRequiresAttention();
+  const observations=important.length?important:[defaultObservation(metrics,"yesterday")];
+  const content=`${observations.map(intelligenceText).join("")}${reportEvidence(metrics,"Yesterday's store activity")}`;
 
   const html = emailShell({
     merchantName,
@@ -486,10 +146,7 @@ export async function sendMorningReport({
 
   return sendEmail({
     to,
-    subject:
-      important.length > 0
-        ? "REDEN Morning Store Brief"
-        : "REDEN Morning Brief — No Issues to Flag",
+    subject: "REDEN Morning Brief",
     html,
   });
 }
@@ -509,70 +166,8 @@ export async function sendEveningReport({
       item?.status !== "dismissed"
   );
 
-  const content =
-    important.length > 0
-      ? `
-        ${important
-          .map(intelligenceCard)
-          .join("")}
-
-        <div
-          style="
-            margin-top:26px;
-            padding:20px;
-            background:#0b0f17;
-            border:1px solid #1f2937;
-            border-radius:14px;
-          "
-        >
-          <div
-            style="
-              color:#71717a;
-              font-size:11px;
-              text-transform:uppercase;
-              letter-spacing:0.08em;
-              margin-bottom:14px;
-            "
-          >
-            Today's evidence
-          </div>
-
-          <table
-            style="
-              width:100%;
-              border-collapse:collapse;
-            "
-          >
-            <tr>
-              <td style="padding:8px 0;color:#71717a;">
-                Visits
-              </td>
-              <td style="padding:8px 0;text-align:right;">
-                ${formatNumber(metrics.total)}
-              </td>
-            </tr>
-
-            <tr>
-              <td style="padding:8px 0;color:#71717a;">
-                Purchases
-              </td>
-              <td style="padding:8px 0;text-align:right;">
-                ${formatNumber(metrics.conversions)}
-              </td>
-            </tr>
-
-            <tr>
-              <td style="padding:8px 0;color:#71717a;">
-                Recorded sales
-              </td>
-              <td style="padding:8px 0;text-align:right;">
-                ${formatMoney(metrics.revenue)}
-              </td>
-            </tr>
-          </table>
-        </div>
-      `
-      : nothingRequiresAttention();
+  const observations=important.length?important:[defaultObservation(metrics,"today")];
+  const content=`${observations.map(intelligenceText).join("")}${reportEvidence(metrics,"Today's store activity")}`;
 
   const html = emailShell({
     merchantName,
@@ -585,10 +180,7 @@ export async function sendEveningReport({
 
   return sendEmail({
     to,
-    subject:
-      important.length > 0
-        ? "REDEN Evening Store Review"
-        : "REDEN Evening Review — No Issues to Flag",
+    subject: "REDEN Evening Store Brief",
     html,
   });
 }
