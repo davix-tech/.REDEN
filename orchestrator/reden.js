@@ -3479,6 +3479,322 @@ cron.schedule("* * * * *", async () => {
             priced AS (
               SELECT session_id,
                 CASE WHEN amount_text ~ '^[0-9]+([.][0-9]+)?
+            SELECT
+              (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
+              (SELECT COUNT(*)::INTEGER FROM events WHERE event='PRODUCT_VIEW') AS product_views,
+              (SELECT COUNT(*)::INTEGER FROM events WHERE event='ADD_TO_CART') AS add_to_carts,
+              (SELECT COUNT(*)::INTEGER FROM events WHERE event='CHECKOUT_STARTED') AS checkout_starts,
+              (SELECT COUNT(*)::INTEGER FROM priced) AS purchases,
+              COALESCE(SUM(amount),0)::NUMERIC AS revenue,
+              COUNT(amount)::INTEGER AS priced_purchases,
+              MAX(NULLIF(currency_text,'')) AS currency
+            FROM priced
+          `, [site.site_id, period.startUTC, period.endUTC]);
+
+          const row=result.rows[0]||{};
+          const visits=Number(row.visits||0),productViews=Number(row.product_views||0),addToCarts=Number(row.add_to_carts||0),checkoutStarts=Number(row.checkout_starts||0),purchases=Number(row.purchases||0);
+          const revenueAvailable=Number(row.priced_purchases||0)>0;
+          const revenue=revenueAvailable?Number(row.revenue||0):null;
+          const currency=typeof row.currency==="string"&&/^[A-Z]{3}$/.test(row.currency)?row.currency:null;
+          const periodName=morning?"yesterday":"today";
+          const metrics={total:visits,productViews,addToCarts,checkoutStarts,conversions:purchases,revenue,currency};
+          const intelligence=[{priority:visits>0&&purchases===0?"high":"normal",...buildMerchantBriefObservation(metrics,periodName)}];
+
+          const send = morning ? sendMorningReport : sendEveningReport;
+          const sentResult = await send({
+            to: site.owner_email,
+            merchantName: site.name,
+            metrics,
+            intelligence
+          });
+
+          if (!sentResult?.ok) {
+            console.error("[MERCHANT REPORT DELIVERY FAILED]", {
+              siteId: site.site_id, type, error: sentResult?.error
+            });
+            continue;
+          }
+
+          await client.query(`
+            INSERT INTO email_logs (site_id, type, status, created_at)
+            VALUES ($1, $2, 'SENT', NOW())
+          `, [site.site_id, type]);
+        } catch (siteError) {
+          console.error("[MERCHANT REPORT SITE ERROR]", {
+            siteId: site.site_id, error: siteError
+          });
+        }
+      }
+    } finally {
+      await client.query(
+        "SELECT pg_advisory_unlock(hashtext('reden_twice_daily_reports'))"
+      );
+    }
+  } catch (error) {
+    console.error("[TWICE-DAILY REPORT CRON ERROR]", error);
+  } finally {
+    client.release();
+  }
+}, { timezone: "UTC" });
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+
+                  THEN amount_text::NUMERIC ELSE NULL END AS amount,
+                currency_text
+              FROM purchases
+            )
+            SELECT
+              (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
+              (SELECT COUNT(*)::INTEGER FROM priced) AS purchases,
+              COALESCE(SUM(amount),0)::NUMERIC AS revenue,
+              COUNT(amount)::INTEGER AS priced_purchases
+            FROM priced
+          `, [site.site_id, period.startUTC, period.endUTC]);
+
+          const row = result.rows[0] || {};
+          const visits = Number(row.visits || 0);
+          const purchases = Number(row.purchases || 0);
+          const revenueAvailable = Number(row.priced_purchases || 0) > 0;
+          const revenue = revenueAvailable ? Number(row.revenue || 0) : null;
+          const periodName = morning ? "yesterday" : "today";
+
+          const intelligence = visits === 0
+            ? [{
+                priority: "high",
+                title: "REDEN did not record any store visits",
+                summary: `No store visits were recorded for ${periodName}. This may mean there were no visits, or that store activity tracking needs checking.`,
+                recommendation: "Open your storefront and confirm that REDEN is receiving store activity before making business decisions."
+              }]
+            : purchases === 0
+              ? [{
+                  priority: "high",
+                  title: "Visitors came to your store, but no purchases were recorded",
+                  summary: `REDEN recorded ${visits} visits for ${periodName}, but no completed purchases. These figures alone do not identify the cause.`,
+                  recommendation: "Review product views, items added to carts and checkout activity to find where shoppers may be stopping."
+                }]
+              : [{
+                  priority: "normal",
+                  title: `Your store recorded ${purchases} purchase${purchases === 1 ? "" : "s"}`,
+                  summary: `REDEN recorded ${visits} visits and ${purchases} purchases for ${periodName}.${revenueAvailable ? ` Recorded sales were ${revenue.toLocaleString("en-NG", { maximumFractionDigits: 2 })}.` : " Purchase amounts were unavailable, so sales could not be totalled."}`,
+                  recommendation: "Keep monitoring visits, purchases and the steps shoppers take before buying. REDEN will flag meaningful changes when the evidence supports them."
+                }];
+
+          const send = morning ? sendMorningReport : sendEveningReport;
+          const sentResult = await send({
+            to: site.owner_email,
+            merchantName: site.name,
+            metrics: { total: visits, conversions: purchases, revenue },
+            intelligence
+          });
+
+          if (!sentResult?.ok) {
+            console.error("[MERCHANT REPORT DELIVERY FAILED]", {
+              siteId: site.site_id, type, error: sentResult?.error
+            });
+            continue;
+          }
+
+          await client.query(`
+            INSERT INTO email_logs (site_id, type, status, created_at)
+            VALUES ($1, $2, 'SENT', NOW())
+          `, [site.site_id, type]);
+        } catch (siteError) {
+          console.error("[MERCHANT REPORT SITE ERROR]", {
+            siteId: site.site_id, error: siteError
+          });
+        }
+      }
+    } finally {
+      await client.query(
+        "SELECT pg_advisory_unlock(hashtext('reden_twice_daily_reports'))"
+      );
+    }
+  } catch (error) {
+    console.error("[TWICE-DAILY REPORT CRON ERROR]", error);
+  } finally {
+    client.release();
+  }
+}, { timezone: "UTC" });
+
+/* =========================================================
+   404
+========================================================= */
+
+app.use((req, res) => {
+  return failure(
+    res,
+    404,
+    "Route not found"
+  );
+});
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("[GLOBAL ERROR]", {
+    requestId: req.requestId,
+    error,
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return failure(
+    res,
+    500,
+    "Internal server error"
+  );
+});
+
+/* =========================================================
+   SERVER
+========================================================= */
+
+const server = app.listen(PORT, () => {
+  console.log(
+    `[REDEN] API listening on port ${PORT}`
+  );
+});
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(
+    `[REDEN] ${signal} received. Shutting down...`
+  );
+
+  server.close(async () => {
+    try {
+      if (redis?.quit) {
+        await redis.quit();
+      }
+    } catch (error) {
+      console.error(
+        "[REDIS SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    try {
+      await db.end();
+    } catch (error) {
+      console.error(
+        "[DATABASE SHUTDOWN ERROR]",
+        error
+      );
+    }
+
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () =>
+  shutdown("SIGTERM")
+);
+
+process.on("SIGINT", () =>
+  shutdown("SIGINT")
+);
+
+                  THEN amount_text::NUMERIC ELSE NULL END AS amount,
+                currency_text
+              FROM purchases
             )
             SELECT
               (SELECT COUNT(DISTINCT session_id)::INTEGER FROM events WHERE event='PAGE_VIEW') AS visits,
