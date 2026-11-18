@@ -254,6 +254,7 @@ async function initializeDatabase() {
         cart_value NUMERIC(12,2) NOT NULL DEFAULT 0,
         intent_score NUMERIC(8,4) NOT NULL DEFAULT 0,
         eligible_after TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        attempts INTEGER NOT NULL DEFAULT 0,
 
         status TEXT NOT NULL DEFAULT 'PENDING'
           CHECK (
@@ -291,7 +292,8 @@ async function initializeDatabase() {
       NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS cart_value NUMERIC(12,2) NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS intent_score NUMERIC(8,4) NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS eligible_after TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS eligible_after TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
     `);
 
     await client.query(`
