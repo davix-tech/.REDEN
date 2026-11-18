@@ -3167,7 +3167,7 @@ app.post("/outcome", async (req, res) => {
     if (!result.rowCount) {
       const existing = await db.query(
         `
-          SELECT id, state
+          SELECT id, state, converted, revenue, action, bandit_context_key
           FROM decisions
           WHERE id = $1
             AND site_id = $2
@@ -3182,6 +3182,14 @@ app.post("/outcome", async (req, res) => {
           404,
           "Decision not found"
         );
+      }
+
+      const prior = existing.rows[0];
+      if (prior.state === "COMPLETED" && prior.converted === converted) {
+        return success(res, {
+          decision: prior,
+          alreadyCompleted: true,
+        });
       }
 
       return failure(
