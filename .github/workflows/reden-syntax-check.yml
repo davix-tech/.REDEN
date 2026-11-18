@@ -2,19 +2,12 @@ name: REDEN syntax check
 
 on:
   pull_request:
-    paths:
-      - "orchestrator/**/*.js"
-      - "package.json"
-      - ".github/workflows/reden-syntax-check.yml"
   push:
     branches:
       - main
       - reden-traffic-baseline
       - reden-merchant-language-reports
-    paths:
-      - "orchestrator/**/*.js"
-      - "package.json"
-      - ".github/workflows/reden-syntax-check.yml"
+      - final-intelligence-abc
 
 jobs:
   syntax:
@@ -26,6 +19,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: Install project dependencies for unit tests
+        run: npm install --ignore-scripts --no-audit --no-fund
       - name: Validate REDEN server and intelligence module syntax
         run: |
           node --check orchestrator/reden.js
@@ -37,6 +32,8 @@ jobs:
           node --check orchestrator/intelligence/commerceEvidence.js
           node --check orchestrator/intelligence/commerceIntelligence.js
           node --check infrastructure/db.js
+          node --check optimization/banditEngine.js
+          node --check optimization/banditEngine.test.js
           node --check public/sdk.js
       - name: Run intelligence unit tests
         run: npm test

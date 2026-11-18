@@ -120,3 +120,86 @@ export function diagnoseSales(evidence = {}, { allowFallback = true } = {}) {
 
   return `REDEN recorded ${purchases} purchases so far.${recordedRevenue} I cannot confirm a sales decline without comparable historical data. Compare traffic first: if visits are down, investigate acquisition; if visits are steady, inspect product-page, cart and checkout conversion.`;
 }
+
+
+const JOURNEY_STAGES = {
+  productView: {
+    name: "visit-to-product discovery",
+    from: "pageViewSessions",
+    to: "productViewSessions",
+    label: "product pages",
+    why: "Visitors are entering the store but fewer are reaching product pages, so product discovery or landing-page relevance may be limiting purchase opportunities.",
+    investigate: "Review landing pages, navigation, product availability and relevance; confirm PRODUCT_VIEW tracking.",
+  },
+  addToCart: {
+    name: "product-to-cart progression",
+    from: "productViewSessions",
+    to: "addToCartSessions",
+    label: "cart additions",
+    why: "Product interest is recorded, but fewer shoppers are committing items to a cart. Product fit, price, product details, stock or trust may be contributing.",
+    investigate: "Review product prices, stock, images/details, shipping information and add-to-cart functionality; confirm ADD_TO_CART tracking.",
+  },
+  checkout: {
+    name: "cart-to-checkout progression",
+    from: "addToCartSessions",
+    to: "checkoutSessions",
+    label: "checkout starts",
+    why: "Shoppers have added items but fewer are proceeding to checkout. Cart friction, delivery costs, fees or account requirements may be contributing.",
+    investigate: "Review cart usability, shipping and fees, guest checkout and mobile cart behaviour; confirm CHECKOUT_STARTED tracking.",
+  },
+  purchase: {
+    name: "checkout-to-purchase completion",
+    from: "checkoutSessions",
+    to: "purchaseSessions",
+    label: "completed purchases",
+    why: "Shoppers reached checkout, but fewer completed purchases. Payment failures, checkout friction or missing purchase tracking may be contributing.",
+    investigate: "Inspect payment failures, checkout errors, unexpected costs and mobile checkout; confirm successful orders emit PURCHASE events.",
+  },
+};
+
+const JOURNEY_PRIORITY = ["purchase", "checkout", "addToCart", "productView"];
+
+/**
+ * Explains the strongest evidence-supported journey gap. Zero downstream
+ * events remain an instrumentation ambiguity unless the source validates it.
+ */
+export function diagnoseJourney(funnel = {}) {
+  const current = funnel.current || {};
+  const validation = Array.isArray(funnel.trackingValidationStages)
+    ? funnel.trackingValidationStages
+    : [];
+  const lowStages = Array.isArray(funnel.lowStages) ? funnel.lowStages : [];
+  const stage = JOURNEY_PRIORITY.find((candidate) => validation.includes(candidate));
+  if (stage) {
+    const details = JOURNEY_STAGES[stage];
+    const denominator = count(current[details.from]);
+    return `REDEN recorded ${denominator} sessions reaching the preceding step, but no ${details.label} were recorded at the next step. This could be a real journey break or missing event tracking; it is not yet proof that shoppers stopped there. ${details.investigate} Validate the event stream before changing offers or spending.`;
+  }
+
+  const weakStage = JOURNEY_PRIORITY.find((candidate) => lowStages.includes(candidate));
+  if (weakStage) {
+    const details = JOURNEY_STAGES[weakStage];
+    const denominator = count(current[details.from]);
+    const numerator = count(current[details.to]);
+    const rate = denominator > 0 ? (numerator / denominator) * 100 : null;
+    const baseline = numberOrNull(funnel.averages?.[weakStage]);
+    const baselineText = baseline === null ? "" : ` Comparable historical progression was ${(baseline * 100).toFixed(1)}%.`;
+    const sampleText = denominator < 5 ? " This is a small sample and should be treated as directional, not a reliable performance estimate." : "";
+    const dropped = Math.max(0, denominator - numerator);
+    return `The clearest journey gap is ${details.name}: ${numerator} of ${denominator} sessions progressed (${rate === null ? "rate unavailable" : rate.toFixed(1)}%), while ${dropped} did not progress in the recorded data.${baselineText} ${details.why} ${details.investigate}${sampleText} REDEN cannot identify the cause from events alone.`;
+  }
+
+  const countStages = JOURNEY_PRIORITY.map((candidate) => {
+    const details = JOURNEY_STAGES[candidate];
+    return { stage: candidate, denominator: count(current[details.from]), numerator: count(current[details.to]) };
+  }).filter((row) => row.denominator > 0);
+  const observedGap = countStages.find((row) => row.numerator < row.denominator);
+  if (observedGap) {
+    const details = JOURNEY_STAGES[observedGap.stage];
+    const pct = (observedGap.numerator / observedGap.denominator) * 100;
+    const sampleText = observedGap.denominator < 5 ? " This is a small sample and is directional only." : "";
+    return `The recorded journey shows its largest visible gap at ${details.name}: ${observedGap.numerator} of ${observedGap.denominator} sessions progressed (${pct.toFixed(1)}%). ${details.why} ${details.investigate}${sampleText} The available records do not prove a cause.`;
+  }
+
+  return "REDEN does not currently have enough reliable session-level journey evidence to identify a specific progression gap. Confirm event tracking and collect more complete sessions before diagnosing shopper friction.";
+}

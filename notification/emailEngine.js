@@ -251,84 +251,22 @@ export async function sendWelcomeEmail({ to }) {
    RECOVERY EMAIL
 ───────────────────────────────────────────── */
 
-export async function sendRecoveryEmail({
-  to,
-  incentive,
-  cart,
-}) {
-  const rewardLabel =
-    incentive || "Special Promotional Reward";
+export async function sendRecoveryEmail({ to, cart = {} }) {
+  const html = `
+    <div style="margin:0;padding:28px 18px;background:#ffffff;color:#202124;font-family:Arial,Helvetica,sans-serif;">
+      <div style="max-width:600px;margin:0 auto;font-size:15px;line-height:1.7;">
+        <p style="margin:0 0 18px;color:#666;font-size:12px;letter-spacing:.04em;text-transform:uppercase;">REDEN by PRETHIM</p>
+        <h1 style="margin:0 0 14px;color:#171717;font-size:24px;line-height:1.3;font-weight:600;">Your cart is still waiting</h1>
+        <p style="margin:0 0 16px;color:#333;">You left items in your cart before completing checkout. If you still want them, return to the store and continue where you left off.</p>
+        <p style="margin:0 0 16px;color:#333;">If you had trouble checking out, the store may be able to help.</p>
+        <p style="margin:28px 0 0;padding-top:16px;border-top:1px solid #e5e5e5;color:#777;font-size:12px;">This reminder was sent by REDEN by PRETHIM.</p>
+      </div>
+    </div>
+  `;
 
   return sendEmail({
     to,
-    subject: "Complete your checkout session",
-    html: `
-      <div
-        style="
-          background:#05070b;
-          color:#ffffff;
-          padding:40px;
-          font-family:Inter,Arial,sans-serif;
-        "
-      >
-        <div style="max-width:680px;margin:0 auto;">
-
-          <h1
-            style="
-              font-size:24px;
-              margin-bottom:15px;
-            "
-          >
-            Continue Your Session
-          </h1>
-
-          <p
-            style="
-              color:#9ca3af;
-              line-height:1.7;
-            "
-          >
-            We noticed you left items in your cart.
-            We've kept an incentive available for your
-            checkout path.
-          </p>
-
-          <div
-            style="
-              margin-top:30px;
-              background:#0b0f17;
-              border:1px solid #1f2937;
-              border-radius:14px;
-              padding:24px;
-              text-align:center;
-            "
-          >
-            <p
-              style="
-                color:#9ca3af;
-                margin:0 0 10px;
-                font-size:14px;
-                text-transform:uppercase;
-                letter-spacing:0.05em;
-              "
-            >
-              Incentive Available
-            </p>
-
-            <h2
-              style="
-                color:#ffffff;
-                font-size:36px;
-                margin:0;
-                font-weight:800;
-              "
-            >
-              ${escapeHtml(rewardLabel)}
-            </h2>
-          </div>
-
-        </div>
-      </div>
-    `,
+    subject: "Your cart is still waiting",
+    html,
   });
 }

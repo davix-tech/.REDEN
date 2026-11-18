@@ -10,7 +10,7 @@ import compression from "compression";
 import rateLimit from "express-rate-limit";
 
 import { db, initDB } from "./infrastructure/db.js";
-import { pickAction, updateBandit } from "./optimization/banditEngine.js";
+import { pickAction, updateBandit, deriveBanditContext } from "./optimization/banditEngine.js";
 import {
   updateSessionContext,
   getSessionContext,
@@ -23,7 +23,7 @@ import {
 } from "./notification/emailEngine.js";
 import { toMerchantLanguage } from "./intelligence/merchantLanguage.js";
 import { composeWeeklyRevenue, loadWeeklyRevenue } from "./intelligence/weeklyRevenue.js";
-import { diagnoseSales } from "./intelligence/diagnostics.js";
+import { diagnoseSales, diagnoseJourney } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
 import { composeConversationResponse } from "./intelligence/responsePolicy.js";
 import { resolveReasoningIntents, composeReasonedResponse } from "./intelligence/reasoningLayer.js";
@@ -976,28 +976,8 @@ function composeOverview(evidence) {
 
 function composeFunnel(evidence) {
   const summary = `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
-  const baseline = evidence.funnelBaseline;
-
-  if (!baseline || baseline.status === "insufficient_history") {
-    return `${summary} REDEN does not yet have five eligible historical days with recorded page-view sessions for a reliable same-time funnel comparison.`;
-  }
-
-  if (baseline.status === "below_baseline" && baseline.current) {
-    const labels = {
-      productView: "product-view",
-      addToCart: "add-to-cart",
-      checkout: "checkout",
-      purchase: "purchase",
-    };
-    const details = baseline.lowStages.map((stage) => {
-      const currentRate = Number(baseline.current.rates?.[stage]) * 100;
-      const averageRate = Number(baseline.averages?.[stage]) * 100;
-      return `${labels[stage]} session rate is ${currentRate.toFixed(1)}% versus a same-time historical average of ${averageRate.toFixed(1)}%.`;
-    });
-    return `${summary} Recorded funnel rates are materially below their baseline: ${details.join(" ")} Treat these as tracking signals to investigate, not proof of a specific cause.`;
-  }
-
-  return `${summary} The available recorded session-level rates are not materially below the baseline under REDEN's current threshold. This does not rule out other causes of a sales decline.`;
+  const diagnosis = diagnoseJourney(evidence.funnelBaseline || {});
+  return `${summary} ${diagnosis}`;
 }
 
 function composeAttribution(evidence) {
@@ -2689,6 +2669,7 @@ app.post("/event", async (req, res) => {
   const cartId = normalizeString(sanitizedPayload.cart_id, 200);
 
   const client = await db.connect();
+  let autoCompletedDecision = null;
 
   try {
     await client.query("BEGIN");
@@ -2733,8 +2714,9 @@ app.post("/event", async (req, res) => {
     if (eventResult.rowCount && orderRecord) {
       orderInserted = await recordIdentifiedOrder(client, orderRecord);
     }
+    let sessionContext = null;
     if (eventResult.rowCount && (!orderRecord || orderInserted)) {
-      await updateSessionContext({
+      sessionContext = await updateSessionContext({
         siteId,
         sessionId,
         event,
@@ -2784,6 +2766,44 @@ app.post("/event", async (req, res) => {
     }
 
     /*
+     * A verified purchase event can complete the most recent actioned
+     * decision for this same site/session within the session window.
+     * Identified duplicate orders are excluded so they cannot earn twice.
+     */
+    if (event === "PURCHASE" && eventResult.rowCount && (!orderRecord || orderInserted)) {
+      const purchaseAmount = Math.max(0, validateNumber(
+        sanitizedPayload.revenue ?? sanitizedPayload.order_total,
+        0
+      ));
+      const attributed = await client.query(
+        `
+          WITH candidate AS (
+            SELECT id
+            FROM decisions
+            WHERE site_id = $1
+              AND session_id = $2
+              AND state = 'ACTIONED'
+              AND actioned_at >= NOW() - INTERVAL '30 minutes'
+            ORDER BY actioned_at DESC
+            LIMIT 1
+            FOR UPDATE
+          )
+          UPDATE decisions d
+          SET
+            state = 'COMPLETED',
+            converted = TRUE,
+            revenue = $3,
+            completed_at = NOW()
+          FROM candidate
+          WHERE d.id = candidate.id
+          RETURNING d.id, d.action, d.bandit_context_key, d.revenue
+        `,
+        [siteId, sessionId, purchaseAmount]
+      );
+      autoCompletedDecision = attributed.rows[0] || null;
+    }
+
+    /*
      * CHECKOUT_STARTED enters recovery processing.
      *
      * customer_email is stored on the queue row itself so
@@ -2809,6 +2829,9 @@ app.post("/event", async (req, res) => {
             customer_email,
             status,
             discount_percent,
+            cart_value,
+            intent_score,
+            eligible_after,
             created_at,
             updated_at
           )
@@ -2817,21 +2840,52 @@ app.post("/event", async (req, res) => {
             $2,
             $3,
             'PENDING',
-            10,
+            0,
+            $4,
+            $5,
+            NOW() + INTERVAL '60 minutes',
             NOW(),
             NOW()
           )
           ON CONFLICT (site_id, session_id) DO UPDATE
-          SET customer_email = COALESCE(
-            EXCLUDED.customer_email,
-            recovery_queue.customer_email
-          )
+          SET
+            customer_email = COALESCE(EXCLUDED.customer_email, recovery_queue.customer_email),
+            cart_value = GREATEST(recovery_queue.cart_value, EXCLUDED.cart_value),
+            intent_score = GREATEST(recovery_queue.intent_score, EXCLUDED.intent_score),
+            eligible_after = CASE
+              WHEN recovery_queue.status = 'PENDING'
+              THEN NOW() + INTERVAL '60 minutes'
+              ELSE recovery_queue.eligible_after
+            END,
+            updated_at = NOW()
         `,
-        [siteId, sessionId, customerEmail || null]
+        [
+          siteId,
+          sessionId,
+          customerEmail || null,
+          boundedCartValue,
+          Number(sessionContext?.intent_score || 0),
+        ]
       );
     }
 
     await client.query("COMMIT");
+
+    if (autoCompletedDecision) {
+      await updateBandit(
+        siteId,
+        autoCompletedDecision.action,
+        true,
+        autoCompletedDecision.bandit_context_key
+      );
+      publishSiteEvent(siteId, {
+        event: "commerce.event",
+        eventId: crypto.randomUUID(),
+        sessionId,
+        eventType: "DECISION_COMPLETED",
+        occurredAt: new Date().toISOString(),
+      });
+    }
 
     // Publish only newly committed events. Duplicate SDK retries
     // are acknowledged but never broadcast twice.
@@ -2887,7 +2941,7 @@ app.post("/score", async (req, res) => {
   );
 
   const behavior = safePayload(
-    req.body?.behavior
+    req.body?.behavior || req.body?.meta
   );
 
   if (!sessionId) {
@@ -2904,11 +2958,21 @@ app.post("/score", async (req, res) => {
       sessionId
     );
 
+    const decisionContext = {
+      ...(context || {}),
+      ...(behavior || {}),
+    };
+    const banditContextKey = deriveBanditContext({
+      cart_value: Math.max(0, cartValue),
+      behavior: decisionContext,
+    });
+
     const action = await pickAction({
       site_id: siteId,
       session_id: sessionId,
       cart_value: Math.max(0, cartValue),
-      behavior: context || behavior,
+      behavior: decisionContext,
+      context_key: banditContextKey,
     });
 
     const actionMap = {
@@ -2929,6 +2993,7 @@ app.post("/score", async (req, res) => {
           action,
           score,
           state,
+          bandit_context_key,
           created_at
         )
         VALUES (
@@ -2937,6 +3002,7 @@ app.post("/score", async (req, res) => {
           $3,
           $4,
           'SCORED',
+          $5,
           NOW()
         )
         RETURNING id
@@ -2946,6 +3012,7 @@ app.post("/score", async (req, res) => {
         sessionId,
         action,
         score,
+        banditContextKey,
       ]
     );
 
@@ -2959,8 +3026,10 @@ app.post("/score", async (req, res) => {
 
     return success(res, {
       decisionId: result.rows[0].id,
+      decision_id: result.rows[0].id,
       action,
       score,
+      discount_percent: score,
     });
   } catch (error) {
     console.error("[SCORE ERROR]", error);
@@ -3089,6 +3158,7 @@ app.post("/outcome", async (req, res) => {
           action,
           converted,
           revenue,
+          bandit_context_key,
           completed_at
       `,
       [
@@ -3102,7 +3172,7 @@ app.post("/outcome", async (req, res) => {
     if (!result.rowCount) {
       const existing = await db.query(
         `
-          SELECT id, state
+          SELECT id, state, converted, revenue, action, bandit_context_key
           FROM decisions
           WHERE id = $1
             AND site_id = $2
@@ -3117,6 +3187,14 @@ app.post("/outcome", async (req, res) => {
           404,
           "Decision not found"
         );
+      }
+
+      const prior = existing.rows[0];
+      if (prior.state === "COMPLETED" && prior.converted === converted) {
+        return success(res, {
+          decision: prior,
+          alreadyCompleted: true,
+        });
       }
 
       return failure(
@@ -3142,7 +3220,8 @@ app.post("/outcome", async (req, res) => {
     await updateBandit(
       siteId,
       decision.action,
-      converted
+      converted,
+      decision.bandit_context_key
     );
 
     return success(res, {
@@ -3265,10 +3344,14 @@ cron.schedule(
             site_id,
             session_id,
             customer_email,
-            discount_percent
+            discount_percent,
+            cart_value,
+            intent_score,
+            attempts
           FROM recovery_queue
           WHERE status = 'PENDING'
-          ORDER BY created_at ASC
+            AND eligible_after <= NOW()
+          ORDER BY cart_value DESC, intent_score DESC, created_at ASC
           LIMIT 20
           FOR UPDATE SKIP LOCKED
         `
@@ -3280,6 +3363,7 @@ cron.schedule(
             UPDATE recovery_queue
             SET
               status = 'PROCESSING',
+              attempts = attempts + 1,
               updated_at = NOW()
             WHERE id = $1
           `,
@@ -3291,23 +3375,24 @@ cron.schedule(
 
       for (const job of jobs.rows) {
         try {
-          const converted = await db.query(
+          const completed = await db.query(
             `
-              SELECT id
-              FROM decisions
-              WHERE site_id = $1
-                AND session_id = $2
-                AND converted = TRUE
-                AND state = 'COMPLETED'
-              LIMIT 1
+              SELECT EXISTS (
+                SELECT 1 FROM event_logs
+                WHERE site_id = $1 AND session_id = $2 AND event = 'PURCHASE'
+              ) OR EXISTS (
+                SELECT 1 FROM session_summaries
+                WHERE site_id = $1 AND session_id = $2 AND purchased = TRUE
+              ) OR EXISTS (
+                SELECT 1 FROM decisions
+                WHERE site_id = $1 AND session_id = $2
+                  AND converted = TRUE AND state = 'COMPLETED'
+              ) AS completed
             `,
-            [
-              job.site_id,
-              job.session_id,
-            ]
+            [job.site_id, job.session_id]
           );
 
-          if (converted.rowCount) {
+          if (completed.rows[0]?.completed) {
             await db.query(
               `
                 UPDATE recovery_queue
@@ -3370,13 +3455,17 @@ cron.schedule(
           const site =
             siteResult.rows[0];
 
-          await sendRecoveryEmail({
-            site,
-            sessionId: job.session_id,
-            customerEmail: job.customer_email,
-            discountPercent:
-              job.discount_percent,
+          const emailResult = await sendRecoveryEmail({
+            to: job.customer_email,
+            cart: {
+              value: Number(job.cart_value || 0),
+              sessionId: job.session_id,
+            },
           });
+
+          if (!emailResult?.ok) {
+            throw new Error(emailResult?.error || "recovery_email_send_failed");
+          }
 
           await db.query(
             `
@@ -3424,7 +3513,8 @@ cron.schedule(
             `
               UPDATE recovery_queue
               SET
-                status = 'FAILED',
+                status = CASE WHEN attempts < 3 THEN 'PENDING' ELSE 'FAILED' END,
+                eligible_after = CASE WHEN attempts < 3 THEN NOW() + INTERVAL '30 minutes' ELSE eligible_after END,
                 updated_at = NOW()
               WHERE id = $1
             `,

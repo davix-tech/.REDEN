@@ -152,8 +152,14 @@ async function initializeDatabase() {
 
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         actioned_at TIMESTAMPTZ,
-        completed_at TIMESTAMPTZ
+        completed_at TIMESTAMPTZ,
+        bandit_context_key VARCHAR(100)
       )
+    `);
+
+    await client.query(`
+      ALTER TABLE decisions
+      ADD COLUMN IF NOT EXISTS bandit_context_key VARCHAR(100)
     `);
 
     /* =====================================================
@@ -175,6 +181,23 @@ async function initializeDatabase() {
 
         PRIMARY KEY (site_id, action)
       )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bandit_context_state (
+        site_id VARCHAR(100) NOT NULL,
+        context_key VARCHAR(100) NOT NULL,
+        action TEXT NOT NULL,
+        pulls INTEGER NOT NULL DEFAULT 0 CHECK (pulls >= 0),
+        rewards NUMERIC(12,4) NOT NULL DEFAULT 0 CHECK (rewards >= 0),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (site_id, context_key, action)
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_bandit_context_site_updated
+      ON bandit_context_state (site_id, updated_at DESC)
     `);
 
     /* =====================================================
@@ -226,7 +249,12 @@ async function initializeDatabase() {
         customer_email TEXT,
 
         discount_percent NUMERIC(5,2)
-          NOT NULL DEFAULT 10,
+          NOT NULL DEFAULT 0,
+
+        cart_value NUMERIC(12,2) NOT NULL DEFAULT 0,
+        intent_score NUMERIC(8,4) NOT NULL DEFAULT 0,
+        eligible_after TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        attempts INTEGER NOT NULL DEFAULT 0,
 
         status TEXT NOT NULL DEFAULT 'PENDING'
           CHECK (
@@ -261,7 +289,37 @@ async function initializeDatabase() {
     await client.query(`
       ALTER TABLE recovery_queue
       ADD COLUMN IF NOT EXISTS discount_percent NUMERIC(5,2)
-      NOT NULL DEFAULT 10
+      NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS cart_value NUMERIC(12,2) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS intent_score NUMERIC(8,4) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS eligible_after TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
+    `);
+
+    await client.query(`
+      UPDATE recovery_queue
+      SET eligible_after = created_at + INTERVAL '60 minutes'
+      WHERE eligible_after IS NULL
+    `);
+
+    await client.query(`
+      ALTER TABLE recovery_queue
+      ALTER COLUMN eligible_after SET DEFAULT NOW(),
+      ALTER COLUMN eligible_after SET NOT NULL,
+      ALTER COLUMN discount_percent SET DEFAULT 0
+    `);
+
+    // The existing recovery message does not issue redeemable coupons.
+    // Clear queued legacy incentive values to avoid suggesting one exists.
+    await client.query(`
+      UPDATE recovery_queue
+      SET discount_percent = 0
+      WHERE status IN ('PENDING', 'PROCESSING')
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_recovery_eligible
+      ON recovery_queue (status, eligible_after, cart_value DESC, intent_score DESC)
     `);
 
     /* =====================================================

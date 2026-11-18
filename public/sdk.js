@@ -1030,51 +1030,26 @@
       return null;
     }
 
-    if (
-      Array.isArray(
-        decision.rules
-      )
-    ) {
-      applyRules(
-        decision.rules
-      );
-    } else {
-      switch (
-        cleanString(
-          decision.action,
-          100
-        )
-      ) {
-        case "INCENTIVE_HIGH":
-          injectBanner(
-            "Special Offer\nUnlock premium savings today."
-          );
-          break;
+    if (Array.isArray(decision.rules)) {
+      applyRules(decision.rules);
+    }
 
-        case "INCENTIVE_MED":
-          updateText(
-            options.ctaSelector ||
-              "button",
-            "Claim Offer"
-          );
-          break;
-
-        case "INCENTIVE_LOW":
-          updateText(
-            options.ctaSelector ||
-              "button",
-            "Continue"
-          );
-          break;
-
-        default:
-          break;
-      }
+    // A discount selection is not a redeemable coupon by itself.
+    // Dispatch the decision for the merchant's commerce integration.
+    try {
+      window.dispatchEvent(new CustomEvent("reden:decision", {
+        detail: {
+          ...decision,
+          discountPercent: Number(decision.discount_percent ?? decision.score ?? 0),
+        },
+      }));
+    } catch (error) {
+      warn("decision event dispatch failed", error);
     }
 
     const decisionId =
       cleanString(
-        decision.decision_id,
+        decision.decision_id || decision.decisionId,
         200
       );
 

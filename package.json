@@ -5,7 +5,7 @@
   "main": "orchestrator/reden.js",
   "scripts": {
     "start": "node orchestrator/reden.js",
-    "test": "node --test orchestrator/intelligence/*.test.js"
+    "test": "node --test orchestrator/intelligence/*.test.js optimization/*.test.js"
   },
   "engines": {
     "node": ">=18"
