@@ -23,7 +23,7 @@ import {
 } from "./notification/emailEngine.js";
 import { toMerchantLanguage } from "./intelligence/merchantLanguage.js";
 import { composeWeeklyRevenue, loadWeeklyRevenue } from "./intelligence/weeklyRevenue.js";
-import { diagnoseSales } from "./intelligence/diagnostics.js";
+import { diagnoseSales, diagnoseJourney } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
 import { composeConversationResponse } from "./intelligence/responsePolicy.js";
 import { resolveReasoningIntents, composeReasonedResponse } from "./intelligence/reasoningLayer.js";
@@ -976,28 +976,8 @@ function composeOverview(evidence) {
 
 function composeFunnel(evidence) {
   const summary = `Today's observed funnel events are ${evidence.pageViews} page views, ${evidence.productViews} product views, ${evidence.addToCart} add-to-cart events, ${evidence.checkoutStarted} checkout starts, and ${evidence.purchases} purchase events. These are event counts, not unique-user stage counts.`;
-  const baseline = evidence.funnelBaseline;
-
-  if (!baseline || baseline.status === "insufficient_history") {
-    return `${summary} REDEN does not yet have five eligible historical days with recorded page-view sessions for a reliable same-time funnel comparison.`;
-  }
-
-  if (baseline.status === "below_baseline" && baseline.current) {
-    const labels = {
-      productView: "product-view",
-      addToCart: "add-to-cart",
-      checkout: "checkout",
-      purchase: "purchase",
-    };
-    const details = baseline.lowStages.map((stage) => {
-      const currentRate = Number(baseline.current.rates?.[stage]) * 100;
-      const averageRate = Number(baseline.averages?.[stage]) * 100;
-      return `${labels[stage]} session rate is ${currentRate.toFixed(1)}% versus a same-time historical average of ${averageRate.toFixed(1)}%.`;
-    });
-    return `${summary} Recorded funnel rates are materially below their baseline: ${details.join(" ")} Treat these as tracking signals to investigate, not proof of a specific cause.`;
-  }
-
-  return `${summary} The available recorded session-level rates are not materially below the baseline under REDEN's current threshold. This does not rule out other causes of a sales decline.`;
+  const diagnosis = diagnoseJourney(evidence.funnelBaseline || {});
+  return `${summary} ${diagnosis}`;
 }
 
 function composeAttribution(evidence) {
