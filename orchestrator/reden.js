@@ -2669,6 +2669,7 @@ app.post("/event", async (req, res) => {
   const cartId = normalizeString(sanitizedPayload.cart_id, 200);
 
   const client = await db.connect();
+  let autoCompletedDecision = null;
 
   try {
     await client.query("BEGIN");
@@ -2765,6 +2766,44 @@ app.post("/event", async (req, res) => {
     }
 
     /*
+     * A verified purchase event can complete the most recent actioned
+     * decision for this same site/session within the session window.
+     * Identified duplicate orders are excluded so they cannot earn twice.
+     */
+    if (event === "PURCHASE" && eventResult.rowCount && (!orderRecord || orderInserted)) {
+      const purchaseAmount = Math.max(0, validateNumber(
+        sanitizedPayload.revenue ?? sanitizedPayload.order_total,
+        0
+      ));
+      const attributed = await client.query(
+        `
+          WITH candidate AS (
+            SELECT id
+            FROM decisions
+            WHERE site_id = $1
+              AND session_id = $2
+              AND state = 'ACTIONED'
+              AND actioned_at >= NOW() - INTERVAL '30 minutes'
+            ORDER BY actioned_at DESC
+            LIMIT 1
+            FOR UPDATE
+          )
+          UPDATE decisions d
+          SET
+            state = 'COMPLETED',
+            converted = TRUE,
+            revenue = $3,
+            completed_at = NOW()
+          FROM candidate
+          WHERE d.id = candidate.id
+          RETURNING d.id, d.action, d.bandit_context_key, d.revenue
+        `,
+        [siteId, sessionId, purchaseAmount]
+      );
+      autoCompletedDecision = attributed.rows[0] || null;
+    }
+
+    /*
      * CHECKOUT_STARTED enters recovery processing.
      *
      * customer_email is stored on the queue row itself so
@@ -2831,6 +2870,22 @@ app.post("/event", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    if (autoCompletedDecision) {
+      await updateBandit(
+        siteId,
+        autoCompletedDecision.action,
+        true,
+        autoCompletedDecision.bandit_context_key
+      );
+      publishSiteEvent(siteId, {
+        event: "commerce.event",
+        eventId: crypto.randomUUID(),
+        sessionId,
+        eventType: "DECISION_COMPLETED",
+        occurredAt: new Date().toISOString(),
+      });
+    }
 
     // Publish only newly committed events. Duplicate SDK retries
     // are acknowledged but never broadcast twice.
