@@ -10,7 +10,7 @@ import compression from "compression";
 import rateLimit from "express-rate-limit";
 
 import { db, initDB } from "./infrastructure/db.js";
-import { pickAction, updateBandit } from "./optimization/banditEngine.js";
+import { pickAction, updateBandit, deriveBanditContext } from "./optimization/banditEngine.js";
 import {
   updateSessionContext,
   getSessionContext,
@@ -2904,11 +2904,18 @@ app.post("/score", async (req, res) => {
       sessionId
     );
 
+    const decisionContext = context || behavior;
+    const banditContextKey = deriveBanditContext({
+      cart_value: Math.max(0, cartValue),
+      behavior: decisionContext,
+    });
+
     const action = await pickAction({
       site_id: siteId,
       session_id: sessionId,
       cart_value: Math.max(0, cartValue),
-      behavior: context || behavior,
+      behavior: decisionContext,
+      context_key: banditContextKey,
     });
 
     const actionMap = {
@@ -2929,6 +2936,7 @@ app.post("/score", async (req, res) => {
           action,
           score,
           state,
+          bandit_context_key,
           created_at
         )
         VALUES (
@@ -2937,6 +2945,7 @@ app.post("/score", async (req, res) => {
           $3,
           $4,
           'SCORED',
+          $5,
           NOW()
         )
         RETURNING id
@@ -2946,6 +2955,7 @@ app.post("/score", async (req, res) => {
         sessionId,
         action,
         score,
+        banditContextKey,
       ]
     );
 
@@ -3089,6 +3099,7 @@ app.post("/outcome", async (req, res) => {
           action,
           converted,
           revenue,
+          bandit_context_key,
           completed_at
       `,
       [
@@ -3142,7 +3153,8 @@ app.post("/outcome", async (req, res) => {
     await updateBandit(
       siteId,
       decision.action,
-      converted
+      converted,
+      decision.bandit_context_key
     );
 
     return success(res, {
