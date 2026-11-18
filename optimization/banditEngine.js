@@ -42,12 +42,19 @@ export function deriveBanditContext({ cart_value = 0, behavior = {} } = {}) {
   return `intent:${intentBand}|cart:${cartBand}|returning:${returning ? "yes" : "no"}`;
 }
 
-export function eligibleBanditActions(cartValue) {
+export function eligibleBanditActions(cartValue, behavior = {}) {
   const cart = number(cartValue);
   if (cart <= 0) return ["NONE"];
+
+  const contextKey = deriveBanditContext({ cart_value: cart, behavior });
+  const intentBand = contextKey.match(/intent:(low|medium|high)/)?.[1] || "low";
+
+  // Strong intent should not be subsidized by default; moderate intent
+  // gets only a small intervention. Low intent can explore eligible arms.
+  if (intentBand === "high") return ["NONE"];
   const actions = ["NONE", "INCENTIVE_LOW"];
-  if (cart >= 500) actions.push("INCENTIVE_MED");
-  if (cart >= 1000) actions.push("INCENTIVE_HIGH");
+  if (intentBand === "low" && cart >= 500) actions.push("INCENTIVE_MED");
+  if (intentBand === "low" && cart >= 1000) actions.push("INCENTIVE_HIGH");
   return actions;
 }
 
@@ -125,7 +132,7 @@ export async function pickAction({ site_id, session_id = null, cart_value = 0, b
     if (!site_id) return "NONE";
     await ensureBanditState(site_id);
     const contextKey = context_key || deriveBanditContext({ cart_value, behavior });
-    const eligible = eligibleBanditActions(cart_value);
+    const eligible = eligibleBanditActions(cart_value, behavior);
 
     const [globalResult, contextualResult] = await Promise.all([
       db.query(`SELECT action, pulls, rewards FROM bandit_state WHERE site_id = $1`, [site_id]),
@@ -157,25 +164,35 @@ export async function updateBandit(site_id, action, converted, context_key = nul
       ? context_key
       : "context:unknown|cart:unknown|returning:unknown";
 
-    await db.query(
-      `INSERT INTO bandit_state (site_id, action, pulls, rewards, updated_at)
-       VALUES ($1, $2, 1, $3, NOW())
-       ON CONFLICT (site_id, action) DO UPDATE SET
-         pulls = bandit_state.pulls + 1,
-         rewards = bandit_state.rewards + EXCLUDED.rewards,
-         updated_at = NOW()`,
-      [site_id, action, reward]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO bandit_state (site_id, action, pulls, rewards, updated_at)
+         VALUES ($1, $2, 1, $3, NOW())
+         ON CONFLICT (site_id, action) DO UPDATE SET
+           pulls = bandit_state.pulls + 1,
+           rewards = bandit_state.rewards + EXCLUDED.rewards,
+           updated_at = NOW()`,
+        [site_id, action, reward]
+      );
 
-    await db.query(
-      `INSERT INTO bandit_context_state (site_id, context_key, action, pulls, rewards, updated_at)
-       VALUES ($1, $2, $3, 1, $4, NOW())
-       ON CONFLICT (site_id, context_key, action) DO UPDATE SET
-         pulls = bandit_context_state.pulls + 1,
-         rewards = bandit_context_state.rewards + EXCLUDED.rewards,
-         updated_at = NOW()`,
-      [site_id, contextKey, action, reward]
-    );
+      await client.query(
+        `INSERT INTO bandit_context_state (site_id, context_key, action, pulls, rewards, updated_at)
+         VALUES ($1, $2, $3, 1, $4, NOW())
+         ON CONFLICT (site_id, context_key, action) DO UPDATE SET
+           pulls = bandit_context_state.pulls + 1,
+           rewards = bandit_context_state.rewards + EXCLUDED.rewards,
+           updated_at = NOW()`,
+        [site_id, contextKey, action, reward]
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   } catch (error) {
     console.error("[BANDIT UPDATE ERROR]", error);
   }
