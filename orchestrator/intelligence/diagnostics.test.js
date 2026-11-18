@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { diagnoseSales } from "./diagnostics.js";
+import { diagnoseSales, diagnoseJourney } from "./diagnostics.js";
 
 const baseEvidence = {
   purchases: 2,
@@ -73,4 +73,47 @@ test("treats mismatched purchase and session records as a data-quality issue", (
 test("does not invent zero revenue when revenue evidence is absent", () => {
   const answer = diagnoseSales({ ...baseEvidence, purchaseRevenue: null });
   assert.doesNotMatch(answer, /recorded purchase revenue is 0/i);
+});
+
+
+test("journey diagnosis quantifies the downstream checkout gap and gives targeted investigations", () => {
+  const answer = diagnoseJourney({
+    status: "below_baseline",
+    lowStages: ["purchase"],
+    current: {
+      pageViewSessions: 30,
+      productViewSessions: 22,
+      addToCartSessions: 12,
+      checkoutSessions: 10,
+      purchaseSessions: 3,
+    },
+    averages: { purchase: 0.6 },
+    trackingValidationStages: [],
+  });
+  assert.match(answer, /checkout-to-purchase completion/i);
+  assert.match(answer, /3 of 10 sessions progressed/i);
+  assert.match(answer, /payment failures/i);
+  assert.match(answer, /cannot identify the cause/i);
+});
+
+test("zero recorded progression is described as a possible tracking gap, not confirmed shopper abandonment", () => {
+  const answer = diagnoseJourney({
+    current: { pageViewSessions: 12, productViewSessions: 0 },
+    trackingValidationStages: ["productView"],
+    lowStages: [],
+  });
+  assert.match(answer, /could be a real journey break or missing event tracking/i);
+  assert.match(answer, /validate the event stream/i);
+  assert.doesNotMatch(answer, /proves shoppers abandoned/i);
+});
+
+test("journey diagnosis flags low sample sizes as directional", () => {
+  const answer = diagnoseJourney({
+    lowStages: ["addToCart"],
+    current: { pageViewSessions: 3, productViewSessions: 2, addToCartSessions: 1 },
+    averages: { addToCart: 0.5 },
+    trackingValidationStages: [],
+  });
+  assert.match(answer, /small sample/i);
+  assert.match(answer, /directional/i);
 });
