@@ -2,19 +2,12 @@ name: REDEN syntax check
 
 on:
   pull_request:
-    paths:
-      - "orchestrator/**/*.js"
-      - "package.json"
-      - ".github/workflows/reden-syntax-check.yml"
   push:
     branches:
       - main
       - reden-traffic-baseline
       - reden-merchant-language-reports
-    paths:
-      - "orchestrator/**/*.js"
-      - "package.json"
-      - ".github/workflows/reden-syntax-check.yml"
+      - final-intelligence-abc
 
 jobs:
   syntax:
