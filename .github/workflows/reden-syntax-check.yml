@@ -26,6 +26,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: Install project dependencies for unit tests
+        run: npm install --ignore-scripts --no-audit --no-fund
       - name: Validate REDEN server and intelligence module syntax
         run: |
           node --check orchestrator/reden.js
