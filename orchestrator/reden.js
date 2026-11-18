@@ -2941,7 +2941,7 @@ app.post("/score", async (req, res) => {
   );
 
   const behavior = safePayload(
-    req.body?.behavior
+    req.body?.behavior || req.body?.meta
   );
 
   if (!sessionId) {
@@ -2958,7 +2958,10 @@ app.post("/score", async (req, res) => {
       sessionId
     );
 
-    const decisionContext = context || behavior;
+    const decisionContext = {
+      ...(context || {}),
+      ...(behavior || {}),
+    };
     const banditContextKey = deriveBanditContext({
       cart_value: Math.max(0, cartValue),
       behavior: decisionContext,
