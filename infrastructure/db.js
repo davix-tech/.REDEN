@@ -304,7 +304,17 @@ async function initializeDatabase() {
 
     await client.query(`
       ALTER TABLE recovery_queue
-      ALTER COLUMN eligible_after SET DEFAULT NOW()
+      ALTER COLUMN eligible_after SET DEFAULT NOW(),
+      ALTER COLUMN eligible_after SET NOT NULL,
+      ALTER COLUMN discount_percent SET DEFAULT 0
+    `);
+
+    // The existing recovery message does not issue redeemable coupons.
+    // Clear queued legacy incentive values to avoid suggesting one exists.
+    await client.query(`
+      UPDATE recovery_queue
+      SET discount_percent = 0
+      WHERE status IN ('PENDING', 'PROCESSING')
     `);
 
     await client.query(`
