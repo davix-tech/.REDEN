@@ -37,6 +37,8 @@ jobs:
           node --check orchestrator/intelligence/commerceEvidence.js
           node --check orchestrator/intelligence/commerceIntelligence.js
           node --check infrastructure/db.js
+          node --check optimization/banditEngine.js
+          node --check optimization/banditEngine.test.js
           node --check public/sdk.js
       - name: Run intelligence unit tests
         run: npm test
