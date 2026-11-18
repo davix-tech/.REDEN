@@ -113,3 +113,21 @@ Attribution reports describe sessions and recorded revenue by source/campaign. T
 - Customer cohort analysis requires a stable pseudonymous `customer_ref`.
 - Recorded revenue is not profit or proof of settled payment.
 - REDEN does not infer advertising ROI without campaign spend evidence.
+
+## Adaptive decision event and outcome learning
+
+When `autoOptimize` is enabled, REDEN selects an action and emits a browser event for storefront-specific execution:
+
+```js
+window.addEventListener("reden:decision", (event) => {
+  const decision = event.detail;
+  // decision.action: NONE | INCENTIVE_LOW | INCENTIVE_MED | INCENTIVE_HIGH
+  // decision.discountPercent: selected percentage (0, 5, 10, or 20)
+  // decision.decision_id / decision.decisionId: decision record ID
+  // Apply promotions only through your own checkout/promotion rules.
+});
+```
+
+REDEN selects and reports an incentive; it does not create a redeemable coupon or guarantee that the checkout price changes. Storefront integrations must apply the promotion safely and honor their own margin, eligibility and checkout rules.
+
+A newly recorded PURCHASE event can automatically complete the latest ACTIONED decision for the same site and session when it occurred within 30 minutes. Identified duplicate orders are excluded. The decision's context is used to update the contextual optimizer. Manual `Reden.outcome()` remains supported and is idempotent when the same conversion result was already completed automatically.
