@@ -3023,8 +3023,10 @@ app.post("/score", async (req, res) => {
 
     return success(res, {
       decisionId: result.rows[0].id,
+      decision_id: result.rows[0].id,
       action,
       score,
+      discount_percent: score,
     });
   } catch (error) {
     console.error("[SCORE ERROR]", error);
