@@ -2713,8 +2713,9 @@ app.post("/event", async (req, res) => {
     if (eventResult.rowCount && orderRecord) {
       orderInserted = await recordIdentifiedOrder(client, orderRecord);
     }
+    let sessionContext = null;
     if (eventResult.rowCount && (!orderRecord || orderInserted)) {
-      await updateSessionContext({
+      sessionContext = await updateSessionContext({
         siteId,
         sessionId,
         event,
@@ -2789,6 +2790,9 @@ app.post("/event", async (req, res) => {
             customer_email,
             status,
             discount_percent,
+            cart_value,
+            intent_score,
+            eligible_after,
             created_at,
             updated_at
           )
@@ -2797,17 +2801,32 @@ app.post("/event", async (req, res) => {
             $2,
             $3,
             'PENDING',
-            10,
+            0,
+            $4,
+            $5,
+            NOW() + INTERVAL '60 minutes',
             NOW(),
             NOW()
           )
           ON CONFLICT (site_id, session_id) DO UPDATE
-          SET customer_email = COALESCE(
-            EXCLUDED.customer_email,
-            recovery_queue.customer_email
-          )
+          SET
+            customer_email = COALESCE(EXCLUDED.customer_email, recovery_queue.customer_email),
+            cart_value = GREATEST(recovery_queue.cart_value, EXCLUDED.cart_value),
+            intent_score = GREATEST(recovery_queue.intent_score, EXCLUDED.intent_score),
+            eligible_after = CASE
+              WHEN recovery_queue.status = 'PENDING'
+              THEN NOW() + INTERVAL '60 minutes'
+              ELSE recovery_queue.eligible_after
+            END,
+            updated_at = NOW()
         `,
-        [siteId, sessionId, customerEmail || null]
+        [
+          siteId,
+          sessionId,
+          customerEmail || null,
+          boundedCartValue,
+          Number(sessionContext?.intent_score || 0),
+        ]
       );
     }
 
@@ -3257,10 +3276,14 @@ cron.schedule(
             site_id,
             session_id,
             customer_email,
-            discount_percent
+            discount_percent,
+            cart_value,
+            intent_score,
+            attempts
           FROM recovery_queue
           WHERE status = 'PENDING'
-          ORDER BY created_at ASC
+            AND eligible_after <= NOW()
+          ORDER BY cart_value DESC, intent_score DESC, created_at ASC
           LIMIT 20
           FOR UPDATE SKIP LOCKED
         `
@@ -3272,6 +3295,7 @@ cron.schedule(
             UPDATE recovery_queue
             SET
               status = 'PROCESSING',
+              attempts = attempts + 1,
               updated_at = NOW()
             WHERE id = $1
           `,
@@ -3283,23 +3307,24 @@ cron.schedule(
 
       for (const job of jobs.rows) {
         try {
-          const converted = await db.query(
+          const completed = await db.query(
             `
-              SELECT id
-              FROM decisions
-              WHERE site_id = $1
-                AND session_id = $2
-                AND converted = TRUE
-                AND state = 'COMPLETED'
-              LIMIT 1
+              SELECT EXISTS (
+                SELECT 1 FROM event_logs
+                WHERE site_id = $1 AND session_id = $2 AND event = 'PURCHASE'
+              ) OR EXISTS (
+                SELECT 1 FROM session_summaries
+                WHERE site_id = $1 AND session_id = $2 AND purchased = TRUE
+              ) OR EXISTS (
+                SELECT 1 FROM decisions
+                WHERE site_id = $1 AND session_id = $2
+                  AND converted = TRUE AND state = 'COMPLETED'
+              ) AS completed
             `,
-            [
-              job.site_id,
-              job.session_id,
-            ]
+            [job.site_id, job.session_id]
           );
 
-          if (converted.rowCount) {
+          if (completed.rows[0]?.completed) {
             await db.query(
               `
                 UPDATE recovery_queue
@@ -3362,13 +3387,17 @@ cron.schedule(
           const site =
             siteResult.rows[0];
 
-          await sendRecoveryEmail({
-            site,
-            sessionId: job.session_id,
-            customerEmail: job.customer_email,
-            discountPercent:
-              job.discount_percent,
+          const emailResult = await sendRecoveryEmail({
+            to: job.customer_email,
+            cart: {
+              value: Number(job.cart_value || 0),
+              sessionId: job.session_id,
+            },
           });
+
+          if (!emailResult?.ok) {
+            throw new Error(emailResult?.error || "recovery_email_send_failed");
+          }
 
           await db.query(
             `
@@ -3416,7 +3445,8 @@ cron.schedule(
             `
               UPDATE recovery_queue
               SET
-                status = 'FAILED',
+                status = CASE WHEN attempts < 3 THEN 'PENDING' ELSE 'FAILED' END,
+                eligible_after = CASE WHEN attempts < 3 THEN NOW() + INTERVAL '30 minutes' ELSE eligible_after END,
                 updated_at = NOW()
               WHERE id = $1
             `,
