@@ -102,9 +102,11 @@ export function resolveReasoningIntents(question, detectedIntents = [], previous
     const previous = parseIntents(previousTurn.intents);
     if (/^(and why|why though|why is that|why did that happen|what caused it|what caused that|can you explain why|explain why)$/i.test(normalized)) {
       if (previous.includes("weekly_revenue")) intents.push("weekly_revenue", "diagnostic");
-      else if (previous.some((intent) => ["revenue", "sales", "purchases", "overview"].includes(intent))) {
+      else if (previous.includes("retention")) intents.push("diagnostic", "retention");
+      else if (previous.includes("cart")) intents.push("diagnostic", "cart");
+      else if (previous.some((intent) => ["revenue", "sales"].includes(intent))) {
         intents.push("diagnostic", "revenue");
-      } else if (previous.some((intent) => ["diagnostic", "funnel", "cart"].includes(intent))) {
+      } else if (previous.some((intent) => ["diagnostic", "funnel"].includes(intent))) {
         intents.push("diagnostic");
       } else {
         intents.push("contextual_follow_up");
