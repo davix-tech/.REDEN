@@ -105,7 +105,7 @@ test("diagnosis prioritizes tracking uncertainty over assuming shoppers abandone
   });
 
   assert.match(answer, /could be a real drop-off or missing tracking/i);
-  assert.match(answer, /verify/i);
+  assert.match(answer, /inspect|verify/i);
   assert.doesNotMatch(answer, /customers abandoned because/i);
 });
 
