@@ -147,6 +147,108 @@ export function detectIntents(question, previousTurn = null) {
     return ["growth"];
   }
 
+  // Route common merchant questions to existing evidence and advice handlers.
+  if (
+    q.includes("what is happening in my store") ||
+    q.includes("what is going well in my business") ||
+    q.includes("are things looking good") ||
+    q.includes("am i making progress") ||
+    q.includes("what can you tell me about customer behaviour") ||
+    q.includes("what can you tell me about customer behavior") ||
+    q.includes("what does customer activity tell us about my business")
+  ) {
+    return ["overview"];
+  }
+
+  if (
+    q.includes("how much are customers spending") ||
+    q.includes("how much do customers spend")
+  ) {
+    return ["revenue"];
+  }
+
+  if (
+    q.includes("which page gets the most attention") ||
+    q.includes("am i attracting the right customers")
+  ) {
+    return ["traffic"];
+  }
+
+  if (
+    q.includes("what do customers do before buying") ||
+    q.includes("what are customers struggling with") ||
+    q.includes("is my website helping customers buy") ||
+    q.includes("which pages might be confusing customers")
+  ) {
+    return ["diagnostic"];
+  }
+
+  if (
+    q.includes("what actions show that someone wants to buy") ||
+    q.includes("what behaviour suggests someone is about to buy") ||
+    q.includes("what behavior suggests someone is about to buy") ||
+    q.includes("can you identify potential buyers")
+  ) {
+    return ["intent_opportunities"];
+  }
+
+  if (
+    q.includes("is my store converting well")
+  ) {
+    return ["conversion"];
+  }
+
+  if (
+    q.includes("am i depending too much on new customers") ||
+    q.includes("what can i learn from repeated visits")
+  ) {
+    return ["retention"];
+  }
+
+  if (
+    q.includes("are customers responding to my offers")
+  ) {
+    return ["bandit"];
+  }
+
+  if (
+    q.includes("am i giving away too many discounts") ||
+    q.includes("are my discounts eating into my margins") ||
+    q.includes("are my prices too low") ||
+    q.includes("am i actually making a profit") ||
+    q.includes("what questions might customers have before buying") ||
+    q.includes("what might make customers trust my store more")
+  ) {
+    return ["advice"];
+  }
+
+  if (
+    q.includes("why is my business not growing") ||
+    q.includes("what is wrong with my store") ||
+    q.includes("what is the biggest weakness in my store") ||
+    q.includes("what has declined recently")
+  ) {
+    return ["diagnostic"];
+  }
+
+  if (q.includes("what opportunities am i missing")) {
+    return ["intent_opportunities"];
+  }
+
+  if (
+    q.includes("what do you think i should do about my store")
+  ) {
+    return ["merchant_priority"];
+  }
+
+  if (
+    q.includes("what's moving in the store") ||
+    q.includes("what is moving in the store") ||
+    q.includes("do shoppers keep trying to buy the same item")
+  ) {
+    return ["product_interest", "purchases"];
+  }
+
   const intents = [];
 
   // Only store-specific identity questions should return the connected store name.
