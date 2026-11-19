@@ -85,12 +85,29 @@ export function detectIntents(question, previousTurn = null) {
   }
 
   // Store-health and growth questions use the existing overview evidence handler.
-  if (/\\b(how are things going with my store|how is my store doing|how is my business doing|is my business growing|is my store growing|are things getting better or worse)\\b/.test(q)) {
+  if (
+    q.includes("how are things going with my store") ||
+    q.includes("how is my store doing") ||
+    q.includes("how is my business doing") ||
+    q.includes("is my business growing") ||
+    q.includes("is my store growing") ||
+    q.includes("are things getting better or worse")
+  ) {
     return ["overview"];
   }
 
   // Repeat-customer questions need retention evidence.
-  if (/\\b(retention|retaining customers|customer loyalty|repeat customers|returning customers|customers coming back|customers come back|customers returning|customers return)\\b/.test(q)) {
+  if (
+    q.includes("retention") ||
+    q.includes("retaining customers") ||
+    q.includes("customer loyalty") ||
+    q.includes("repeat customers") ||
+    q.includes("returning customers") ||
+    q.includes("customers coming back") ||
+    q.includes("customers come back") ||
+    q.includes("customers returning") ||
+    q.includes("customers return")
+  ) {
     return ["retention"];
   }
 
@@ -211,7 +228,7 @@ export function detectIntents(question, previousTurn = null) {
 
   const uniqueIntents = [...new Set(intents)];
   // "Performing" is a product-performance cue, not a store overview request.
-  if (uniqueIntents.includes("product_interest") && uniqueIntents.includes("purchases")) {
+  if (uniqueIntents.includes("product_interest")) {
     const overviewIndex = uniqueIntents.indexOf("overview");
     if (overviewIndex !== -1) uniqueIntents.splice(overviewIndex, 1);
   }
