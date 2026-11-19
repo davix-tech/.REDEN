@@ -62,7 +62,7 @@ export function detectFollowUpIntent(question, previousTurn) {
     return ["revenue"];
   }
 
-  if (/^(tell me more|explain that|what do you mean|what does that mean|what about it|can you explain|can you explain that more simply|is that good or bad|explain further|how so|how does that work|elaborate)$/.test(q)) {
+  if (/^(tell me more|explain that|what do you mean|what does that mean|what does that mean for my business|what about it|can you explain|can you explain that more simply|is that good or bad|explain further|how so|how does that work|elaborate)$/.test(q)) {
     return ["contextual_follow_up"];
   }
 
