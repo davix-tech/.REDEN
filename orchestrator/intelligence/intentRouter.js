@@ -242,6 +242,7 @@ export function detectIntents(question, previousTurn = null) {
   }
 
   if (
+    q.includes("what s moving in the store") ||
     q.includes("what's moving in the store") ||
     q.includes("what is moving in the store") ||
     q.includes("do shoppers keep trying to buy the same item")
