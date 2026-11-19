@@ -74,9 +74,9 @@ export async function updateSessionContext({
           $9,
           LEAST(
             1,
-            ($3 * 0.02) +
-            ($4 * 0.08) +
-            ($5 * 0.20) +
+            ($3::integer * 0.02) +
+            ($4::integer * 0.08) +
+            ($5::integer * 0.20) +
             CASE WHEN $6 THEN 0.30 ELSE 0 END +
             CASE WHEN $7 THEN 0.50 ELSE 0 END
           ),
@@ -171,9 +171,9 @@ export async function updateSessionContext({
           intent_score = LEAST(
             1,
             (
-              (session_summaries.page_views + EXCLUDED.page_views) * 0.02 +
-              (session_summaries.product_views + EXCLUDED.product_views) * 0.08 +
-              (session_summaries.cart_additions + EXCLUDED.cart_additions) * 0.20 +
+              (session_summaries.page_views + EXCLUDED.page_views)::numeric * 0.02 +
+              (session_summaries.product_views + EXCLUDED.product_views)::numeric * 0.08 +
+              (session_summaries.cart_additions + EXCLUDED.cart_additions)::numeric * 0.20 +
               CASE
                 WHEN session_summaries.checkout_started OR EXCLUDED.checkout_started
                 THEN 0.30
