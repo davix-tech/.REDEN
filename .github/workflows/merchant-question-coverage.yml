@@ -22,5 +22,5 @@ jobs:
           node-version: 20
       - name: Install dependencies
         run: npm install --ignore-scripts --no-audit --no-fund
-      - name: Run merchant question coverage baseline
-        run: node --test orchestrator/intelligence/merchantQuestionCoverage.test.js orchestrator/intelligence/merchantReasoningQuality.test.js
+      - name: Run merchant question and conversation quality tests
+        run: node --test orchestrator/intelligence/merchantQuestionCoverage.test.js orchestrator/intelligence/merchantReasoningQuality.test.js orchestrator/intelligence/merchantConversationQuality.test.js
