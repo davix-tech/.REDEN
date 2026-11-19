@@ -34,7 +34,9 @@ export function detectFollowUpIntent(question, previousTurn) {
 
   if (/^(why|why is that|why did that happen|what caused that|what is causing that)$/.test(q)) {
     if (prior.includes("weekly_revenue")) return ["weekly_revenue", "diagnostic"];
-    if (prior.some((intent) => ["revenue", "overview", "purchases", "sales"].includes(intent))) {
+    if (prior.includes("retention")) return ["diagnostic", "retention"];
+    if (prior.includes("cart")) return ["diagnostic", "cart"];
+    if (prior.some((intent) => ["revenue", "sales"].includes(intent))) {
       return ["diagnostic", "revenue"];
     }
     if (prior.includes("diagnostic") || prior.includes("merchant_priority")) {
