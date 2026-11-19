@@ -44,13 +44,13 @@ export function detectFollowUpIntent(question, previousTurn) {
     }
   }
 
-  if (/^(what should i do|what should i do now|what should i do next|what should i do then|what now|what next|what do you recommend|how do i fix it)$/.test(q)) {
+  if (/^(what should i do|what should i do now|what should i do next|what should i do then|what now|what next|what do you recommend|how do i fix it|how can i fix it|which one should i deal with first)$/.test(q)) {
     return ["merchant_priority"];
   }
 
   if (
     prior.includes("weekly_revenue") &&
-    /^(what about last week|and last week|previous week|compare with last week|how about last week)$/.test(q)
+    /^(what about last week|and last week|previous week|compare with last week|how about last week|can you compare that with last week)$/.test(q)
   ) {
     return ["weekly_revenue"];
   }
@@ -62,7 +62,7 @@ export function detectFollowUpIntent(question, previousTurn) {
     return ["revenue"];
   }
 
-  if (/^(tell me more|explain that|what do you mean|what does that mean|what about it|can you explain|explain further|how so|how does that work|elaborate)$/.test(q)) {
+  if (/^(tell me more|explain that|what do you mean|what does that mean|what about it|can you explain|can you explain that more simply|is that good or bad|explain further|how so|how does that work|elaborate)$/.test(q)) {
     return ["contextual_follow_up"];
   }
 
