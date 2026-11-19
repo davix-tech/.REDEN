@@ -44,3 +44,24 @@ test("business redirects rotate after a previous redirect", () => {
   const second = chooseBusinessRedirectVariant("Tell me a joke", [{ answer: first }]);
   assert.notEqual(first, second);
 });
+
+test("why and cause follow-ups preserve cart and retention topics", () => {
+  assert.deepEqual(detectFollowUpIntent("Why?", {
+    question: "Are customers coming back?",
+    answer: "Returning-customer evidence is limited.",
+    intents: ["retention"],
+  }), ["diagnostic", "retention"]);
+  assert.deepEqual(detectFollowUpIntent("What caused that?", {
+    question: "How many customers abandoned their carts?",
+    answer: "Recorded cart abandonment events were found.",
+    intents: ["cart"],
+  }), ["diagnostic", "cart"]);
+});
+
+test("why after product performance does not become a revenue diagnosis", () => {
+  assert.equal(detectFollowUpIntent("Why?", {
+    question: "Which products are performing best?",
+    answer: "These products have the strongest recorded activity.",
+    intents: ["product_interest", "purchases"],
+  }), null);
+});
