@@ -20,12 +20,14 @@ function runConversation(turns) {
   for (const turn of turns) {
     const result = ask(turn.question, previousTurn);
     const missing = (turn.expected ?? []).filter((intent) => !result.intents.includes(intent));
+    const unexpected = (turn.forbidden ?? []).filter((intent) => result.intents.includes(intent));
     transcript.push({
       question: turn.question,
       expected: turn.expected ?? [],
       actual: result.intents,
       missing,
-      matched: missing.length === 0,
+      unexpected,
+      matched: missing.length === 0 && unexpected.length === 0,
     });
     previousTurn = result;
   }
@@ -62,7 +64,7 @@ const conversations = [
     turns: [
       { question: "How much revenue came in today?", expected: ["revenue"] },
       { question: "Which products are performing best?", expected: ["product_interest", "purchases"] },
-      { question: "Why?", expected: [] },
+      { question: "Why?", expected: ["contextual_follow_up"], forbidden: ["diagnostic", "revenue"] },
     ],
   },
   {
