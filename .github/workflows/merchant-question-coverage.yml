@@ -1,6 +1,7 @@
 name: Merchant question coverage
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - test/merchant-question-coverage
