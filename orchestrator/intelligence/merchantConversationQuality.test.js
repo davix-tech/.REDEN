@@ -124,7 +124,7 @@ test("full conversation diagnostics report unsupported continuity instead of hid
 
   console.log("\\n[REDEN MULTI-TURN CONVERSATION QUALITY]");
   console.log(JSON.stringify({
-    conversations: results.length,
+    conversationCount: results.length,
     totalTurns,
     matchedTurns,
     mismatchedTurns: mismatches.length,
