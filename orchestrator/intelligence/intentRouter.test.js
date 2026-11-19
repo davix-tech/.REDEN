@@ -177,3 +177,19 @@ test("routes everyday sales and traffic wording through the language dictionary"
   assert.deepEqual(detectIntents("How much cash from sales came in today?"), ["revenue"]);
   assert.deepEqual(detectIntents("How many people visited my store today?"), ["traffic", "overview"]);
 });
+
+test("routes store health and business growth questions to overview", () => {
+  assert.deepEqual(detectIntents("How are things going with my store?"), ["overview"]);
+  assert.deepEqual(detectIntents("Is my business growing?"), ["overview"]);
+});
+
+test("recognizes returning-customer questions as retention", () => {
+  assert.deepEqual(detectIntents("Are customers coming back?"), ["retention"]);
+  assert.deepEqual(detectIntents("How many returning customers do I have?"), ["retention"]);
+  assert.deepEqual(detectIntents("Are customers returning to my website?"), ["retention"]);
+});
+
+test("recognizes cart abandonment inflections", () => {
+  assert.deepEqual(detectIntents("How many customers abandoned their carts?"), ["cart"]);
+  assert.deepEqual(detectIntents("Why are customers abandoning their carts?"), ["diagnostic", "cart"]);
+});
