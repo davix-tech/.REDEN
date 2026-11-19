@@ -173,7 +173,7 @@ export function detectIntents(question, previousTurn = null) {
     intents.push("diagnostic");
   }
 
-  if (/\b(cart|checkout|checkouts|basket|abandon)\b/.test(q)) {
+  if (/\b(cart|checkout|checkouts|basket|abandon\w*)\b/.test(q)) {
     intents.push("cart");
   }
 
