@@ -84,6 +84,16 @@ export function detectIntents(question, previousTurn = null) {
     return ["commerce_knowledge"];
   }
 
+  // Store-health and growth questions use the existing overview evidence handler.
+  if (/\\b(how are things going with my store|how is my store doing|how is my business doing|is my business growing|is my store growing|are things getting better or worse)\\b/.test(q)) {
+    return ["overview"];
+  }
+
+  // Repeat-customer questions need retention evidence.
+  if (/\\b(retention|retaining customers|customer loyalty|repeat customers|returning customers|customers coming back|customers come back|customers returning|customers return)\\b/.test(q)) {
+    return ["retention"];
+  }
+
   if (/\b(what is my store called|what is my store name|what is this store called|which store is connected)\b/.test(q)) {
     return ["identity"];
   }
@@ -200,6 +210,11 @@ export function detectIntents(question, previousTurn = null) {
   }
 
   const uniqueIntents = [...new Set(intents)];
+  // "Performing" is a product-performance cue, not a store overview request.
+  if (uniqueIntents.includes("product_interest") && uniqueIntents.includes("purchases")) {
+    const overviewIndex = uniqueIntents.indexOf("overview");
+    if (overviewIndex !== -1) uniqueIntents.splice(overviewIndex, 1);
+  }
 
   // Topic-specific decision questions should receive the knowledge-guided answer,
   // not a competing raw metric section such as bandit state.
