@@ -65,3 +65,32 @@ test("why after product performance does not become a revenue diagnosis", () => 
     intents: ["product_interest", "purchases"],
   }), null);
 });
+
+test("handles contextual merchant follow-ups only with relevant prior turns", () => {
+  const revenueTurn = {
+    question: "How much revenue came in today?",
+    answer: "Your store recorded 12,000 in sales.",
+    intents: ["revenue"],
+  };
+  const weeklyTurn = {
+    question: "How much did my store make this week?",
+    answer: "Your store recorded week-to-date sales.",
+    intents: ["weekly_revenue"],
+  };
+  const diagnosticTurn = {
+    question: "Why are sales down?",
+    answer: "Recorded purchases are below the recent baseline.",
+    intents: ["diagnostic", "purchases"],
+  };
+
+  assert.deepEqual(detectFollowUpIntent("Why?", revenueTurn), ["diagnostic", "revenue"]);
+  assert.deepEqual(detectFollowUpIntent("What caused that?", revenueTurn), ["diagnostic", "revenue"]);
+  assert.deepEqual(detectFollowUpIntent("What should I do then?", diagnosticTurn), ["merchant_priority"]);
+  assert.deepEqual(detectFollowUpIntent("Can you explain that more simply?", revenueTurn), ["contextual_follow_up"]);
+  assert.deepEqual(detectFollowUpIntent("Is that good or bad?", revenueTurn), ["contextual_follow_up"]);
+  assert.deepEqual(detectFollowUpIntent("How can I fix it?", diagnosticTurn), ["merchant_priority"]);
+  assert.deepEqual(detectFollowUpIntent("What does that mean for my business?", revenueTurn), ["contextual_follow_up"]);
+  assert.deepEqual(detectFollowUpIntent("Can you compare that with last week?", weeklyTurn), ["weekly_revenue"]);
+  assert.deepEqual(detectFollowUpIntent("Which one should I deal with first?", diagnosticTurn), ["merchant_priority"]);
+  assert.equal(detectFollowUpIntent("What about yesterday?", revenueTurn), null);
+});
