@@ -63,7 +63,7 @@ const conversations = [
     id: "topic-switch-and-follow-up",
     turns: [
       { question: "How much revenue came in today?", expected: ["revenue"] },
-      { question: "Which products are performing best?", expected: ["product_interest", "purchases"] },
+      { question: "Which products are performing best?", expected: ["product_interest", "purchases"], forbidden: ["overview"] },
       { question: "Why?", expected: ["contextual_follow_up"], forbidden: ["diagnostic", "revenue"] },
     ],
   },
