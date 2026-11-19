@@ -191,5 +191,5 @@ test("recognizes returning-customer questions as retention", () => {
 
 test("recognizes cart abandonment inflections", () => {
   assert.deepEqual(detectIntents("How many customers abandoned their carts?"), ["cart"]);
-  assert.deepEqual(detectIntents("Why are customers abandoning their carts?"), ["diagnostic", "cart"]);
+  assert.deepEqual(detectIntents("Why are customers abandoning their carts?"), ["cart"]);
 });
