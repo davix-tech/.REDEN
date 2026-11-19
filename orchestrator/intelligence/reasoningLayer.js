@@ -7,7 +7,7 @@
  * merchant claims must still come from the existing evidence composers.
  */
 
-const REFERENTIAL_FOLLOW_UP = /^(and why|why though|why is that|why did that happen|what caused it|what caused that|what about that|what about it|would that help|will that help|would that work|will that work|is that good|is that enough|what should i do about it|how do i fix that|how can i improve it|can you explain why|explain why)$/i;
+const REFERENTIAL_FOLLOW_UP = /^(why|and why|why though|why is that|why did that happen|what caused it|what caused that|what about that|what about it|would that help|will that help|would that work|will that work|is that good|is that enough|what should i do about it|how do i fix that|how can i improve it|can you explain why|explain why)$/i;
 
 const SEMANTIC_PATTERNS = [
   {
@@ -100,7 +100,7 @@ export function resolveReasoningIntents(question, detectedIntents = [], previous
 
   if (REFERENTIAL_FOLLOW_UP.test(normalized) && previousTurn?.question && previousTurn?.answer) {
     const previous = parseIntents(previousTurn.intents);
-    if (/^(and why|why though|why is that|why did that happen|what caused it|what caused that|can you explain why|explain why)$/i.test(normalized)) {
+    if (/^(why|and why|why though|why did that happen|what caused it|what caused that|can you explain why|explain why)$/i.test(normalized)) {
       if (previous.includes("weekly_revenue")) intents.push("weekly_revenue", "diagnostic");
       else if (previous.includes("retention")) intents.push("diagnostic", "retention");
       else if (previous.includes("cart")) intents.push("diagnostic", "cart");
