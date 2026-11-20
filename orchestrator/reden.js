@@ -782,7 +782,7 @@ function composeRevenue(evidence) {
   }
 
   const amount = formatPurchaseRevenue(evidence);
-  return `Your store recorded ${amount} in sales revenue today. This is recorded revenue, not verified profit. The store currency has not been confirmed.`;
+  return `Your store recorded ${amount} in sales revenue today (currency not confirmed). This is recorded revenue, not profit.`;
 }
 
 function composeTraffic(evidence) {
