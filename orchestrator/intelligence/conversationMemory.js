@@ -121,3 +121,16 @@ export function chooseBusinessRedirectVariant(question, recentTurns = []) {
   const index = previousRedirects % templates.length;
   return templates[index];
 }
+
+export function selectContextTurn(question, recentTurns = []) {
+  if (!recentTurns.length) return null;
+  const q = normalizedText(question);
+  const isReferential = /^(why|and why|why though|what caused (that|it)|what is causing that|explain that|explain that simply|explain that more simply|can you explain|tell me more|what does that mean|what about (that|it|yesterday|today|last week)|is that (good|bad|enough)|what should i do|what should i do then|why should i do that|how do i fix that|how can i fix it|how can i improve it|would that help|will that help|would that work|will that work|how so|elaborate|what now|what next)$/.test(q);
+  if (!isReferential) return recentTurns[0] || null;
+  // Skip conversational/clarification turns and anchor to the most recent substantive evidence or advice turn.
+  const substantive = recentTurns.find((turn) => {
+    const intents = parseConversationIntents(turn.intents);
+    return intents.length && !intents.every((intent) => ["contextual_follow_up", "greeting", "gratitude"].includes(intent));
+  });
+  return substantive || recentTurns[0] || null;
+}
