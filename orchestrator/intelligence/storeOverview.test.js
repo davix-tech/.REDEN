@@ -27,6 +27,7 @@ test("overview interprets small samples and flags purchase-event/order reconcili
   assert.match(answer, /enough reliable historical traffic/i);
   assert.match(answer, /decision conversion rate is unavailable/i);
   assert.match(answer, /not profit/i);
+  assert.match(answer, /currency not confirmed/i);
 });
 
 test("overview prioritizes a funnel stage below historical baseline", () => {

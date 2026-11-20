@@ -14,6 +14,18 @@ function normalizeQuestion(question) {
 export function detectIntents(question, previousTurn = null) {
   const q = normalizeQuestion(question);
 
+  // Broad everyday merchant wording should route to the existing evidence handlers.
+  // These rules deliberately avoid assuming that the evidence proves the store is healthy.
+  if (/^(how is business|how s business|how is the business|how s the business|how is my business|how s my business|how is the store|how s the store|how is my store|how s my store|how is the shop|how s the shop|how is my shop|how s my shop)$/.test(q)) {
+    return ["overview"];
+  }
+  if (/^(what s happening in (the|my) (store|shop|business)|what is happening in (the|my) (store|shop|business)|what s going on in (the|my) (store|shop|business)|what is going on in (the|my) (store|shop|business)|what s going on with (the|my) (store|shop|business)|what is going on with (the|my) (store|shop|business))$/.test(q)) {
+    return ["overview"];
+  }
+  if (/^(how much (is|are) (my |the )?(earnings|income|money)|how much (money|income|earnings) (did|have) (i|we|my store|the store) (make|made|earn|earned)|what (are|is) (my |the )?(earnings|income)|how much did (my |the )?(store|business) (make|earn)|how much (did|have) i (make|made|earn|earned))$/.test(q)) {
+    return ["revenue"];
+  }
+
   // Keep plain-language period revenue questions focused on the revenue
   // answer instead of appending a generic overview because "today" is present.
   if (/\bhow much\b.*\brevenue\b.*\b(came in|came through|brought in|made|earned)\b/.test(q)) {

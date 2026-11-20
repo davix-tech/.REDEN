@@ -222,7 +222,7 @@ export function composeWeeklyRevenue(data = {}) {
     );
   } else {
     lines.push(
-      `For ${period}, your store recorded ${formatAmount(revenue)} in sales. This is sales before costs, not profit, and the store currency has not been confirmed.`
+      `For ${period}, your store recorded ${formatAmount(revenue)} in sales (currency not confirmed). This is sales before costs, not profit.`
     );
     lines.push(
       `REDEN recorded ${purchases ?? 0} purchase(s)${visits !== null ? ` from ${visits} store visits` : ""}.`

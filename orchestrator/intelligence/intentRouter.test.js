@@ -235,3 +235,16 @@ test("routes remaining merchant questions to existing intelligence handlers", ()
     assert.deepEqual(detectIntents(question), expected, question);
   }
 });
+
+
+test("recognizes informal store-health and earnings wording", () => {
+  for (const question of ["How is business?", "How's business?", "How is the store?", "How's my shop?"]) {
+    assert.deepEqual(detectIntents(question), ["overview"], question);
+  }
+  for (const question of ["What's happening in the store?", "What's going on with my business?", "What is happening in my shop?"]) {
+    assert.deepEqual(detectIntents(question), ["overview"], question);
+  }
+  for (const question of ["How much is earnings?", "What are my earnings?", "How much income did my store make?"]) {
+    assert.deepEqual(detectIntents(question), ["revenue"], question);
+  }
+});
