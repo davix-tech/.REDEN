@@ -18,7 +18,7 @@ test("capability response distinguishes recorded revenue from profit", () => {
 
 test("general fallback does not invent an answer", () => {
   const answer = composeConversationResponse("general_help", "Who won an event yesterday?");
-  assert.match(answer, /can.t reliably answer that from my reviewed knowledge/);
+  assert.match(answer, /couldn.t reliably answer that question with my current knowledge/);
   assert.match(answer, /won.t make something up/);
 });
 
@@ -51,8 +51,8 @@ test("business redirection varies instead of repeating one generic fallback", ()
     { answer: first }
   ]);
   assert.notEqual(first, second);
-  assert.match(first, /store/i);
-  assert.match(second, /commerce business/i);
+  assert.match(first, /REDEN Pro is coming/i);
+  assert.match(second, /REDEN Pro is coming/i);
 });
 
 test("contextual follow-up explains the previous answer rather than losing the topic", () => {

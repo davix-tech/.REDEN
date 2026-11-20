@@ -42,7 +42,7 @@ export function composeConversationResponse(intent, question = "", recentTurns =
       return composeCommerceKnowledge(question);
 
     case "general_help":
-      return "I can’t reliably answer that from my reviewed knowledge, and I won’t make something up. " + chooseBusinessRedirectVariant(question, recentTurns);
+      return "I couldn’t reliably answer that question with my current knowledge, and I won’t make something up.\n\nI can still help you understand your store using your actual sales, visitors, customer behaviour and checkout activity.\n\nREDEN Pro is coming. With Pro, you’ll be able to ask broader business questions, explore more complex ideas, get deeper explanations and discuss virtually any business topic with REDEN.\n\nFor now, I can help you understand and improve your store using the data available. What would you like to explore?";
 
     default:
       return "I couldn’t determine a reliable response for that request. " + policy.response_shapes.out_of_scope + " (Knowledge version: " + REDEN_KNOWLEDGE_VERSION + ".)";
