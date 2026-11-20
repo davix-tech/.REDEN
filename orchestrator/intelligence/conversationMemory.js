@@ -125,7 +125,8 @@ export function chooseBusinessRedirectVariant(question, recentTurns = []) {
 export function selectContextTurn(question, recentTurns = []) {
   if (!recentTurns.length) return null;
   const q = normalizedText(question);
-  const isCausal = /^(why|and why|why though|what caused (that|it)|what is causing that|why should i do that|why should i do this)$/.test(q);\n  const isReferential = /^(why|and why|why though|what caused (that|it)|what is causing that|explain that|explain that simply|explain that more simply|can you explain|tell me more|what does that mean|what about (that|it|yesterday|today|last week)|is that (good|bad|enough)|what should i do|what should i do then|why should i do that|how do i fix that|how can i fix it|how can i improve it|would that help|will that help|would that work|will that work|how so|elaborate|what now|what next)$/.test(q);
+  const isCausal = /^(why|and why|why though|what caused (that|it)|what is causing that|why should i do that|why should i do this)$/.test(q);
+  const isReferential = /^(why|and why|why though|what caused (that|it)|what is causing that|explain that|explain that simply|explain that more simply|can you explain|tell me more|what does that mean|what about (that|it|yesterday|today|last week)|is that (good|bad|enough)|what should i do|what should i do then|why should i do that|how do i fix that|how can i fix it|how can i improve it|would that help|will that help|would that work|will that work|how so|elaborate|what now|what next)$/.test(q);
   if (!isReferential || (!isCausal && recentTurns[0])) return recentTurns[0] || null;
   // Skip conversational/clarification turns and anchor to the most recent substantive evidence or advice turn.
   const substantive = recentTurns.find((turn) => {
