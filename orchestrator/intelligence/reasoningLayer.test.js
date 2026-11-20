@@ -98,3 +98,14 @@ test("understands product demand and customer acquisition in ordinary language",
     ["growth", "traffic", "conversion"]
   );
 });
+
+test("resolves a bare why after product performance as a contextual follow-up", () => {
+  assert.deepEqual(
+    resolveReasoningIntents("Why?", [], {
+      question: "Which products are performing best?",
+      answer: "These products have the strongest recorded activity.",
+      intents: ["product_interest", "purchases"],
+    }),
+    ["contextual_follow_up"]
+  );
+});

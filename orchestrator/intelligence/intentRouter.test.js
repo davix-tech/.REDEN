@@ -177,3 +177,61 @@ test("routes everyday sales and traffic wording through the language dictionary"
   assert.deepEqual(detectIntents("How much cash from sales came in today?"), ["revenue"]);
   assert.deepEqual(detectIntents("How many people visited my store today?"), ["traffic", "overview"]);
 });
+
+test("routes store health and business growth questions to overview", () => {
+  assert.deepEqual(detectIntents("How are things going with my store?"), ["overview"]);
+  assert.deepEqual(detectIntents("Is my business growing?"), ["overview"]);
+});
+
+test("recognizes returning-customer questions as retention", () => {
+  assert.deepEqual(detectIntents("Are customers coming back?"), ["retention"]);
+  assert.deepEqual(detectIntents("How many returning customers do I have?"), ["retention"]);
+  assert.deepEqual(detectIntents("Are customers returning to my website?"), ["retention"]);
+});
+
+test("recognizes cart abandonment inflections", () => {
+  assert.deepEqual(detectIntents("How many customers abandoned their carts?"), ["cart"]);
+  assert.deepEqual(detectIntents("Why are customers abandoning their carts?"), ["cart"]);
+});
+
+test("routes remaining merchant questions to existing intelligence handlers", () => {
+  const cases = [
+    ["What is happening in my store?", ["overview"]],
+    ["What is going well in my business?", ["overview"]],
+    ["How much are customers spending?", ["revenue"]],
+    ["Which page gets the most attention?", ["traffic"]],
+    ["Am I attracting the right customers?", ["traffic"]],
+    ["What do customers do before buying?", ["diagnostic"]],
+    ["What are customers struggling with?", ["diagnostic"]],
+    ["What actions show that someone wants to buy?", ["intent_opportunities"]],
+    ["What does customer activity tell us about my business?", ["overview"]],
+    ["Is my store converting well?", ["conversion"]],
+    ["Am I depending too much on new customers?", ["retention"]],
+    ["Are customers responding to my offers?", ["bandit"]],
+    ["Am I giving away too many discounts?", ["advice"]],
+    ["What behaviour suggests someone is about to buy?", ["intent_opportunities"]],
+    ["Can you identify potential buyers?", ["intent_opportunities"]],
+    ["Why is my business not growing?", ["diagnostic"]],
+    ["What is wrong with my store?", ["diagnostic"]],
+    ["What is the biggest weakness in my store?", ["diagnostic"]],
+    ["What opportunities am I missing?", ["intent_opportunities"]],
+    ["Is my website helping customers buy?", ["diagnostic"]],
+    ["Which pages might be confusing customers?", ["diagnostic"]],
+    ["Are things looking good?", ["overview"]],
+    ["Am I making progress?", ["overview"]],
+    ["What do you think I should do about my store?", ["merchant_priority"]],
+    ["What's moving in the store?", ["product_interest", "purchases"]],
+    ["Do shoppers keep trying to buy the same item?", ["product_interest", "purchases"]],
+    ["Are my discounts eating into my margins?", ["advice"]],
+    ["Are my prices too low?", ["advice"]],
+    ["Am I actually making a profit?", ["advice"]],
+    ["What questions might customers have before buying?", ["advice"]],
+    ["What can I learn from repeated visits?", ["retention"]],
+    ["What might make customers trust my store more?", ["advice"]],
+    ["What has declined recently?", ["diagnostic"]],
+  ];
+
+  for (const [question, expected] of cases) {
+    assert.deepEqual(detectIntents(question), expected, question);
+  }
+});

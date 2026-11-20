@@ -1,0 +1,27 @@
+name: Merchant question coverage
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test/merchant-question-coverage
+  pull_request:
+    paths:
+      - "orchestrator/intelligence/**"
+      - "package.json"
+      - ".github/workflows/merchant-question-coverage.yml"
+
+jobs:
+  merchant-question-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Run merchant question and conversation quality tests
+        run: node --test orchestrator/intelligence/merchantQuestionCoverage.test.js orchestrator/intelligence/merchantReasoningQuality.test.js orchestrator/intelligence/merchantConversationQuality.test.js
