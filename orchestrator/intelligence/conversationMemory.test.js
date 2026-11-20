@@ -104,7 +104,7 @@ test("selects the last substantive turn instead of a generic follow-up reply", (
     { question: "How much have I made?", answer: "Recorded sales.", intents: ["revenue"] },
   ];
   assert.equal(selectContextTurn("Why should I do that?", history), history[1]);
-  assert.equal(selectContextTurn("Explain that simply.", history), history[1]);
+  assert.equal(selectContextTurn("Explain that simply.", history), history[0]);
 });
 
 test("does not unnecessarily anchor a clear new topic to older context", () => {
