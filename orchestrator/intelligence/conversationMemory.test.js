@@ -5,6 +5,7 @@ import {
   composeContextualFollowUp,
   detectFollowUpIntent,
   parseConversationIntents,
+  selectContextTurn,
 } from "./conversationMemory.js";
 
 test("parses intent history from PostgreSQL arrays and JSON strings", () => {
@@ -93,4 +94,20 @@ test("handles contextual merchant follow-ups only with relevant prior turns", ()
   assert.deepEqual(detectFollowUpIntent("Can you compare that with last week?", weeklyTurn), ["weekly_revenue"]);
   assert.deepEqual(detectFollowUpIntent("Which one should I deal with first?", diagnosticTurn), ["merchant_priority"]);
   assert.equal(detectFollowUpIntent("What about yesterday?", revenueTurn), null);
+});
+
+
+test("selects the last substantive turn instead of a generic follow-up reply", () => {
+  const history = [
+    { question: "Explain that simply.", answer: "Plain explanation.", intents: ["contextual_follow_up"] },
+    { question: "Why?", answer: "Diagnosis based on recorded data.", intents: ["diagnostic", "revenue"] },
+    { question: "How much have I made?", answer: "Recorded sales.", intents: ["revenue"] },
+  ];
+  assert.equal(selectContextTurn("Why should I do that?", history), history[1]);
+  assert.equal(selectContextTurn("Explain that simply.", history), history[1]);
+});
+
+test("does not unnecessarily anchor a clear new topic to older context", () => {
+  const history = [{ question: "Why?", answer: "Sales explanation.", intents: ["diagnostic", "revenue"] }];
+  assert.equal(selectContextTurn("Which products are performing best?", history), history[0]);
 });
