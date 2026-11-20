@@ -25,6 +25,7 @@ import { toMerchantLanguage } from "./intelligence/merchantLanguage.js";
 import { composeWeeklyRevenue, loadWeeklyRevenue } from "./intelligence/weeklyRevenue.js";
 import { diagnoseSales, diagnoseJourney } from "./intelligence/diagnostics.js";
 import { detectIntents } from "./intelligence/intentRouter.js";
+import { selectContextTurn } from "./intelligence/conversationMemory.js";
 import { composeConversationResponse } from "./intelligence/responsePolicy.js";
 import { resolveReasoningIntents, composeReasonedResponse } from "./intelligence/reasoningLayer.js";
 import { composeKnowledgeGuidance } from "./intelligence/knowledgeAdvisor.js";
@@ -2442,7 +2443,7 @@ app.post("/api/v1/intelligence", async (req, res) => {
       : { rows: [] };
 
     const recentTurns = conversationHistoryResult.rows || [];
-    const previousTurn = recentTurns[0] || null;
+    const previousTurn = selectContextTurn(question, recentTurns);
     let intents = resolveReasoningIntents(
       question,
       detectIntents(question, previousTurn),
